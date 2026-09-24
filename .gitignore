@@ -1,0 +1,5 @@
+.vscode
+
+firmware/.vscode
+firmware/.xmake
+firmware/build
