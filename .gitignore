@@ -3,3 +3,5 @@
 firmware/.vscode
 firmware/.xmake
 firmware/build
+
+firmware/sdk/EXAM

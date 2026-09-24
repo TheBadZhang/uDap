@@ -157,10 +157,41 @@ __STATIC_INLINE void PORT_OFF(void) {
     PIN_nRESET_OUT(1U);
 }
 
+//**************************************************************************************************
+// 状态指示灯
+//
+// 本板只有一颗灯，接在 PB12，**高电平点亮**。
+// 它对应 CMSIS-DAP 的 Connect LED：主机（调试器软件）连接到 DAP 时点亮。
+//
+// 由 DAP.c 的 DAP_HostStatus(ID_DAP_HostStatus=0x01) 驱动：
+//   request[0] = DAP_DEBUGGER_CONNECTED(0) -> LED_CONNECTED_OUT(request[1])
+//   request[0] = DAP_TARGET_RUNNING(1)     -> LED_RUNNING_OUT(request[1])
+// pyOCD 在 connect() 置 CONNECTED=1、disconnect() 置 0；
+// 它从不把 TARGET_RUNNING 置 1，故本板不为 Running 单独点灯。
+#define LED_CONNECTED_PORT        GPIOB
+#define LED_CONNECTED_PIN         GPIO_Pin_12
+// 1 = 高电平点亮，0 = 低电平点亮
+#define LED_CONNECTED_ACTIVE_HIGH 1U
+
 __STATIC_INLINE void LED_CONNECTED_OUT(uint32_t bit) {
+#if LED_CONNECTED_ACTIVE_HIGH
+    if (bit != 0U) {
+        LED_CONNECTED_PORT->BSHR = LED_CONNECTED_PIN;  // 置高，点亮
+    } else {
+        LED_CONNECTED_PORT->BCR = LED_CONNECTED_PIN;   // 拉低，熄灭
+    }
+#else
+    if (bit != 0U) {
+        LED_CONNECTED_PORT->BCR = LED_CONNECTED_PIN;   // 拉低，点亮
+    } else {
+        LED_CONNECTED_PORT->BSHR = LED_CONNECTED_PIN;  // 置高，熄灭
+    }
+#endif
 }
 
+// 本板只有一颗灯，未接 Target Running 指示
 __STATIC_INLINE void LED_RUNNING_OUT(uint32_t bit) {
+    (void)bit;
 }
 
 __STATIC_INLINE uint32_t TIMESTAMP_GET(void) {
@@ -168,7 +199,21 @@ __STATIC_INLINE uint32_t TIMESTAMP_GET(void) {
 }
 
 __STATIC_INLINE void DAP_SETUP(void) {
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    // GPIOB 给状态灯（PB12）用，GPIOA 给 SWD / nRESET 用
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB, ENABLE);
+
+    // 先把输出数据寄存器置为「灭」，再切成推挽输出，避免初始化瞬间闪一下。
+    // （高电平点亮时「灭」= 低，与复位值一致；低电平点亮时这一步才是必需的）
+    LED_CONNECTED_OUT(0U);
+
+    GPIO_InitTypeDef led = {0};
+    led.GPIO_Pin = LED_CONNECTED_PIN;
+    led.GPIO_Speed = GPIO_Speed_50MHz;
+    led.GPIO_Mode = GPIO_Mode_Out_PP;
+    // 用库函数而不是裸写 CFGHR：SDK 的 GPIO_Init 对 CFGHR 走静态缓存
+    // （CFGHR_tmpB），直接写寄存器会让缓存失步，后续 GPIO_Init 调用会把配置冲掉。
+    GPIO_Init(LED_CONNECTED_PORT, &led);
+
     PORT_OFF();
 }
 

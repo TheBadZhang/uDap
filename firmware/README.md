@@ -172,13 +172,35 @@ DAP glue）都已编译链接成功，并经实测确认：USB 正常枚举（CM
 `ch32x035-usb-dap-main` 直接搬过来的（SWCLK=PA2、SWDIO=PA3、nRESET=PA5），
 尚未按 uDap2 原理图核对，上板前必须确认。**
 
-| 项目 | 参考工程取值 | 需核对 |
+| 项目 | 取值 | 需核对 |
 | --- | --- | --- |
 | SWCLK / SWDIO | PA2 / PA3 | ✓ |
 | nRESET | PA5 | ✓（见下方说明） |
 | 桥接串口 | USART4：PB0=TX、PB1=RX | ✓ |
-| LED | 未实现（`LED_CONNECTED_OUT` / `LED_RUNNING_OUT` 为空） | — |
+| 状态灯 | PB12，高电平点亮，接 `LED_CONNECTED_OUT` | ✓ |
 | USB | PC16=UDM / PC17=UDP | 固定复用，无选择余地 |
+
+### 状态指示灯
+
+本板只有一颗灯（PB12，高电平点亮），接的是 CMSIS-DAP 的 **Connect LED**：主机连接到
+DAP 时点亮、断开时熄灭。改脚或改极性只需动 `src/dap/DAP_config.h` 里的三个宏：
+
+```c
+#define LED_CONNECTED_PORT         GPIOB
+#define LED_CONNECTED_PIN          GPIO_Pin_12
+#define LED_CONNECTED_ACTIVE_HIGH  1U   // 0 = 低电平点亮
+```
+
+它由主机下发的 `ID_DAP_HostStatus(0x01)` 驱动（DAP.c 的 `DAP_HostStatus`）：
+
+| 状态类型 | 固件回调 | 主机行为 |
+| --- | --- | --- |
+| `DAP_DEBUGGER_CONNECTED`(0) | `LED_CONNECTED_OUT` | pyOCD 在 `connect()` 置 1、`disconnect()` 置 0 |
+| `DAP_TARGET_RUNNING`(1) | `LED_RUNNING_OUT` | pyOCD **从不置 1**（只下发 0），OpenOCD 不发该命令 |
+
+因此 `LED_RUNNING_OUT` 保持空实现（本板也没有第二颗灯）。**这意味着灯的可见性取决于
+主机工具**：pyOCD 下会亮；OpenOCD 若不支持该命令则始终不亮 —— 这种情况需要固件本地
+指示（如 USB 枚举后常亮），目前未实现。
 
 > ⚠️ **参考工程自身的 README 与代码不一致**：它的 `README.md` 引脚表写
 > `PB12 = nRESET`、`PA5 = 按键`，但 `src/dap/DAP_config.h` 里是 `PA5 = nRESET`
