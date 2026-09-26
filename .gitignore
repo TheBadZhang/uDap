@@ -1,7 +1,15 @@
 .vscode
 
+firmware/tools/__pycache__
+
 firmware/.vscode
 firmware/.xmake
 firmware/build
 
 firmware/sdk/EXAM
+
+
+
+
+hardware/uDap-backups
+hardware/fp-info-cache
