@@ -70,8 +70,13 @@ void chry_dap_init(uint8_t busid, uint32_t reg_base);
 
 void chry_dap_handle(void) __attribute__((section(".highcode")));
 
-// COM 口 <-> 目标串口（USART4）的数据搬运：从 UART RX FIFO 取数据送 CDC IN。
-// 由主循环调用（usbd_ep_start_write 不是中断安全的）。
+// COM 口 <-> 目标串口（USART4）的周期性服务，两个方向都在这里推进：
+//   OUT 方向：CDC OUT 背压恢复（TX FIFO 余量足够后重挂端点）
+//   IN  方向：从 UART RX FIFO 取数据送 CDC IN
+//
+// 必须由主循环反复调用。OUT 那一支不能省略 —— 背压停止重挂端点后就再也不会
+// 有 USB 中断，「FIFO 已排空」只能在主循环里察觉。
+// IN 那一支不能放在中断里，因为 usbd_ep_start_write 不是中断安全的。
 void chry_dap_cdc_bridge(void);
 
 /* implment by user */

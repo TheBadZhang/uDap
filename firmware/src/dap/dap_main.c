@@ -374,11 +374,76 @@ static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t cdc_in_buffer[CDC_IN_BUFFE
 static volatile struct cdc_line_coding g_cdc_lincoding;
 static volatile uint8_t cdc_tx_busy;
 
-// 目标串口 -> COM 口：从 RX FIFO 取数据送 CDC IN。
-// 由主循环调用，不能放在 UART 中断里 —— usbd_ep_start_write 不是中断安全的。
+// CDC OUT 背压标志：UART TX FIFO 余量不足时置位，表示 OUT 端点已停止重挂。
+// 排空到能再容一整包后，由 chry_dap_cdc_bridge() 重新挂起。
+static volatile uint8_t cdc_out_stalled;
+
+// ---------------------------------------------------------------------------
+// COM 口波特率上限：主机设得太高就直接拒绝打开
+// ---------------------------------------------------------------------------
+// CDC ACM 规范里**没有**「拒绝波特率」的标准手段 —— 收到 SET_LINE_CODING 时
+// 设备只有两条路：接受，或者把该控制传输 STALL 掉。Windows 的 usbser.sys
+// 遇到 STALL 会让 SetCommState 失败，主机侧表现就是**打开串口报错**。
+//
+// 为什么需要这个上限：实测 2 Mbaud 是可靠上限（MB 量级压力测试零错误），
+// 2.2 Mbaud 起开始偶发丢字节、并伴随秒级超时停顿。与其让主机设到一个必然
+// 丢数据的速率、跑起来才发现，不如在打开时就明确拒绝。
+// 判断是「> 2 M 才拒」，即恰好 2000000 是通过的。
+//
+// 实现方式：CherryUSB 的 usbd_cdc_acm_set_line_coding() 是 __WEAK void 回调，
+// **无法表达拒绝**（其类请求处理函数无条件返回 0 = ACK）。所以这里在初始化时
+// 捕获它的类请求处理函数指针，换成一个先判上限、通过再转交的包装。
+// 这样不必修改 third_party 子模块。
+#define CDC_MAX_BAUDRATE 2000000u
+
+// CherryUSB 的类请求处理函数（static，只能在 init 时捕获）
+static usbd_request_handler s_cdc_acm_class_handler;
+
+static int cdc_acm_class_interface_request_handler_guard(uint8_t busid, struct usb_setup_packet *setup, uint8_t **data, uint32_t *len) {
+    if (setup->bRequest == CDC_REQUEST_SET_LINE_CODING &&
+        data != NULL && *data != NULL &&
+        setup->wLength >= sizeof(uint32_t)) {
+        // 行编码是 packed 的 7 字节结构，这里只取前 4 字节的 dwDTERate，
+        // 避免依赖结构体对齐/长度
+        uint32_t rate;
+        memcpy(&rate, *data, sizeof(rate));
+
+        if (rate > CDC_MAX_BAUDRATE) {
+            // 返回负值 → usbd_core 对 EP0 发 STALL → 主机侧行编码设置失败。
+            // 这里直接返回、不转交原处理函数，所以也不会调用
+            // usbd_cdc_acm_set_line_coding()，g_cdc_lincoding 与 UART 实际
+            // 波特率都保持原值不变。
+            return -1;
+        }
+    }
+
+    return s_cdc_acm_class_handler(busid, setup, data, len);
+}
+
+// COM 口 <-> 目标串口的周期性服务，两个方向都在这一个函数里推进：
+//   OUT 方向：CDC OUT 背压的恢复侧 —— TX FIFO 重新有一整包余量后重挂 OUT 端点
+//   IN  方向：从 UART RX FIFO 取数据送 CDC IN
+//
+// 必须由主循环反复调用。OUT 那一支尤其不能省：USB 中断只在传输完成时触发，
+// 端点既然没挂就永远不会再有中断，「FIFO 已排空」只能在主循环里察觉 ——
+// 少了这一半，背压会把 OUT 端点永久停摆（比丢字节更糟）。
+// IN 那一支不能在 UART 中断里做，因为 usbd_ep_start_write 不是中断安全的。
 void chry_dap_cdc_bridge(void) {
     uint32_t length;
 
+    // ---- OUT 方向：背压恢复 ----
+    // 阀值取「一整包」而不是「>0」：OUT 端点每次完成最多交付
+    // CDC_OUT_BUFFER_SIZE 字节，若只剩几字节空间就重挂，那一包仍会被丢掉一截。
+    // 取整包余量可保证每次重挂后那一包必然完整入队，也即零丢字节。
+    //
+    // 说明：TXE 中断（优先级 2，低于 USB 的 1）只从 FIFO 取数据，因此从这里
+    // 检查到回调真正写入之间，余量只会变大不会变小，该保证成立。
+    if (cdc_out_stalled != 0U && drv_uart_tx_free() >= CDC_OUT_BUFFER_SIZE) {
+        cdc_out_stalled = 0U;
+        usbd_ep_start_read(0, CDC_OUT_EP, cdc_out_buffer, sizeof(cdc_out_buffer));
+    }
+
+    // ---- IN 方向：目标串口 -> COM 口 ----
     // 上一包还没发完就等下一轮，usbd_ep_start_write 不能重入
     if (cdc_tx_busy) {
         return;
@@ -415,6 +480,7 @@ void usbd_event_handler(uint8_t busid, uint8_t event) {
             /* setup first out ep read transfer */
             USB_RequestIdle = 0U;
             cdc_tx_busy = 0U;
+            cdc_out_stalled = 0U;
 
             usbd_ep_start_read(0, DAP_OUT_EP, USB_Request[0], DAP_PACKET_SIZE);
             usbd_ep_start_read(0, CDC_OUT_EP, cdc_out_buffer, sizeof(cdc_out_buffer));
@@ -472,11 +538,24 @@ void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes) {
     (void)busid;
     (void)ep;
 
-    // 主机 -> 目标串口：写入 UART TX FIFO，然后立刻重挂接收。
-    // 在中断里就重挂，主机不必等主循环，USB 侧不会被串口波特率拖慢；
-    // 速率差由 TX FIFO 吸收（FIFO 满时丢新字节，见 drv_uart_tx_overflow_count）。
+    // 主机 -> 目标串口：先写入 UART TX FIFO。
+    // 走背压路径时本包必然放得下，故不会丢；若仍发生部分写入，
+    // 说明有非预期的重入，会被 drv_uart_tx_overflow_count() 记下来。
     drv_uart_write(cdc_out_buffer, nbytes);
-    usbd_ep_start_read(0, CDC_OUT_EP, cdc_out_buffer, sizeof(cdc_out_buffer));
+
+    // **背压**：只有 FIFO 除本包外还能再容一整包时才立刻重挂端点。
+    // 余量不足就不重挂 —— 主机侧 bulk 写会一直被 NAK，于是它自然阻塞在
+    // 串口波特率上，数据一个都不丢。旧行为是无条件重挂，USB 会以 MB/s 级
+    // 速度灌满 FIFO，超出部分直接丢弃（实测：115200 下写 8192 B 丢 85%），
+    // 主机侧等待等长回读的脚本因此永远等不齐 —— 表现为「一直跑不结束」。
+    //
+    // 代价：主机的一次大 write() 现在会阻塞到串口把数据排出去为止
+    // （115200 下写 8 KiB 约 711 ms）。这是零丢字节换来的必然结果。
+    if (drv_uart_tx_free() >= CDC_OUT_BUFFER_SIZE) {
+        usbd_ep_start_read(0, CDC_OUT_EP, cdc_out_buffer, sizeof(cdc_out_buffer));
+    } else {
+        cdc_out_stalled = 1U;
+    }
 }
 
 void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes) __attribute__((section(".highcode"), noinline));
@@ -564,8 +643,19 @@ void chry_dap_init(uint8_t busid, uint32_t reg_base) {
     usbd_add_endpoint(0, &dap_in_ep);
 
     /*!< cdc acm */
-    usbd_add_interface(0, usbd_cdc_acm_init_intf(0, &intf1));
-    usbd_add_interface(0, usbd_cdc_acm_init_intf(0, &intf2));
+    // usbd_cdc_acm_init_intf() 内部把 class_interface_handler 指向 CherryUSB 的
+    // static 处理函数。这里先调一次把它取出来存好，再换成带波特率上限检查的
+    // 包装（见 cdc_acm_class_interface_request_handler_guard 上方的说明）。
+    // 必须在 usbd_add_interface() 之前改：那是按指针注册的。
+    usbd_cdc_acm_init_intf(0, &intf1);
+    s_cdc_acm_class_handler = intf1.class_interface_handler;
+    intf1.class_interface_handler = cdc_acm_class_interface_request_handler_guard;
+
+    usbd_cdc_acm_init_intf(0, &intf2);
+    intf2.class_interface_handler = cdc_acm_class_interface_request_handler_guard;
+
+    usbd_add_interface(0, &intf1);
+    usbd_add_interface(0, &intf2);
     usbd_add_endpoint(0, &cdc_out_ep);
     usbd_add_endpoint(0, &cdc_in_ep);
 
@@ -641,6 +731,11 @@ void chry_dap_handle(void) {
                 usbd_ep_start_write(0, DAP_IN_EP, USB_Response[n], USB_RespSize[n]);
             }
         }
+
+        // 长 DAP 命令（例如大块内存读写）会把主循环占住几百毫秒，期间 COM 口的
+        // OUT 端点是停止重挂状态的话，主机的串口写就一直在被 NAK。这里每处理完
+        // 一条命令就补一次桥接服务，让串口在大块 SWD 操作期间也能持续推进。
+        chry_dap_cdc_bridge();
     }
 }
 
@@ -648,7 +743,10 @@ void usbd_cdc_acm_set_line_coding(uint8_t busid, uint8_t intf, struct cdc_line_c
     (void)busid;
     (void)intf;
 
-    // 行编码除了回存（主机打开串口时要能读回自己的配置），还用来设真实波特率
+    // 行编码除了回存（主机打开串口时要能读回自己的配置），还用来设真实波特率。
+    //
+    // 注意：超过 CDC_MAX_BAUDRATE 的请求在校验包装里已被 STALL 掉，走不到这里，
+    // 所以本函数收到的速率一定在上限内（判断逻辑集中在包装里，这里不再重复）。
     if (line_coding != NULL && line_coding->dwDTERate != 0U) {
         memcpy((uint8_t *)&g_cdc_lincoding, line_coding, sizeof(struct cdc_line_coding));
         drv_uart_set_baudrate(line_coding->dwDTERate);

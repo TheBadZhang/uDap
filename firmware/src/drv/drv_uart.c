@@ -22,14 +22,17 @@
 //   TX FIFO：生产者 USB 中断（CDC OUT 回调），消费者 USART4 中断。
 //            USART4 中断是真正的中断，能抢占主循环 —— SWD 在处理 DAP 命令时
 //            它照样在排水。所以 TX 侧不会因为 SWD 而积压。
+//            上限：USB 侧有背压（见 dap_main.c 的 usbd_cdc_acm_bulk_out），
+//            余量不足就不重挂 OUT 端点，主机被 NAK 挡住，所以不会溢出。
+//            本缓冲只需能吸收「USB 一包的突发 + 中断响应延迟」。
 //
 //   RX FIFO：生产者 USART4 中断，消费者**主循环**。SWD 排空命令队列期间主循环
-//            回不来，RX 侧只能靠 FIFO 硬顶 —— 这是并发时真正脆弱的一侧。
+//            回不来，RX 侧只能靠 FIFO 硬顶 —— 这是并发时真正脆弱的一侧，
+//            而它没有可用的背压手段（UART 侧无 RTS/CTS 流控）。
 //
 // 曾把 RX 调到 2048 想缓解并发丢字节，**实测无改善**（1024 与 2048 都是约
 // 2 次 / 2 MB）：失败形态是「停顿」而不是渐进溢出，加深缓冲治不了；
 // 而且 20 KB SRAM 已接近用满（再加会与栈重叠、直接链接失败）。已改回 1024。
-// 真正待办：在 chry_dap_handle() 排队循环里插一次桥接调用，或 RX 改 DMA。
 #define UART_FIFO_SIZE 1024u
 
 #define UART_DEFAULT_BAUDRATE 115200u
@@ -134,8 +137,11 @@ uint32_t drv_uart_write(const uint8_t *data, uint32_t length) {
 
     if (written != length) {
         // FIFO 满，超出部分被丢弃。不在这里阻塞：本函数在 USB 中断上下文里被调用
-        // （CDC OUT 回调），阻塞会拖垮 USB。丢多少记多少，见
-        // drv_uart_tx_overflow_count()。上层若要避免丢弃需自行限流。
+        // （CDC OUT 回调），阻塞会拖垮 USB。
+        //
+        // 正常路径下不会走到这里 —— CDC OUT 回调会先查 drv_uart_tx_free()，
+        // 确认放得下整包才重挂端点（背压）。所以本计数只应在异常情况
+        // （非预期重入、FIFO 被调得过小）下增长；若它持续增长，说明背压失效。
         uart_tx_overflow += (length - written);
     }
 
@@ -155,6 +161,10 @@ uint32_t drv_uart_read(uint8_t *data, uint32_t length) {
 
 uint32_t drv_uart_rx_available(void) {
     return chry_ringbuffer_get_used(&uart_rx_fifo);
+}
+
+uint32_t drv_uart_tx_free(void) {
+    return chry_ringbuffer_get_free(&uart_tx_fifo);
 }
 
 uint32_t drv_uart_rx_overflow_count(void) {
