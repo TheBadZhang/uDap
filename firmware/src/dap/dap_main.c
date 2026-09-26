@@ -379,46 +379,32 @@ static volatile uint8_t cdc_tx_busy;
 static volatile uint8_t cdc_out_stalled;
 
 // ---------------------------------------------------------------------------
-// COM 口波特率上限：主机设得太高就直接拒绝打开
+// 关于 COM 口波特率：不再设上限
 // ---------------------------------------------------------------------------
-// CDC ACM 规范里**没有**「拒绝波特率」的标准手段 —— 收到 SET_LINE_CODING 时
-// 设备只有两条路：接受，或者把该控制传输 STALL 掉。Windows 的 usbser.sys
-// 遇到 STALL 会让 SetCommState 失败，主机侧表现就是**打开串口报错**。
+// 曾经这里有一个 2 Mbaud 的硬上限（用包装 CherryUSB 的类请求处理函数实现，
+// 超限就 STALL）。撤掉的原因是两件事：
 //
-// 为什么需要这个上限：实测 2 Mbaud 是可靠上限（MB 量级压力测试零错误），
-// 2.2 Mbaud 起开始偶发丢字节、并伴随秒级超时停顿。与其让主机设到一个必然
-// 丢数据的速率、跑起来才发现，不如在打开时就明确拒绝。
-// 判断是「> 2 M 才拒」，即恰好 2000000 是通过的。
+//   1. 拒绝在主机侧**不可观测**。实测（pyserial 3.5 / Windows 11）请求
+//      2.5M / 3M / 4M 都能成功打开、不抛异常；usbser.sys 并没有把 STALL
+//      变成 SetCommState 失败。设备保持上一次的速率，主机却以为自己设成了。
+//      这种「静默不生效」比「跑一个可能丢数据的速率」更难排查。
+//   2. 高波特率的实际可用性取决于**使用模式**而非波特率本身：只要发送是
+//      「小载荷」或「分批、中间留空隙」，就不会触发 RX FIFO 溢出，
+//      2 Mbaud 以上同样能零丢字节（实测 512 KiB @ 3M/6Mbaud、192 B 块全对）。
 //
-// 实现方式：CherryUSB 的 usbd_cdc_acm_set_line_coding() 是 __WEAK void 回调，
-// **无法表达拒绝**（其类请求处理函数无条件返回 0 = ACK）。所以这里在初始化时
-// 捕获它的类请求处理函数指针，换成一个先判上限、通过再转交的包装。
-// 这样不必修改 third_party 子模块。
-#define CDC_MAX_BAUDRATE 2000000u
-
-// CherryUSB 的类请求处理函数（static，只能在 init 时捕获）
-static usbd_request_handler s_cdc_acm_class_handler;
-
-static int cdc_acm_class_interface_request_handler_guard(uint8_t busid, struct usb_setup_packet *setup, uint8_t **data, uint32_t *len) {
-    if (setup->bRequest == CDC_REQUEST_SET_LINE_CODING &&
-        data != NULL && *data != NULL &&
-        setup->wLength >= sizeof(uint32_t)) {
-        // 行编码是 packed 的 7 字节结构，这里只取前 4 字节的 dwDTERate，
-        // 避免依赖结构体对齐/长度
-        uint32_t rate;
-        memcpy(&rate, *data, sizeof(rate));
-
-        if (rate > CDC_MAX_BAUDRATE) {
-            // 返回负值 → usbd_core 对 EP0 发 STALL → 主机侧行编码设置失败。
-            // 这里直接返回、不转交原处理函数，所以也不会调用
-            // usbd_cdc_acm_set_line_coding()，g_cdc_lincoding 与 UART 实际
-            // 波特率都保持原值不变。
-            return -1;
-        }
-    }
-
-    return s_cdc_acm_class_handler(busid, setup, data, len);
-}
+// 所以现在完全接受主机下发的速率。**但注意：并非「波特率越高越快」** ——
+// 实测桥接的吞吐天花板约 190~200 KiB/s，正好落在 2 Mbaud，再往上提没有收益：
+//   - 2 Mbaud 配大块（4 KiB）发送：~191 KiB/s，利用率 98%（已到顶）。
+//   - 更高波特率必须把块压到 <=192 B 才不丢字节，等效速率反而降到 ~165 KiB/s。
+// 天花板在本文件的 chry_dap_cdc_bridge()：IN 方向每次主循环只发起一次
+// CDC IN 传输并等它完成，所以每秒能搬的字节数有上限（不是 USB 带宽不够）。
+// 详见仓库根 readme.md 第 6.4 节。
+//
+// 精度与上限交给 UART 硬件与使用方把关：
+//   - USART 是 16 倍过采样，BRR = 48 MHz / 波特率。BRR = 16（3 Mbaud）是
+//     16 倍过采样的标称下限；BRR < 16 即 USARTDIV < 1，超出规范但实测仍可用。
+//   - 请求的速率往往无法被 BRR 整除（如 2.5 M 实际 2.526 M，+1.05%），
+//     接真实目标板时会带来累积偏差 —— 这是正常现象，设备侧无法检测。
 
 // COM 口 <-> 目标串口的周期性服务，两个方向都在这一个函数里推进：
 //   OUT 方向：CDC OUT 背压的恢复侧 —— TX FIFO 重新有一整包余量后重挂 OUT 端点
@@ -643,19 +629,8 @@ void chry_dap_init(uint8_t busid, uint32_t reg_base) {
     usbd_add_endpoint(0, &dap_in_ep);
 
     /*!< cdc acm */
-    // usbd_cdc_acm_init_intf() 内部把 class_interface_handler 指向 CherryUSB 的
-    // static 处理函数。这里先调一次把它取出来存好，再换成带波特率上限检查的
-    // 包装（见 cdc_acm_class_interface_request_handler_guard 上方的说明）。
-    // 必须在 usbd_add_interface() 之前改：那是按指针注册的。
-    usbd_cdc_acm_init_intf(0, &intf1);
-    s_cdc_acm_class_handler = intf1.class_interface_handler;
-    intf1.class_interface_handler = cdc_acm_class_interface_request_handler_guard;
-
-    usbd_cdc_acm_init_intf(0, &intf2);
-    intf2.class_interface_handler = cdc_acm_class_interface_request_handler_guard;
-
-    usbd_add_interface(0, &intf1);
-    usbd_add_interface(0, &intf2);
+    usbd_add_interface(0, usbd_cdc_acm_init_intf(0, &intf1));
+    usbd_add_interface(0, usbd_cdc_acm_init_intf(0, &intf2));
     usbd_add_endpoint(0, &cdc_out_ep);
     usbd_add_endpoint(0, &cdc_in_ep);
 
@@ -745,8 +720,10 @@ void usbd_cdc_acm_set_line_coding(uint8_t busid, uint8_t intf, struct cdc_line_c
 
     // 行编码除了回存（主机打开串口时要能读回自己的配置），还用来设真实波特率。
     //
-    // 注意：超过 CDC_MAX_BAUDRATE 的请求在校验包装里已被 STALL 掉，走不到这里，
-    // 所以本函数收到的速率一定在上限内（判断逻辑集中在包装里，这里不再重复）。
+    // 不再对速率做上限检查（见文件上方「关于 COM 口波特率」的说明）：主机下什么
+    // 就设什么，UART 硬件能产生多少就是多少。注意 USART 是 16 倍过采样，
+    // BRR = 48 MHz / 波特率，标称上限 3 Mbaud；超过后 BRR 整数部分为 0，
+    // 实际速率不再受控（≈48 MHz / BRR）。
     if (line_coding != NULL && line_coding->dwDTERate != 0U) {
         memcpy((uint8_t *)&g_cdc_lincoding, line_coding, sizeof(struct cdc_line_coding));
         drv_uart_set_baudrate(line_coding->dwDTERate);

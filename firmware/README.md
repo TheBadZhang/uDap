@@ -221,18 +221,47 @@ USB 描述符沿用 CherryDAP 示例的 VID/PID `0d28:0204`。
 本工程自带 `tools/` 下的测速与串口测试脚本（与参考工程一致）：
 
 ```powershell
-.\tools\speed.ps1 -Khz 12000 -Bytes 65536 -Rounds 3
+.\tools\speed.ps1 -Khz 6000 -Bytes 65536 -Rounds 3
+
+# 频率扫描（一次跑 100 kHz ~ 12 MHz 并汇总）
+.\tools\openocd_speed_sweep.ps1 -Rounds 5 -Warmup 1
+
+# 串口环回吞吐 / 利用率（需 PB0-PB1 短接）
+python .\tools\com_loopback_speed.py --seconds 2 --repeats 3
+
+# 分块 / 间隔发送（撤除波特率上限后新增）
+python .\tools\com_loopback_paced.py --baud 2000000 --chunk 4096 --total 262144
+python .\tools\com_loopback_matrix.py --baud 2000000,3000000 --chunk 192,4096
 ```
 
-实测基线（STM32F411 目标，64 KiB）：
+实测基线（STM32F411 目标，OpenOCD + `tools/openocd_speed_test.tcl`，2026-09-26，
+16 KiB 块、预热 1 轮 + 5 轮平均）：
 
-| SWCLK | 写 KiB/s | 读 KiB/s |
-| --- | --- | --- |
-| 4000 kHz（慢路径） | ~54 | ~49 |
-| 12000 kHz（快路径） | ~142 | ~132 |
+| SWCLK | 写 KiB/s | 读 KiB/s | 路径 |
+| --- | --- | --- | --- |
+| 4000 kHz | 54.2 | 45.3 | 慢（已饱和） |
+| 5750 kHz | 54.1 | 45.5 | 慢（饱和，最后一档） |
+| **6000 kHz** | **125.4** | **121.0** | **快（拐点）** |
+| 12000 kHz | 126.3 | 119.0 | 快（与 6 MHz 同速） |
 
-**比较两版固件速度时必须确保 `-Khz` 相同**：≥12000 kHz 才走「快路径」，差 2.6 倍。
-注意 PowerShell 参数要写成 `-Khz 12000` 或 `-Khz:12000`，写成 `-Khz=12000` 会直接报错
+慢路径自约 2.5 MHz 起完全饱和（2.5 → 5.75 MHz 都在 54 / 45 KiB/s），
+6 MHz 跨过 `MAX_SWJ_CLOCK(2)` 阈值切到快路径后约 2.3 倍。
+**快路径的实际 SWCLK 由固定指令数决定（约 6 MHz），所以填 6 MHz 和填 12 MHz 速度相同 ——
+推荐就填 6 MHz**（阈值处余量最厚）。
+
+阈值可在 `src/dap/DAP_config.h` 里用 `DELAY_FAST_CYCLES` 调整
+（阈值 = `24 MHz / (2 + DELAY_FAST_CYCLES)`，本工程 2 → 6 MHz；上游默认 0 → 12 MHz）。
+`tools/speed.ps1` 与 `openocd_speed_sweep.ps1` 的 `-FastMinKhz`（默认 6000）
+只影响打印的路径标注，**改固件阈值时需同步**。
+
+COM 口波特率不再有上限（原先 `> 2 Mbaud` 会被 STALL，已撤除，见 `src/dap/dap_main.c`
+里「关于 COM 口波特率」的说明）。实测桥接吞吐天花板约 **190~200 KiB/s**，
+2 Mbaud 就处在天花板上；再提高波特率换不来吞吐，反而要求把发送块压到 ≤192 B
+才能不丢字节。**完整频率表、串口环回利用率、波特率 × 块大小矩阵与可靠性边界，
+见仓库根目录的 `readme.md` 第 6 节。**
+
+**比较两版固件速度时必须确保 `-Khz` 相同**：≥6000 kHz 才走「快路径」，差 2.3 倍。
+注意 PowerShell 参数要写成 `-Khz 6000` 或 `-Khz:6000`，写成 `-Khz=6000` 会直接报错
 （已加 `[CmdletBinding()]` 拦截，避免静默回落到默认的 4000 kHz）。
 
 ## 其他可参考的实现

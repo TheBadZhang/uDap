@@ -17,6 +17,32 @@
 #define CPU_CLOCK               48000000U
 #define IO_PORT_WRITE_CYCLES    2U
 
+// 快路径（SWD_TransferFast）的启用阈值。
+//
+// 判定点在 cherrydap 的 Set_Clock_Delay()（DAP/Source/DAP.c，__WEAK）：
+//     if (clock >= MAX_SWJ_CLOCK(DELAY_FAST_CYCLES)) -> fast_clock = 1
+//     MAX_SWJ_CLOCK(n) = (CPU_CLOCK / 2) / (IO_PORT_WRITE_CYCLES + n)
+// 代入本文件的值与下面的 DELAY_FAST_CYCLES = 2U：
+//     (48 MHz / 2) / (2 + 2) = 6 MHz
+// 即**请求时钟 >= 6 MHz 就走快路径**（上游默认 DELAY_FAST_CYCLES = 0，阈值 12 MHz）。
+//
+// 为什么降到 6 MHz：快路径的实际 SWCLK 由固定指令数决定（约 6 MHz），
+// **与请求值无关** —— 请求 6 MHz 与请求 12 MHz 拿到的是同一个速率。阈值留在
+// 12 MHz 的唯一后果，是让主机填 6 ~ 11.5 MHz 时白跑慢路径（实测慢路径 56 KiB/s
+// vs 快路径 129 KiB/s，见仓库根 readme.md 第 6.1 节）。6 MHz 以下仍走慢路径，
+// 保留可调延时，供长线 / 慢目标使用。
+//
+// 改阈值只需改这个数（阈值 = 24 MHz / (2 + 本值)）：
+//     0 -> 12 MHz（上游默认）    2 -> 6 MHz（本工程）    4 -> 4 MHz
+//
+// ⚠️ DELAY_FAST_CYCLES 在 DAP.h 里还有一个用途：决定 PIN_DELAY_FAST() 补几个 NOP。
+// 在本工程里**不影响时序** —— sw_dp.c 已把 PIN_DELAY_FAST 重定义成固定一个
+// __NOP()，且上游唯二使用它的 SW_DP.c / JTAG_DP.c 并未参与编译（见 xmake.lua）。
+// 也就是说这个宏在本工程里只当阈值旋钮用。
+#ifndef DELAY_FAST_CYCLES
+#define DELAY_FAST_CYCLES 2U
+#endif
+
 // 慢路径（SWD_TransferSlow）的单次位延时
 //
 #ifndef DELAY_SLOW_CYCLES
