@@ -2,6 +2,12 @@
 
 #include "drv/drv_uart.h"
 
+// 序列号来源（xmake 的 option("esig_sn") -> -DESIG_SN=0/1）。
+// 未定义时默认关闭：打开会改变 USB 序列号，进而改变主机侧的设备实例。
+#ifndef ESIG_SN
+#define ESIG_SN 0
+#endif
+
 #define CMSIS_DAP_INTERFACE_SIZE (9 + 7 + 7)
 #define CUSTOM_HID_LEN           (9 + 9 + 7 + 7)
 
@@ -291,13 +297,91 @@ const uint8_t hid_custom_report_desc[HID_CUSTOM_REPORT_DESC_SIZE] = {
     0xC0 /*     END_COLLECTION	             */
 };
 
-char serial_number_dynamic[36] = "DEADBEEF";  // Dynamic serial number
+// USB 序列号。默认是固定的 "DEADBEEF"；打开 ESIG_SN 时会被芯片出厂 UID 覆盖。
+// 36 字节足够放 24 个 UID 十六进制字符（+ 结束符）。
+char serial_number_dynamic[36] = "DEADBEEF";
+
+#if ESIG_SN
+// ---------------------------------------------------------------------------
+// 序列号改用芯片出厂 UID（ESIG，Electronic Signature）
+// ---------------------------------------------------------------------------
+// 默认的固定串对所有板子都一样，多块插在同一台机器上无法区分（VID:PID 也相同）。
+// ESIG 区的 96 位 UID 出厂烧录、只读、对每颗芯片唯一，适合做产品序列号。
+// 寄存器定义见 CH32X035 应用手册第 19 章「电子签名（ESIG）」：
+//   0x1FFFF7E8  R32_ESIG_UNIID1  U_ID[31:0]
+//   0x1FFFF7EC  R32_ESIG_UNIID2  U_ID[63:32]
+//   0x1FFFF7F0  R32_ESIG_UNIID3  U_ID[95:64]
+//
+// 注意：USB 序列号参与主机侧的设备枚举与驱动匹配，换了序列号等于换了设备实例，
+// 首次插入需要重新匹配一次驱动（本设备是 WinUSB，靠 MS OS 2.0 描述符自动匹配，
+// 无需手工安装）。这是预期行为，不是故障。
+#define ESIG_UNIID1_ADDR 0x1FFFF7E8u /* U_ID[31:0]  */
+#define ESIG_UNIID2_ADDR 0x1FFFF7ECu /* U_ID[63:32] */
+#define ESIG_UNIID3_ADDR 0x1FFFF7F0u /* U_ID[95:64] */
+#define ESIG_SN_HEX_LEN  24u         /* 96 位 -> 24 个十六进制字符 */
+
+// 一个 32 位字 -> 8 个大写十六进制字符（高位在前）
+static void esig_sn_put_word(uint32_t value, char *out) {
+    static const char hex[] = "0123456789ABCDEF";
+
+    for (uint32_t i = 0u; i < 8u; i++) {
+        out[i] = hex[(value >> (28u - 4u * i)) & 0x0Fu];
+    }
+}
+
+// 检查刚拼好的 UID 串是否「像个有效值」（不全 0、不全 F）
+static bool esig_sn_uid_is_plausible(void) {
+    bool all_zero = true;
+    bool all_ff = true;
+
+    for (uint32_t i = 0u; i < ESIG_SN_HEX_LEN; i++) {
+        if (serial_number_dynamic[i] != '0') {
+            all_zero = false;
+        }
+        if (serial_number_dynamic[i] != 'F') {
+            all_ff = false;
+        }
+    }
+    return !(all_zero || all_ff);
+}
+
+// 按 UNIID1 -> UNIID2 -> UNIID3 拼接（与沁恒例程的打印顺序一致；顺序只是约定，
+// 唯一性不受影响）。三个地址逐个显式读取（虽然是相邻的 +0/+4/+8），这样每个
+// 地址都能在自己那一行独立对照手册，不必依赖「它们相邻」这个隐含前提。
+static void esig_sn_apply(void) {
+    static const char fallback[] = "DEADBEEF";
+
+    esig_sn_put_word(*(const volatile uint32_t *)ESIG_UNIID1_ADDR,
+                     &serial_number_dynamic[0]);
+    esig_sn_put_word(*(const volatile uint32_t *)ESIG_UNIID2_ADDR,
+                     &serial_number_dynamic[8]);
+    esig_sn_put_word(*(const volatile uint32_t *)ESIG_UNIID3_ADDR,
+                     &serial_number_dynamic[16]);
+    serial_number_dynamic[ESIG_SN_HEX_LEN] = '\0';
+
+    // 全 0 或全 FF 表示没读到有效 UID（地址不对、ESIG 不可读、总线返回未初始化值）。
+    // 这时**退回固定串**，而不是把一个「看似唯一、其实所有板子都一样」的串当成
+    // 序列号发出去 —— 后者会让本特性悄无声息地失效，且主机侧无从察觉。
+    // （本工程 _write 是空实现，没法打印告警，所以只能靠退回固定串让现象可见。）
+    if (!esig_sn_uid_is_plausible()) {
+        for (uint32_t i = 0u; i < sizeof(fallback); i++) {
+            serial_number_dynamic[i] = fallback[i];
+        }
+    }
+}
+#endif /* ESIG_SN */
+
+// 供 DAP_config.h 的 DAP_GetSerNumString() 取用（CMSIS-DAP 的 DAP_GetSerNum 命令）。
+// 与 USB 描述符的 iSerialNumber 用同一份字符串，保证两条路径报告一致。
+const char *udap_serial_number(void) {
+    return serial_number_dynamic;
+}
 
 char *string_descriptors[] = {
-    (char[]){0x09, 0x04},               /* Langid */
-    "uDAP",                        /* Manufacturer */
-    "uDAP CMSIS-DAP",              /* Product */
-    "DEADBEEF", /* Serial Number */
+    (char[]){0x09, 0x04},  /* Langid */
+    "uDAP",                /* Manufacturer */
+    "uDAP CMSIS-DAP",      /* Product */
+    serial_number_dynamic, /* Serial Number（固定值或 ESIG UID） */
     "uDAP WebUSB",
 };
 
@@ -328,10 +412,8 @@ __WEAK const uint8_t *other_speed_config_descriptor_callback(uint8_t speed) {
 __WEAK const char *string_descriptor_callback(uint8_t speed, uint8_t index) {
     (void)speed;
 
-    if (index == 3) {
-        return serial_number_dynamic;
-    }
-
+    // 序列号（index 3）也在 string_descriptors 里，指向 serial_number_dynamic，
+    // 所以这里不需要再特判
     if (index >= (sizeof(string_descriptors) / sizeof(char *))) {
         return NULL;
     }
@@ -620,6 +702,11 @@ const struct usb_descriptor cmsisdap_descriptor = {
 
 void chry_dap_init(uint8_t busid, uint32_t reg_base) {
     DAP_Setup();
+
+#if ESIG_SN
+    // 必须在 usbd_initialize() 之前：主机在枚举阶段就会索要序列号字符串描述符
+    esig_sn_apply();
+#endif
 
     usbd_desc_register(0, &cmsisdap_descriptor);
 

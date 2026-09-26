@@ -84,10 +84,29 @@ __STATIC_INLINE uint8_t DAP_GetProductString(char *str) {
     (void)str;
     return 0U;
 }
+
+// 序列号由 src/dap/dap_main.c 提供：USB 描述符的 iSerialNumber 与这里的
+// DAP_GetSerNum 命令共用同一份字符串，避免两条路径报告不同的序列号
+// （后者只在主机主动查询 DAP_ID_SER_NUM 时才用到，如 pyOCD 的探针列表）。
+//
+// 声明放在本文件而不是 dap_main.h：dap_main.h 会 include 本文件，反向包含会成环。
+extern const char *udap_serial_number(void);
+
+// 返回写入的字符数（不含结束符）。CMSIS-DAP 规定字符串最长 32 字符，
+// 而 DAP_Info 的响应缓冲就是 DAP_PACKET_SIZE(64)，所以 32 是安全上限。
 __STATIC_INLINE uint8_t DAP_GetSerNumString(char *str) {
-    (void)str;
-    return 0U;
+    const char *sn = udap_serial_number();
+    uint8_t n = 0U;
+
+    if (sn != NULL) {
+        while (sn[n] != '\0' && n < 32U) {
+            str[n] = sn[n];
+            n++;
+        }
+    }
+    return n;
 }
+
 __STATIC_INLINE uint8_t DAP_GetTargetDeviceVendorString(char *str) {
     (void)str;
     return 0U;

@@ -96,11 +96,55 @@ xmake f --dap=y -y      # 直接用 xmake：启用
 
 | 配置 | Flash | RAM |
 | --- | --- | --- |
-| `--dap=y`（默认） | 25.79 KiB | 19.07 KiB |
+| `--dap=y`（默认，`--esig_sn=n`） | 26.09 KiB | 19.16 KiB |
+| `--dap=y --esig_sn=y` | 26.71 KiB | 19.16 KiB |
 | `--dap=n` | 12.47 KiB | 11.60 KiB |
 
 启用 DAP 时会校验 `src/dap/DAP_config.h`、`dap_main.c`、`sw_dp.c`、`src/drv/drv_uart.c`
 是否存在，缺文件直接报错并提醒可用 `--dap=n` 关闭。
+
+### 序列号：固定值 / 芯片 ESIG UID
+
+默认所有板子的 USB 序列号都是固定的 `DEADBEEF` —— 多块板子同时插在一台机器上时
+无法区分（VID:PID 也相同）。`option("esig_sn")` 打开后改用芯片 ESIG 区的
+**96 位出厂 UID**（出厂烧录、只读、每颗芯片唯一），转成 24 个大写十六进制字符：
+
+```powershell
+.\build.ps1 -EsigSn y     # 便捷脚本：用芯片 UID
+.\build.ps1               # 默认：固定 DEADBEEF（-EsigSn n）
+
+xmake f --dap=y --esig_sn=y -y
+```
+
+**寄存器定义**（代码在 `src/dap/dap_main.c`，见 CH32X035 应用手册第 19 章
+「电子签名（ESIG）」）：
+
+| 地址 | 名称 | 内容 |
+| --- | --- | --- |
+| `0x1FFFF7E8` | `R32_ESIG_UNIID1` | `U_ID[31:0]` |
+| `0x1FFFF7EC` | `R32_ESIG_UNIID2` | `U_ID[63:32]` |
+| `0x1FFFF7F0` | `R32_ESIG_UNIID3` | `U_ID[95:64]` |
+
+拼接顺序为 UNIID1 → UNIID2 → UNIID3（与沁恒例程的打印顺序一致；顺序只是约定，
+不影响唯一性）。同一份字符串同时供两处使用：
+
+- USB 描述符的 iSerialNumber（`dap_main.c` 的 `string_descriptors[3]`）
+- CMSIS-DAP 的 `DAP_GetSerNum` 命令（`src/dap/DAP_config.h` 的 `DAP_GetSerNumString()`）
+
+两点注意：
+
+1. **打开后会改变主机侧的设备实例**。USB 序列号参与 Windows 的设备枚举与驱动匹配，
+   换了序列号等于换了一台设备，首次插入需要重新匹配一次驱动（本设备是 WinUSB，
+   靠 MS OS 2.0 描述符自动匹配，无需手工安装）。原来绑定 `DEADBEEF` 实例的
+   OpenOCD / pyOCD 配置需要用新序列号。
+2. **UID 读不出来时会退回固定串**。若三个寄存器读回全 0 或全 FF（地址不对、
+   ESIG 不可读等），固件不会把「看似唯一、其实所有板子都相同」的串当序列号发出去，
+   而是退回 `DEADBEEF`，让「没生效」在主机侧可见。（本工程 `_write` 是空实现，
+   没有日志可用，所以只能靠这个现象判断。）
+
+`--esig_sn=y` 需要 `--dap=y`：序列号在 `src/dap/dap_main.c` 里设置，而该文件只在
+启用 CMSIS-DAP 时编译。这个组合会被 `xmake.lua` 与 `build.ps1` 直接拒绝，
+不会默默编出一个用不上它的固件。
 
 ### 与参考工程的两处必要差异
 
@@ -141,6 +185,7 @@ git submodule update --init
 # 便捷脚本（release，DAP 默认启用）
 .\build.ps1
 .\build.ps1 -Dap n          # 关闭 CMSIS-DAP，只编 USB 骨架
+.\build.ps1 -EsigSn y       # 用芯片 ESIG UID 作序列号（每颗芯片唯一）
 .\build.ps1 -Clean          # 先清理
 .\build.ps1 -Mode debug     # debug 构建
 .\build.ps1 -Reconfigure    # 工具链路径变化后强制重新配置
@@ -152,6 +197,10 @@ xmake -r
 
 # 关闭 CMSIS-DAP，只编 USB 骨架
 xmake f -m release --dap=n -y
+xmake -r
+
+# 用芯片 UID 作序列号
+xmake f -m release --dap=y --esig_sn=y -y
 xmake -r
 ```
 
@@ -216,7 +265,8 @@ probe-rs list
 probe-rs info --chip <目标型号> --probe <CMSIS-DAP探针序列号>
 ```
 
-USB 描述符沿用 CherryDAP 示例的 VID/PID `0d28:0204`。
+USB 描述符沿用 CherryDAP 示例的 VID/PID `0d28:0204`。序列号默认固定为 `DEADBEEF`，
+可用 `--esig_sn=y` 改成芯片出厂 UID（见上方「序列号」一节）。
 
 本工程自带 `tools/` 下的测速与串口测试脚本（与参考工程一致）：
 

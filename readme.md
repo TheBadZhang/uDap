@@ -78,7 +78,7 @@ USB 描述符（`src/dap/dap_main.c`）：
 | --- | --- |
 | VID:PID | `0d28:0204`（与部分 DAPLink 相同，同插时需按序列号区分） |
 | 制造商 / 产品 | `uDAP` / `uDAP CMSIS-DAP` |
-| 序列号 | `DEADBEEF` |
+| 序列号 | 默认 `DEADBEEF`（固定）；`--esig_sn=y` 时用芯片 ESIG 区的 96 位出厂 UID（24 位十六进制，每颗芯片唯一） |
 | 复合接口 | 接口 0 = CMSIS-DAP 厂商自定义 bulk（MS OS 2.0 描述符自动装 WinUSB）<br/>接口 1/2 = CDC ACM |
 | DAP 固件版本 | `0.1.0` |
 
@@ -109,7 +109,7 @@ USB 描述符（`src/dap/dap_main.c`）：
 | 编译器 | WCH RISC-V Embedded GCC 12（`riscv-wch-elf-*`，MounRiver Studio 2 自带） |
 | 编译选项 | `-march=rv32imacxw -mabi=ilp32 -msmall-data-limit=8 -mno-save-restore`，`-O3 -Wall -std=gnu11`（release） |
 | 优化 | LTO + `--gc-sections`；`.highcode` 段启动时从 Flash 搬到 RAM 执行 |
-| 辅助脚本 | `firmware/build.ps1`（PowerShell，包了工具链路径与 `--dap=y/n`） |
+| 辅助脚本 | `firmware/build.ps1`（PowerShell，包了工具链路径与 `--dap=y/n` / `--esig_sn=y/n`） |
 | 烧录 | `wlink`（WCH 官方）或 `wchisp` |
 
 ### 上位机 / 测试脚本
@@ -138,6 +138,9 @@ KiCad 工程：`hardware/uDap.kicad_sch` / `uDap.kicad_pcb`（含 Type-C 子图 
 - **CDC 侧背压**：UART TX FIFO 余量不足时不重挂 OUT 端点，主机 bulk 写被 NAK 挡住，
   主机侧自然阻塞在串口波特率上，**不丢字节**（见第 6.2 节）。
 - **状态指示灯**：PB12 显示主机是否已连接（由 `DAP_HostStatus` 驱动）。
+- **可选唯一序列号**：`--esig_sn=y` 时用芯片 ESIG 区的 96 位出厂 UID 作 USB 序列号
+  （同一份字符串也用于 CMSIS-DAP 的 `DAP_GetSerNum`），多块板子可区分；
+  默认仍是固定的 `DEADBEEF`。见 `firmware/README.md` 的「序列号」一节。
 - **可裁剪**：`xmake f --dap=n` 可关掉调试器功能，只编 USB 骨架（Flash 12.5 KiB）。
 
 ---
@@ -152,18 +155,28 @@ cd firmware
 # 便捷脚本（release，CMSIS-DAP 默认启用）
 .\build.ps1
 .\build.ps1 -Dap n        # 只编 USB 骨架
+.\build.ps1 -EsigSn y     # 用芯片 ESIG UID 作序列号（每颗芯片唯一）
 .\build.ps1 -Clean        # 先清理
 
 # 或直接用 xmake
 $env:WCH_TOOLCHAIN_ROOT = "D:/program/wch/MounRiver_Studio2/resources/app/resources/win32/components/WCH/Toolchain/RISC-V Embedded GCC12"
 xmake f -m release -y
 xmake -r
+
+# 用芯片 ESIG UID 作序列号（每颗芯片唯一，多块板子可区分）
+xmake f -m release --dap=y --esig_sn=y -y
+xmake -r
 ```
 
 产物：`firmware/build/release/firmware.elf` / `.bin` / `.map`。
 
-> ⚠️ xmake 会把 option 值持久化到本地配置，构建脚本每次显式传 `--dap=...`；
-> 直接敲 xmake 时也请显式指定，否则结果会被上一次的配置决定。
+> ⚠️ xmake 会把 option 值持久化到本地配置，构建脚本每次显式传 `--dap=...` 与
+> `--esig_sn=...`；直接敲 xmake 时也请显式指定，否则结果会被上一次的配置决定。
+>
+> ⚠️ `--esig_sn=y` **需要** `--dap=y`（序列号在 `src/dap/dap_main.c` 里设置，
+> 该文件只在启用 CMSIS-DAP 时编译）。这个组合会被直接拒绝并给出提示。
+> 打开后 USB 序列号从 `DEADBEEF` 变成芯片 UID，主机侧会当成**另一台设备**，
+> 需要重新匹配一次驱动（WinUSB 自动匹配，无需手工装）。
 
 ### 烧录
 
@@ -181,6 +194,10 @@ probe-rs info --chip stm32f411ceu --probe DEADBEEF
 # 串口
 python -m serial.tools.miniterm COM21 115200
 ```
+
+> 上面的 `--probe DEADBEEF` 是**默认**序列号。若用 `--esig_sn=y` 构建过，
+> 探针标识会变成芯片 UID（24 位十六进制），用 `probe-rs list` 或
+> `Get-PnpDevice` 查实际值。
 
 ---
 

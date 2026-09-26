@@ -72,6 +72,16 @@ option("dap")
     set_description("Enable CMSIS-DAP (CherryDAP + src/dap + src/drv glue)")
 option_end()
 
+-- 用芯片出厂 UID（ESIG 区，96 位、每颗唯一）作为 USB 序列号。
+-- 关闭时用固定的 "DEADBEEF" —— 多块板子同时插在一台机器上时无法区分。
+-- 寄存器定义见 CH32X035 应用手册第 19 章「电子签名（ESIG）」。
+-- 序列号在 src/dap/dap_main.c 里设置，所以依赖 CMSIS-DAP glue（--dap=y）。
+option("esig_sn")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Use the chip ESIG UID (96-bit, unique per chip) as the USB serial number")
+option_end()
+
 target("firmware")
     -- 目标属性
     set_plat("cross")
@@ -84,6 +94,15 @@ target("firmware")
     set_filename("firmware.elf")
 
     local dap_enabled = has_config("dap")
+    local esig_sn_enabled = has_config("esig_sn")
+
+    -- 序列号在 src/dap/dap_main.c 中设置，而该文件只在启用 DAP 时才编译。
+    -- 这个组合下选项会静默失效，所以直接报错而不是默默编出一个用不上它的固件。
+    if esig_sn_enabled and not dap_enabled then
+        raise("esig_sn requires dap: the USB serial number is set in src/dap/dap_main.c, " ..
+              "which is only compiled with CMSIS-DAP " ..
+              "(use `xmake f --dap=y` or `--esig_sn=n`)")
+    end
 
     -- 本工程应用代码
     -- src/*.c        系统初始化、中断、main（main 内用 ENABLE_DAP 区分两条路径）
@@ -92,6 +111,7 @@ target("firmware")
     add_files("src/*.c", "src/bsp/*.c", "src/port/*.c")
     add_includedirs("src")
     add_defines("ENABLE_DAP=" .. (dap_enabled and 1 or 0))
+    add_defines("ESIG_SN=" .. (esig_sn_enabled and 1 or 0))
 
     -- CMSIS-DAP 专有的应用 glue，仅在启用 DAP 时参与编译
     if dap_enabled then
@@ -201,6 +221,8 @@ target("firmware")
         cprint("${cyan}Using toolchain:${clear} %s", toolchain_root)
         cprint("${cyan}Using SDK:${clear} sdk/")
         cprint("${cyan}CMSIS-DAP:${clear} %s", has_config("dap") and "enabled" or "disabled")
+        cprint("${cyan}Serial #:${clear} %s", has_config("esig_sn")
+            and "chip ESIG UID (unique)" or "fixed DEADBEEF")
     end)
 
     -- 指定 map 文件，与 elf 同目录
