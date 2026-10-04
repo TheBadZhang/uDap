@@ -12,7 +12,6 @@
 
 #include "drv/drv_uart.h"
 
-// 三种构建（--dap / --wchlink / 双模式）共用这一份行编码状态与回调，
 // 见 drv_cdc_line.h 的说明。默认值与 drv_uart 的默认波特率保持一致。
 #define CDC_LINE_DEFAULT_BAUDRATE 115200u
 

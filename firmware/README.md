@@ -1,9 +1,9 @@
 # CH32X035F8U DAP（uDap 固件）
 
-CH32X035F8U 上的调试器固件，xmake + WCH RISC-V GCC 构建。同一份代码可编译成三种
-调试器功能：**CMSIS-DAP**（默认）、**WCH-Link**（RVSWD 目标调试 / Flash 烧录），
-或**两者都编入、运行期用按键切换的双模式固件**。COM 口（CDC <-> USART4 桥）在所有
-构建里行为一致。
+CH32X035F8U 上的调试器固件，xmake + WCH RISC-V GCC 构建。固件固定为**双模式**：
+**CMSIS-DAP** 与 **WCH-Link**（RVSWD 目标调试 / Flash 烧录）两套调试器代码都编入
+同一份固件，运行期用外接按键切换（两者都用 PA2/PA3，不可能同时运行）。COM 口
+（CDC <-> USART4 桥）在两种模式下行为一致。
 
 ## 目录结构
 
@@ -13,7 +13,7 @@ CH32X035F8U 上的调试器固件，xmake + WCH RISC-V GCC 构建。同一份代
 uDap2/
 ├── firmware/               ← 固件工程根（xmake 工程）
 │   ├── src/                本工程代码（应用 + 移植 glue）
-│   │   ├── main.c          应用入口（用 ENABLE_DAP / ENABLE_WCHLINK 区分路径）
+│   │   ├── main.c          应用入口（双模式：CMSIS-DAP / WCH-Link 运行期切换）
 │   │   ├── system_ch32x035.c  时钟与系统初始化
 │   │   ├── ch32x035_it.c   中断实现
 │   │   ├── ch32x035_conf.h SDK 配置
@@ -27,11 +27,11 @@ uDap2/
 │   │   ├── port/
 │   │   │   ├── usb_ch32x035_dc_usbfs.c   CherryUSB 的 CH32X035 USBFS 设备端口 glue（必选）
 │   │   │   └── usb_ch32x035_dc_usbfs.h   端口扩展（IN 传输取消，WCH-Link 用）
-│   │   ├── dap/            CMSIS-DAP glue（可选）
+│   │   ├── dap/            CMSIS-DAP glue
 │   │   │   ├── DAP_config.h    SWD / nRESET 引脚与时序配置
 │   │   │   ├── dap_main.c      USB 描述符、WinUSB/MSOS、DAP 与 CDC 端点分发
 │   │   │   └── sw_dp.c         SWD 位翻转实现（CherryDAP 的传输后端）
-│   │   ├── wchlink/        WCH-Link glue（可选；可与 dap 共存，见「双模式」）
+│   │   ├── wchlink/        WCH-Link glue（与 dap 共存于同一份固件，见「双模式」）
 │   │   │   ├── transport/      RVSWD 物理层（PA2/PA3 位翻转）与帧收发
 │   │   │   ├── protocol/       WCH-Link USB 命令帧
 │   │   │   ├── rvswd/          RISC-V DM 调试原语（寄存器/内存/复位）
@@ -43,6 +43,8 @@ uDap2/
 │   │   │   └── status_led.c    状态灯接口（本板无灯，空实现）
 │   │   └── drv/
 │   │       ├── drv_uart.c      CDC <-> USART4 桥（CherryRB FIFO）
+│   │       ├── drv_mode_button.c  模式切换按键（PA4）
+│   │       ├── drv_mode_store.c   模式持久化（用户选择字 Data0）
 │   │       └── drv_power_switch.c  目标电源开关接口（本板无开关，空实现）
 │   ├── sdk/                WCH CH32X035 SDK（Core / Peripheral / Debug / Startup / Ld / EXAM）
 │   ├── third_party/        仅上游依赖，全部为 submodule
@@ -92,48 +94,45 @@ submodule 的 git 管理数据在 `.git/modules/firmware/third_party/`，与工�
 调用链是 `usbd_initialize()` → `usb_dc_init()` → `usb_dc_low_level_init()`，因此应用侧必须先
 调用 `NVIC_PriorityGroupConfig()` 设定优先级分组。
 
-## CMSIS-DAP（可选）
+## CMSIS-DAP + WCH-Link（双模式）
 
-调试器功能（CherryDAP + `src/dap`、`src/drv` glue）是可选的，默认启用，可以关闭：
+`xmake.lua` **不提供裁剪选项**：CMSIS-DAP（CherryDAP + `src/dap`、`src/drv` glue）与
+WCH-Link（`src/wchlink/`，RVSWD 目标调试 / Flash 烧录）两套代码强制同时编入，
+产出的一律是运行期按键切换的双模式固件。两者都要占用 PA2=SWCLK / PA3=SWDIO，
+USB 身份也不同（见下面「双模式」一节），所以不存在「只编其中一个」的构建。
 
-```powershell
-.\build.ps1 -Dap n      # 便捷脚本：关闭
-.\build.ps1             # 便捷脚本：启用（-Dap y 是默认值）
+`src/main.c` 在两种模式间轮转；两种模式**各自私有**的代码与数据被链接到同一段
+RAM（overlay），这是两套代码能同时装进 20 KiB RAM 的原因。
 
-xmake f --dap=n -y      # 直接用 xmake：关闭
-xmake f --dap=y -y      # 直接用 xmake：启用
-```
-
-> ⚠️ **xmake 会把选项值持久化**到本地配置：执行过 `xmake f --dap=n` 之后，再运行
-> 不带 `--dap` 的 `xmake f` 仍然保持关闭（实测：关闭后只跑 `xmake f -m release -y`
-> 再构建，产物仍是 12.47 KiB）。因此 `build.ps1` 每次都显式传 `--dap=...`，
-> 保证构建结果只由参数决定；直接敲 xmake 时也请显式指明。
-
-`xmake.lua` 里的 `option("dap")` 控制它，并传递 `-DENABLE_DAP=0/1` 给 C 代码；
-`src/main.c` 用该宏区分两条初始化路径（关闭时不再调 `chry_dap_init()`）。
-两个实测尺寸：
+实测尺寸（release）：
 
 | 配置 | Flash | RAM |
 | --- | --- | --- |
-| `--dap=y`（默认，`--esig_sn=n`） | 25.88 KiB | 19.06 KiB |
-| `--dap=y --esig_sn=y` | 26.49 KiB | 19.06 KiB |
-| `--dap=n --wchlink=y` | 41.77 KiB | 17.28 KiB |
-| **`--dap=y --wchlink=y`（双模式）** | **58.57 KiB** | **17.23 KiB** |
-| `--dap=n`（骨架） | 12.47 KiB | 11.60 KiB |
+| 默认（序列号固定 `DEADBEEF`） | 58.53 KiB | 17.23 KiB |
+| `-EsigSn y`（序列号用芯片 ESIG UID） | 58.67 KiB | 17.23 KiB |
 
 上限：Flash 63232 B（`62K - 256`，末尾 256 B 留给 NV 配置），RAM 20480 B。
-双模式余量：Flash 3256 B、RAM 2832 B。
+Flash 余量约 3.2 KiB，RAM 余量约 2.8 KiB。
 
-启用 DAP 时会校验 `src/dap/DAP_config.h`、`dap_main.c`、`sw_dp.c` 是否存在，
-缺文件直接报错并提醒可用 `--dap=n` 关闭。
+构建开始时会校验两套模式的关键文件（`src/dap/DAP_config.h`、`dap_main.c`、`sw_dp.c`、
+`src/wchlink/` 的若干文件、`drv_mode_button.c` 等）是否齐全，缺文件直接报错，
+不会默默编出一个少了一半功能的固件。
 
-> **WCH-Link 用 `-Os` 而不是 DAP 的 `-O3`**，这是能装进 62 KiB / 20 KiB 的前提。
-> `sdk/Ld/Link_highcode_nv_256B.ld` 的 `.highcode` 是 `> RAM AT > FLASH`（启动时
+> **必须用 `-Os`**，这是能装进 62 KiB / 20 KiB 的前提。
+> `sdk/Ld/Link_highcode_nv_256B_dual.ld` 的 `.highcode` 是 `> RAM AT > FLASH`（启动时
 > 从 Flash 搬到 RAM 执行），而 USB 端口层把 `usbd_ep_start_read/write` 与
 > `USBFS_IRQHandler` 放进了 `.highcode`。用 `-O3` + LTO 时整条 USB 调用链会被内联进
 > 中断处理函数，`.highcode` 从 5.4 KiB 膨胀到 18.5 KiB，同时吃光 Flash（溢出
-> 11100 字节）和 RAM（溢出约 10.6 KiB）—— 实测链接直接失败。DAP 需要 `.highcode`
-> 里的 SWD 位翻转跑得快，所以 `--dap=y` 仍保持 `-O3` 不变。
+> 11100 字节）和 RAM（溢出约 10.6 KiB）—— 实测链接直接失败。参考工程
+> `ch32x035-usb-wchlink-main` 同样使用 smallest。
+>
+> **debug 模式（`-Mode debug`）同样是 `-Os` + LTO**：`-Og` / `-O0` 下两套代码 +
+> overlay 装不进 Flash（`.data` 直接报 region overflow），所以 debug 只额外保留调试
+> 符号，不降优化。
+
+链接脚本的 `OVERLAY` 段 LMA 由 ld 单独排布，**不受 `FLASH` 区域长度约束**，超出也不会
+报链接错误，只会静默生成一个装不进芯片的 `.bin`。因此 `xmake.lua` 在 `after_build`
+里按 `.bin` 实际长度兜底检查，超过 63232 B 直接报错并终止构建。
 
 ### 序列号：固定值 / 芯片 ESIG UID
 
@@ -145,7 +144,7 @@ xmake f --dap=y -y      # 直接用 xmake：启用
 .\build.ps1 -EsigSn y     # 便捷脚本：用芯片 UID
 .\build.ps1               # 默认：固定 DEADBEEF（-EsigSn n）
 
-xmake f --dap=y --esig_sn=y -y
+xmake f -m release --esig_sn=y -y
 ```
 
 **寄存器定义**（代码在 `src/dap/dap_main.c`，见 CH32X035 应用手册第 19 章
@@ -174,9 +173,8 @@ xmake f --dap=y --esig_sn=y -y
    而是退回 `DEADBEEF`，让「没生效」在主机侧可见。（本工程 `_write` 是空实现，
    没有日志可用，所以只能靠这个现象判断。）
 
-`--esig_sn=y` 需要 `--dap=y`：序列号在 `src/dap/dap_main.c` 里设置，而该文件只在
-启用 CMSIS-DAP 时编译。这个组合会被 `build.ps1` 立刻拒绝，直接敲 xmake 则在构建开始时
-以 `esig_sn requires dap` 报错，不会默默编出一个用不上它的固件。
+`--esig_sn=y` 只影响 CMSIS-DAP 模式的 USB 序列号（在 `src/dap/dap_main.c` 里设置）；
+双模式固件总是编入 CMSIS-DAP，所以这个选项永远有效，不存在「依赖被裁掉的模式」的问题。
 
 ### 与参考工程的两处必要差异
 
@@ -194,24 +192,15 @@ xmake f --dap=y --esig_sn=y -y
    而且它也从不调用该函数，所以没暴露问题）。已在 `src/bsp/bsp_delay.c` 末尾提供
    转发到 SysTick 延时 的等价实现。
 
-## WCH-Link（可选）
+## WCH-Link（RVSWD）
 
-`option("wchlink")` 打开 WCH-Link（RVSWD）功能，实现移植自参考工程
-`ch32x035-usb-wchlink-main` 的 `src/wchlink/**`（含 6 个目标族：CH32X03X / CH32L10X /
-CH32V20X / CH32V30X / CH58X / CH59X）。
+WCH-Link 的实现移植自参考工程 `ch32x035-usb-wchlink-main` 的 `src/wchlink/**`
+（含 6 个目标族：CH32X03X / CH32L10X / CH32V20X / CH32V30X / CH58X / CH59X）。
 
-它与 CMSIS-DAP 都占用 PA2=SWCLK / PA3=SWDIO，所以**不能同时运行**；有两种用法：
+它与 CMSIS-DAP 都占用 PA2=SWCLK / PA3=SWDIO，所以**不能同时运行**；本固件把两套
+代码都编进来，运行期用外接按键在两者间切换（见下面「双模式」一节）。
 
-- **只编 WCH-Link**：`--dap=n --wchlink=y`（本文这一节）。
-- **双模式**：`--dap=y --wchlink=y` —— 两套代码都编进一份固件，运行期用外接按键切换，
-  见下面「双模式」一节。
-
-```powershell
-.\build.ps1 -Dap n -Wchlink y      # 便捷脚本：编 WCH-Link
-
-xmake f -m release --dap=n --wchlink=y -y
-xmake -r
-```
+没有任何构建选项能把它单独编出来 —— 编译即双模式。
 
 WCH-Link 模式下的 USB 身份与 CMSIS-DAP 完全不同（这是主机端工具识别的**前提**，不是笔误）：
 
@@ -277,23 +266,23 @@ toggle，而来源工程的端口层对 EP1~EP3 改用了硬件自动翻转
 可以参照 `firmware/ch32x035-usb-wchlink-main/third_party/cherryusb_port/usb_ch32x035_dc_usbfs.c`
 把 EP1~EP3 换成硬件自动翻转，并补上 toggle 重同步接口。
 
-### Link 模式（RISC-V / ARM-DAP）：没有运行时切换，DAP 模式是另一份构建
+### WCH 官方的两种 Link 模式：切换 = 换固件（与本固件的按键切换无关）
 
-WCH-Link 有两套互斥的"模式"，**本工程只实现了 RISC-V（RVSWD）这一套**。
+WCH 官方 Link 有两套互斥的"模式"，**本工程只实现了 RISC-V（RVSWD）这一套**。
 原因是官方那套切换并不是改一个状态位，而是**替换 link 自己的固件**：
 
-| | 官方做法 | 本工程对应 |
+| | 官方 Link 做法 | 本固件对应 |
 | --- | --- | --- |
-| **RISC-V 模式** | 往 link 写 `WCH-Link_APP_IAP_RV.bin` | `--dap=n --wchlink=y`（USB 身份 `1a86:8010` 厂商协议）|
-| **ARM / DAP 模式** | 往 link 写 `WCH-Link_APP_IAP_ARM.bin`、`WCH-DAPLink_APP_IAP.bin` 或 `FIRMWARE_DAP_CH549.bin` | `--dap=y`（USB 身份 `0d28:0204` **CMSIS-DAP**）|
-| **切换动作** | 进 IAP → 写另一份固件 → 重启 | 重新编译烧录（`--dap` 与 `--wchlink` 互斥）|
+| **RISC-V 模式** | 往 link 写 `WCH-Link_APP_IAP_RV.bin` | WCH-Link 模式（USB 身份 `1a86:8010` 厂商协议）|
+| **ARM / DAP 模式** | 往 link 写 `WCH-Link_APP_IAP_ARM.bin`、`WCH-DAPLink_APP_IAP.bin` 或 `FIRMWARE_DAP_CH549.bin` | CMSIS-DAP 模式（USB 身份 `0d28:0204` **CMSIS-DAP**）|
+| **切换动作** | 进 IAP → 写另一份固件 → 重启（换固件） | PA4 按键 → 反初始化 USB → 换描述符重新枚举（**同一份固件**，见下节）|
 
 证据：
 
 - OpenOCD 的配置文件本身就分成两套（MounRiver Studio 2 的 `OpenOCD/bin/`）：
   - `wch-riscv.cfg` → `adapter driver wlinke` + `transport select sdi`（RV 模式，DCK+DIO 两线）
   - `wch-arm.cfg` → **`adapter driver cmsis-dap`** + `transport select swd`
-    即 **ARM/DAP 模式的 link 对主机就是一个 CMSIS-DAP 设备** —— 正好等于本工程的 `--dap=y` 产物。
+    即 **ARM/DAP 模式的 link 对主机就是一个 CMSIS-DAP 设备** —— 正好等于本固件的 CMSIS-DAP 模式（双模式固件默认进入的那一套）。
 - WCH-LinkUtility 自带的固件与字符串（`Others/SWDTool/default/`）：
   - `Firmware_Link/WCH-Link_APP_IAP_RV.bin`、`WCH-Link_APP_IAP_ARM.bin`、`WCH-DAPLink_APP_IAP.bin`、`FIRMWARE_DAP_CH549.bin`
   - `wchlink.wcfg`：`CH549Ver_RV=32` / `CH549Ver_ARM=31`（两种模式是两份固件、两个版本号）
@@ -309,29 +298,24 @@ WCH-Link 有两套互斥的"模式"，**本工程只实现了 RISC-V（RVSWD）�
 | `0x01` IAP（`WCHLINK_DEVICE_MODE_IAP`）| 不回复协议帧，改为 `bsp_system_enter_isp()`（`src/wchlink/usb/wchlink_usb.c:562`）→ 复位进 CH32X035 的 ISP bootloader |
 | 其它 | 回 `unsupported` |
 
-也就是说：**"切模式"这个动作的钩子（IAP）是有的，真正换固件是主机侧完成的**，
-本固件只会把自己复位进 ISP，不会、也无法在运行时变成 DAP 模式。
+也就是说：**WCH 官方"切模式"动作的钩子（IAP）是有的，真正换固件是主机侧完成的**，
+收到 IAP 命令时本固件只会把自己复位进 ISP。本固件自己的模式切换不走这条路
+（见下节：按键 + 重新枚举 USB，不经过 IAP）。
 
 > ⚠️ **注意一个真实风险**：烧了本固件之后，如果在 WCH-LinkUtility 里点「切换模式」并选
 > ARM/DAP，官方工具会先走 IAP（本固件会配合复位进 bootloader），然后**把 WCH 官方的
 > ARM/DAP 固件写进去，覆盖本固件**。这是符合官方设计的行为，不是 bug；想回到本固件
-> 就重新烧一次 `firmware.bin` 即可。
->
-> **能不能"一份固件运行时可切"？—— 能，见下面「双模式」一节。**
-> 两者是两套 USB 身份与描述符，且**不能同时运行**（都要占 PA2/PA3）；
-> 早期估算"同时编进来装不下"只考虑了 Flash 直接相加：
-> `骨架 12772 + DAP 增量 13940 + WCH-Link 增量 29996 ≈ 66708 B`，比可用的
-> `62K-256 = 63232 B` 多约 3.4 KiB。但实测用 `-Os` 后 Flash 只占 **58.57 KiB**（够），
-> 真正的瓶颈是 RAM（25.3 KiB > 20 KiB）—— 而两者不同时运行，把各自私有的代码与数据
-> 用链接脚本的 `OVERLAY` 放到同一段地址就解决了（RAM 降到 17.23 KiB）。
+> 就重新烧一次 `firmware.bin` 即可。要在本固件内部切到 CMSIS-DAP 模式，用 PA4 按键，
+> 不要用官方工具的「切换模式」。
 
 ## 双模式（CMSIS-DAP + WCH-Link，运行期按键切换）
 
-`xmake f --dap=y --wchlink=y` 会把**两套调试器代码都编进同一份固件**，启动默认进
-CMSIS-DAP，运行期用外接按键在两种模式间切换。
+本固件**固定**把两套调试器代码都编进同一份固件，运行期用外接按键在两种模式间切换。
+当前模式会写进芯片的**用户选择字**，下次上电自动恢复；全新芯片（或记录无效时）默认进
+CMSIS-DAP。
 
 ```powershell
-.\build.ps1 -Dap y -Wchlink y
+.\build.ps1        # 直接构建；没有「只编一个模式」的选项
 ```
 
 **两种模式不可能同时运行**：它们都要占用 PA2=SWCLK/DCK、PA3=SWDIO/DIO（同一对物理
@@ -358,20 +342,43 @@ SBU MUX 的交换控制，而本板没有 MUX，所以确定空闲。**要改引
 
 去抖 20 ms，且切换后会等按键释放，同一次按住不会来回抖动切换。
 
+### 模式持久化（用户选择字 Data0）
+
+每次按键切换后，新选的模式会写进 CH32X035 的**用户选择字**，下次上电由
+`src/drv/drv_mode_store.c` 读回并直接进入该模式。没有有效记录（擦除态 / 反码校验
+失败 / 取值非法）时回退到默认的 CMSIS-DAP。
+
+依据 CH32X035 应用手册 20.5 节「用户选择字」：信息块共 8 字节，其中 `Data0`/`Data1`
+是 2 字节用户自定义数据，地址 `0x1FFFF804` 的 32 位字排布为
+`[31:24]=nData1 [23:16]=Data1 [15:8]=nData0 [7:0]=Data0`（每个字节都带反码用于装载
+校验）。本工程只用 `Data0`：`0x00 = CMSIS-DAP`、`0x01 = WCH-Link`，`Data1` 及
+RDPR/USER/WRPR 全部原样保留。模式枚举 `firmware_mode_t` 定义在
+`src/drv/drv_mode_store.h`，`main.c` 与持久化共用同一套取值。**再增加模式时改两处**：
+在该枚举末尾追加成员（已有取值会写进 Flash，属于 ABI，不能重排；取值须从 0 起连续），
+再在 `main.c` 的 `mode_run()` 里加一个 `case` —— 主循环用 `(mode + 1) % FIRMWARE_MODE_COUNT`
+轮转，有效性判断也自动落在新增成员上，无需再改别处。
+
+> ⚠️ 注意：用户选择字与读保护 `RDPR`、`USER` 配置字、写保护 `WRPR0..3` 同处
+> `0x1FFFF800` 开始的同一个 256 B 擦除页。编程前必须整区擦除，所以保存时会把
+> RDPR/USER/WRPR 原样回写 —— 否则会改变读保护状态（可能导致整片擦除甚至读保护）。
+> 选项字节的擦写寿命有限，且擦/写过程中掉电可能损坏选择字，所以驱动只在值真的变化时
+> 才擦写，并在编程后回读校验。若要频繁切换模式又担心寿命，可改用链接脚本预留的
+> 末尾 256 B NV 页（见下文）而不是选项字节。
+
 ### RAM overlay：两种模式复用同一段 RAM
 
-双模式全编译时 Flash 够用，但 RAM 需要约 25.3 KiB 而只有 20 KiB。解决办法是把
+两套代码全编进来时 Flash 够用，但 RAM 需要约 25.3 KiB 而只有 20 KiB。解决办法是把
 **只有某一个模式用得到**的代码与数据放进同一段 RAM 地址（它们不同时运行），用
 ld 的 `OVERLAY` 命令实现（见 `sdk/Ld/Link_highcode_nv_256B_dual.ld`）：
 
-| 段 | 内容 | 双模式下的大小 |
+| 段 | 内容 | 实测大小 |
 | --- | --- | --- |
-| `.highcode` | **共用**：USB 端口层热路径 | 3188 B |
-| `dap_overlay` | 仅 CMSIS-DAP：`sw_dp.c`/`dap_main.c` 热路径 + `DAP_ProcessCommand` + USB 收发缓冲 | 4556 B（代码 2940 + BSS 1616）|
-| `wchlink_overlay` | 仅 WCH-Link：`rvswd_phy_gpio.c` 位翻转 + 会话/大缓冲 | 8076 B（代码 2032 + BSS 6044）|
-| `.bss` | 共用：USB 核心、端口状态、UART FIFO 等 | 5056 B |
+| `.highcode` | **共用**：USB 端口层热路径 | 约 3.1 KiB |
+| `dap_overlay` | 仅 CMSIS-DAP：`sw_dp.c`/`dap_main.c` 热路径 + `DAP_ProcessCommand` + USB 收发缓冲 | 约 4.4 KiB |
+| `wchlink_overlay` | 仅 WCH-Link：`rvswd_phy_gpio.c` 位翻转 + 会话/大缓冲 | 约 7.9 KiB |
+| `.bss` | 共用：USB 核心、端口状态、UART FIFO 等 | 约 4.9 KiB |
 
-两个 overlay 段的 VMA **相同**（实测都是 `0x20000da4`），窗口取较大的那个（8076 B）。
+两个 overlay 段的 VMA **相同**（实测都是 `0x20000d9c`），窗口取较大的那个（约 7.9 KiB）。
 `main()` 在进入各自模式前调用 `dap_overlay_init()` / `wchlink_overlay_init()`：
 把该模式的代码段从 Flash（`__load_start_xxx_overlay`）拷进 overlay，并清零它的 BSS。
 
@@ -386,9 +393,8 @@ ld 的 `OVERLAY` 命令实现（见 `sdk/Ld/Link_highcode_nv_256B_dual.ld`）：
   不加也能工作，只是不省 RAM。
 - `.highcode` 里新增共用热路径代码会同时占用两种模式的 RAM（这是应该的 —— 它被共用）。
 
-单模式构建（`--dap=y --wchlink=n` 或 `--dap=n --wchlink=y`）**不使用** overlay：
-`mode_overlay.h` 的宏退化成原来的 `.highcode`，链接脚本仍是原来的
-`Link_highcode_nv_256B.ld`，行为与改动前一致（实测尺寸也一致）。
+本工程**只有这一种构建**：`sdk/Ld/Link_highcode_nv_256B_dual.ld` 是本目录下唯一的
+工程链接脚本（`mode_overlay.h` 的段宏也没有「退化成 `.highcode`」的分支）。
 
 ## 第三方依赖
 
@@ -410,10 +416,8 @@ git submodule update --init
 由 `toolchains/wch-riscv/xmake.lua` 自动探测默认路径。
 
 ```powershell
-# 便捷脚本（release，DAP 默认启用）
+# 便捷脚本（release）。产物固定是 CMSIS-DAP + WCH-Link 双模式固件
 .\build.ps1
-.\build.ps1 -Dap n          # 关闭 CMSIS-DAP，只编 USB 骨架
-.\build.ps1 -Dap n -Wchlink y   # 编 WCH-Link（RVSWD 调试/烧录）
 .\build.ps1 -EsigSn y       # 用芯片 ESIG UID 作序列号（每颗芯片唯一）
 .\build.ps1 -Clean          # 先清理
 .\build.ps1 -Mode debug     # debug 构建
@@ -424,30 +428,20 @@ $env:WCH_TOOLCHAIN_ROOT = "D:/program/wch/MounRiver_Studio2/resources/app/resour
 xmake f -m release -y
 xmake -r
 
-# 关闭 CMSIS-DAP，只编 USB 骨架
-xmake f -m release --dap=n -y
-xmake -r
-
-# 编 WCH-Link（只编 WCH-Link 时需显式关掉 DAP）
-xmake f -m release --dap=n --wchlink=y -y
-xmake -r
-
-# 双模式：两套都编入，运行期按键切换
-xmake f -m release --dap=y --wchlink=y -y
-xmake -r
-
 # 用芯片 UID 作序列号
-xmake f -m release --dap=y --esig_sn=y -y
+xmake f -m release --esig_sn=y -y
 xmake -r
 ```
 
-> ⚠️ `--dap` / `--wchlink` / `--esig_sn` 三个选项都会被 xmake **持久化**到本地配置，
-> `build.ps1` 每次都显式传三个值，保证构建结果只由参数决定；直接敲 xmake 时也请显式指明。
+> ⚠️ `--esig_sn` 是唯一的应用侧选项，xmake 会把它**持久化**到本地配置；
+> `build.ps1` 每次都显式传值，保证构建结果只由参数决定。直接敲 xmake 时也请显式指明。
+> 调试器功能的裁剪选项（`--dap` / `--wchlink`）已经**删除** —— 传了 xmake 会报
+> `error: Invalid option: --dap=n`，因为不存在「只编一个模式」的构建。
 
 产物：`build/<mode>/firmware.elf`、`firmware.bin`、`firmware.map`。构建结束会打印
 Flash / RAM 占用统计。
 
-链接脚本为 `sdk/Ld/Link_highcode_nv_256B.ld`：Flash 62K（末尾 256B 留给 NV 配置），
+链接脚本为 `sdk/Ld/Link_highcode_nv_256B_dual.ld`：Flash 62K（末尾 256B 留给 NV 配置），
 RAM 20K；`.highcode` 段由 `startup_ch32x035_highcode.S` 在启动时从 Flash 搬到 RAM 执行，
 USB 设备端口等热路径代码通过 `section(".highcode")` 放在其中。
 
@@ -457,10 +451,10 @@ USB（CherryUSB + CH32X035 端口 glue + 硬件初始化）与 CMSIS-DAP（Cherr
 DAP glue）都已编译链接成功，并经实测确认：USB 正常枚举（CMSIS-DAP 调试器 + CDC 串口
 同时出现），DAP 能通过 OpenOCD 对目标读写（140 KiB/s 量级，见下方「验证」）。
 
-WCH-Link 模式已移植完成，**编译链接通过并已上板完整实测**（41.77 KiB / 17.28 KiB，
-见上方尺寸表）。实测覆盖 USB 枚举、WCH 官方驱动识别（`WCH-LinkRV`）、RVSWD 连接与
-目标核 examine、目标 ChipID/ESIG/Flash 读取、目标 RAM 读写、整片擦除 + 编程 + 校验
-（62 KB）以及 CDC，详见下方「验证 → WCH-Link 模式」。
+WCH-Link 模式已移植完成，**编译链接通过并已上板完整实测**。实测覆盖 USB 枚举、
+WCH 官方驱动识别（`WCH-LinkRV`）、RVSWD 连接与目标核 examine、目标 ChipID/ESIG/Flash
+读取、目标 RAM 读写、整片擦除 + 编程 + 校验（62 KB）以及 CDC，详见下方
+「验证 → WCH-Link 模式」。
 
 **注意：`src/dap/DAP_config.h` 的 SWD / nRESET 引脚是按参考工程
 `ch32x035-usb-dap-main` 直接搬过来的（SWCLK=PA2、SWDIO=PA3、nRESET=PA5），

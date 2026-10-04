@@ -800,9 +800,6 @@ void chry_dap_handle(void) {
     }
 }
 
-// 行编码的 4 个 usbd_cdc_acm_* 回调由 src/drv/drv_cdc_line.c 统一提供 ——
-// 双模式固件（--dap=y --wchlink=y）下如果两个模式各定义一份，会撞成重复符号。
-
 #if CONFIG_CHERRYDAP_USE_MSC
 #define BLOCK_SIZE  512
 #define BLOCK_COUNT 10

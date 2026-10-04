@@ -11,7 +11,6 @@ includes("toolchains/wch-riscv/xmake.lua")
 
 local arch_flags = {"-march=rv32imacxw", "-mabi=ilp32", "-msmall-data-limit=8", "-mno-save-restore"}
 local startup_file = "sdk/Startup/startup_ch32x035_highcode.S"
-local linker_script = "sdk/Ld/Link_highcode_nv_256B.ld"
 
 -- 构建后统计输出用的辅助函数
 local function parse_berkeley_size(size_output)
@@ -63,30 +62,18 @@ local function print_memory_summary(size_info)
     print(string.format("RAM   used: %s", format_size(size_info.ram)))
 end
 
--- CMSIS-DAP（CherryDAP + src/dap、src/drv glue）是可选的：
---   xmake f --dap=n   # 只编 USB 骨架，不含调试器功能
--- USB 本身不可关：本芯片必然用到 USB。
-option("dap")
-    set_default(true)
-    set_showmenu(true)
-    set_description("Enable CMSIS-DAP (CherryDAP + src/dap + src/drv glue)")
-option_end()
+-- 调试器功能不做裁剪：CMSIS-DAP（CherryDAP + src/dap、src/drv glue）与
+-- WCH-Link（RVSWD 目标调试 / Flash 烧录，见 src/wchlink）**必须同时编入**，
+-- 产出的是运行期由按键切换的双模式固件（见 src/main.c 与 src/mode_overlay.h）。
+-- 两者都占用 PA2=SWCLK / PA3=SWDIO，USB 身份也完全不同，所以不可能同时运行 ——
+-- 双模式由 main.c 保证任一时刻只有一个在跑（切换时反初始化 USB 并用另一套
+-- 描述符重新枚举）。没有「只编其中一个」的构建。
+-- USB 本身同样不可关：本芯片必然用到 USB。
 
--- WCH-Link（RVSWD 目标调试 / Flash 烧录，见 src/wchlink）：
---   xmake f --dap=n --wchlink=y    只编 WCH-Link
---   xmake f --dap=y --wchlink=y    双模式：一份固件，运行期由按键切换
--- 两者都占用 PA2=SWCLK / PA3=SWDIO，所以不可能同时运行 —— 双模式下由 main.c
--- 保证任一时刻只有一个在跑（切换时反初始化 USB 并用另一套描述符重新枚举）。
-option("wchlink")
-    set_default(false)
-    set_showmenu(true)
-    set_description("Enable WCH-Link (RVSWD target debug/flash, src/wchlink); with dap=y builds a runtime-switchable dual-mode firmware")
-option_end()
-
--- 用芯片出厂 UID（ESIG 区，96 位、每颗唯一）作为 USB 序列号。
+-- 用芯片出厂 UID（ESIG 区，96 位、每颗唯一）作为 CMSIS-DAP 的 USB 序列号。
 -- 关闭时用固定的 "DEADBEEF" —— 多块板子同时插在一台机器上时无法区分。
 -- 寄存器定义见 CH32X035 应用手册第 19 章「电子签名（ESIG）」。
--- 序列号在 src/dap/dap_main.c 里设置，所以依赖 CMSIS-DAP glue（--dap=y）。
+-- 序列号在 src/dap/dap_main.c 里设置。
 option("esig_sn")
     set_default(false)
     set_showmenu(true)
@@ -104,54 +91,37 @@ target("firmware")
     set_targetdir("build/$(mode)")
     set_filename("firmware.elf")
 
-    local dap_enabled = has_config("dap")
-    local wchlink_enabled = has_config("wchlink")
     local esig_sn_enabled = has_config("esig_sn")
-    local debugger_enabled = dap_enabled or wchlink_enabled
-    -- 双模式：两套调试器代码都编进来，运行期由 main.c 按键切换
-    local dual_mode = dap_enabled and wchlink_enabled
 
     -- 本工程应用代码
-    -- src/*.c        系统初始化、中断、main（main 内用 ENABLE_DAP / ENABLE_WCHLINK 区分路径）
+    -- src/*.c        系统初始化、中断、main（双模式：CMSIS-DAP / WCH-Link 运行期切换）
     -- src/bsp/*.c    延时/打印/系统/USB 硬件初始化/UID
     -- src/port/*.c   CherryUSB 的 CH32X035 设备端口 glue
     add_files("src/*.c", "src/bsp/*.c", "src/port/*.c")
     add_includedirs("src", "src/port")
-    add_defines("ENABLE_DAP=" .. (dap_enabled and 1 or 0))
-    add_defines("ENABLE_WCHLINK=" .. (wchlink_enabled and 1 or 0))
     add_defines("ESIG_SN=" .. (esig_sn_enabled and 1 or 0))
 
-    -- CDC <-> USART4 桥：三种调试器构建都要（COM 口行为保持一致）
+    -- CDC <-> USART4 桥（COM 口在两种模式下行为一致）
     -- drv_cdc_line.c 是两种模式**共用**的 usbd_cdc_acm_* 回调；不共用的话
     -- 双模式固件会撞成重复符号（两个模式各定义一份）。
-    if debugger_enabled then
-        add_files("src/drv/drv_uart.c", "src/drv/drv_cdc_line.c")
-        add_sysincludedirs("third_party/cherryrb")
-        add_files("third_party/cherryrb/chry_ringbuffer.c")
-    end
+    add_files("src/drv/drv_uart.c", "src/drv/drv_cdc_line.c")
+    add_sysincludedirs("third_party/cherryrb")
+    add_files("third_party/cherryrb/chry_ringbuffer.c")
 
-    -- 模式切换按键（只有双模式需要）
-    if dual_mode then
-        add_files("src/drv/drv_mode_button.c")
-    end
+    -- 模式切换按键 + 把当前模式持久化到用户选择字 Data0
+    add_files("src/drv/drv_mode_button.c", "src/drv/drv_mode_store.c")
 
-    -- CMSIS-DAP 专有的应用 glue，仅在启用 DAP 时参与编译
-    if dap_enabled then
-        add_files("src/dap/*.c")
-        add_includedirs("src/dap")
-    end
+    -- CMSIS-DAP 专有的应用 glue
+    add_files("src/dap/*.c")
+    add_includedirs("src/dap")
 
-    -- 双模式改用带 OVERLAY 的链接脚本：两种模式各自的私有代码/数据共用同一段
-    -- RAM 地址（它们不同时运行），由 main.c 在进入各自模式时初始化。
-    if dual_mode then
-        linker_script = "sdk/Ld/Link_highcode_nv_256B_dual.ld"
-    end
+    -- 链接脚本带 OVERLAY 段：两种模式各自的私有代码/数据共用同一段 RAM 地址
+    -- （它们不同时运行），由 main.c 在进入各自模式时初始化。
+    local linker_script = "sdk/Ld/Link_highcode_nv_256B_dual.ld"
 
     -- WCH-Link 专有的应用 glue（含无 LED / 无电源开关的空实现）
-    if wchlink_enabled then
-        add_files("src/wchlink/**/*.c", "src/wchlink/**/*.S",
-                  "src/status/*.c", "src/drv/drv_power_switch.c")
-    end
+    add_files("src/wchlink/**/*.c", "src/wchlink/**/*.S",
+              "src/status/*.c", "src/drv/drv_power_switch.c")
 
     -- CH32X035 SDK
     -- 注意：不编译 sdk/Debug/debug.c —— 它无条件定义了 _write 与 _sbrk，
@@ -175,17 +145,12 @@ target("firmware")
                        "third_party/cherryusb/class/msc",
                        "third_party/cherryusb/class/hid")
 
-    -- ===== CMSIS-DAP：可选（xmake f --dap=n 关闭） =====
-    -- 注意：不要在这个分支里打印启用/禁用状态。`xmake f` 会把 xmake.lua 求值两次，
-    -- 配置阶段读到的 dap 值可能还是旧值，会打出与实际相反的结论。
-    -- 权威状态统一在下面的 before_build 里输出。
-    if dap_enabled then
-        -- CherryDAP（上游 CMSIS-DAP 实现）
-        add_files("third_party/cherrydap/DAP/Source/DAP.c",
-                  "third_party/cherrydap/DAP/Source/DAP_vendor.c")
-        add_sysincludedirs("third_party/cherrydap",
-                           "third_party/cherrydap/DAP/Include")
-    end
+    -- ===== CMSIS-DAP =====
+    -- CherryDAP（上游 CMSIS-DAP 实现）
+    add_files("third_party/cherrydap/DAP/Source/DAP.c",
+              "third_party/cherrydap/DAP/Source/DAP_vendor.c")
+    add_sysincludedirs("third_party/cherrydap",
+                       "third_party/cherrydap/DAP/Include")
 
     -- 编译、汇编与链接选项
     add_cxflags(table.join(arch_flags, {
@@ -212,71 +177,49 @@ target("firmware")
 
     -- 按模式追加优化与符号设置
     --
-    -- WCH-Link 用 -Os 而不是 DAP 的 -O3：USB 端口层把 usbd_ep_start_read/write
-    -- 与 USBFS_IRQHandler 放进 .highcode（见 sdk/Ld/Link_highcode_nv_256B.ld，
-    -- .highcode 是 "> RAM AT > FLASH"），-O3 + LTO 会把整条 USB 调用链内联进
-    -- 中断处理函数，使 .highcode 膨胀到 18 KiB —— 同时吃光 62 KiB Flash 与
-    -- 20 KiB RAM。参考工程 ch32x035-usb-wchlink-main 同样使用 smallest。
-    -- DAP 需要 .highcode 里的 SWD 位翻转跑得快，所以保持 -O3 不变。
+    -- 两种模式（CMSIS-DAP / WCH-Link）的代码必须同时装进 62 KiB Flash，
+    -- 所以 debug 与 release 都用 -Os：
+    --   * release：-O3 + LTO 会把整条 USB 调用链内联进 .highcode 的中断处理函数，
+    --     使其膨胀到 18 KiB，同时吃光 62 KiB Flash 与 20 KiB RAM（参考工程
+    --     ch32x035-usb-wchlink-main 同样使用 smallest）。
+    --   * debug：-Og / -O0 下两套代码 + overlay 装不进 Flash（`.data` 直接报
+    --     region overflow），所以也改用 -Os + LTO，只保留调试符号。
     if is_mode("debug") then
         set_symbols("debug")
-        set_optimize("none")
-        add_cxflags("-Og", {force = true})
     else
         set_symbols("hidden")
-        if wchlink_enabled then
-            set_optimize("smallest")
-        else
-            set_optimize("fastest")
-        end
-        add_cxflags("-flto", {force = true})
-        add_ldflags("-flto", {force = true})
     end
+    set_optimize("smallest")
+    add_cxflags("-flto", {force = true})
+    add_ldflags("-flto", {force = true})
 
     -- 构建钩子，按触发顺序排列
 
     -- 打印当前模式、工具链与 SDK 目录
     before_build(function (target)
-        -- 选项组合与必需文件校验放在这里，而不是 xmake.lua 顶层：
+        -- 必需文件校验放在这里，而不是 xmake.lua 顶层：
         -- xmake 的工程描述作用域是精简沙箱，顶层没有 raise（顶层调用会报
         -- "attempt to call a nil value (global 'raise')"），而 before_build 是
         -- 脚本作用域，raise 可用，且它在任何编译动作之前执行。
-
-        -- 序列号在 src/dap/dap_main.c 中设置，而该文件只在启用 DAP 时才编译。
-        -- 这个组合下选项会静默失效，所以直接报错而不是默默编出一个用不上它的固件。
-        if has_config("esig_sn") and not has_config("dap") then
-            raise("esig_sn requires dap: the USB serial number is set in src/dap/dap_main.c, " ..
-                  "which is only compiled with CMSIS-DAP " ..
-                  "(use `xmake f --dap=y` or `--esig_sn=n`)")
-        end
-
+        --
+        -- 双模式固件同时编入 CMSIS-DAP 与 WCH-Link，下列文件全部必需；
+        -- 少任何一个都直接报错，而不是默默编出一个少了一半功能的固件。
         local required = {"src/usb_config.h",
                           "src/port/usb_ch32x035_dc_usbfs.c",
-                          "src/bsp/bsp_usb.c"}
-        if has_config("dap") or has_config("wchlink") then
-            table.insert(required, "src/drv/drv_uart.c")
-            table.insert(required, "src/drv/drv_cdc_line.c")
-        end
-        if has_config("dap") and has_config("wchlink") then
-            table.insert(required, "src/drv/drv_mode_button.c")
-        end
-        if has_config("dap") then
-            for _, req in ipairs({"src/dap/DAP_config.h",
-                                  "src/dap/dap_main.c",
-                                  "src/dap/sw_dp.c"}) do
-                table.insert(required, req)
-            end
-        end
-        if has_config("wchlink") then
-            for _, req in ipairs({"src/wchlink/usb/wchlink_usb.c",
-                                  "src/wchlink/transport/rvswd_phy_gpio.c",
-                                  "src/wchlink/target/rvswd_target_registry.c",
-                                  "src/bsp/bsp_uid.c",
-                                  "src/status/status_led.c",
-                                  "src/drv/drv_power_switch.c"}) do
-                table.insert(required, req)
-            end
-        end
+                          "src/bsp/bsp_usb.c",
+                          "src/drv/drv_uart.c",
+                          "src/drv/drv_cdc_line.c",
+                          "src/drv/drv_mode_button.c",
+                          "src/drv/drv_mode_store.c",
+                          "src/dap/DAP_config.h",
+                          "src/dap/dap_main.c",
+                          "src/dap/sw_dp.c",
+                          "src/wchlink/usb/wchlink_usb.c",
+                          "src/wchlink/transport/rvswd_phy_gpio.c",
+                          "src/wchlink/target/rvswd_target_registry.c",
+                          "src/bsp/bsp_uid.c",
+                          "src/status/status_led.c",
+                          "src/drv/drv_power_switch.c"}
         for _, req in ipairs(required) do
             if not os.isfile(req) then
                 raise("missing required source: " .. req)
@@ -288,15 +231,7 @@ target("firmware")
         cprint("${cyan}Using mode:${clear} %s", get_config("mode") or "debug")
         cprint("${cyan}Using toolchain:${clear} %s", toolchain_root)
         cprint("${cyan}Using SDK:${clear} sdk/")
-        local mode_label = "USB skeleton only (no debugger)"
-        if has_config("dap") and has_config("wchlink") then
-            mode_label = "CMSIS-DAP + WCH-Link (dual mode, runtime switchable)"
-        elseif has_config("dap") then
-            mode_label = "CMSIS-DAP"
-        elseif has_config("wchlink") then
-            mode_label = "WCH-Link"
-        end
-        cprint("${cyan}Mode:${clear} %s", mode_label)
+        cprint("${cyan}Mode:${clear} CMSIS-DAP + WCH-Link (dual mode, runtime switchable)")
         cprint("${cyan}Serial #:${clear} %s", has_config("esig_sn")
             and "chip ESIG UID (unique)" or "fixed DEADBEEF")
     end)
@@ -314,7 +249,18 @@ target("firmware")
         local targetfile = target:targetfile()
         local bindir = target:targetdir()
 
-        os.execv(prefix .. "objcopy", {"-O", "binary", targetfile, path.join(bindir, "firmware.bin")})
+        local binfile = path.join(bindir, "firmware.bin")
+        os.execv(prefix .. "objcopy", {"-O", "binary", targetfile, binfile})
+
+        -- OVERLAY 段的 LMA 由 ld 单独排布，**不受 FLASH 区域长度约束**，超了也不报错，
+        -- 只会静默生成一个装不进芯片的 .bin。所以按 .bin 实际长度兜底检查。
+        local flash_limit = 63232  -- 62K - 256（末尾 256 B 留给 NV 配置，见链接脚本）
+        local binsize = os.filesize(binfile)
+        if binsize > flash_limit then
+            raise(string.format("firmware.bin is %d B, exceeds the %d B FLASH limit " ..
+                                "(OVERLAY LMAs are not bounded by the FLASH region)",
+                                binsize, flash_limit))
+        end
 
         local sections_output = os.iorunv(prefix .. "size", {"--format=sysv", targetfile})
         local size_info = parse_berkeley_size(os.iorunv(prefix .. "size", {"--format=berkeley", targetfile}))
@@ -324,7 +270,7 @@ target("firmware")
         -- .highcode 在 SRAM 中执行；.stack 是 NOBITS，不应依赖 Berkeley 分类推断 RAM 占用
         size_info.ram = sum_section_sizes(sections, {".highcode", ".data", ".bss", ".stack"})
         -- 双模式的 overlay 段（dap_overlay / wchlink_overlay）被链接到**同一段地址**，
-        -- 不能相加，只能取较大的那个作为这段窗口的占用（见 sdk/Ld/*_dual.ld）。
+        -- 不能相加，只能取较大的那个作为这段窗口的占用（见 sdk/Ld/Link_highcode_nv_256B_dual.ld）。
         size_info.overlay = 0
         for _, name in ipairs({"dap_overlay", "wchlink_overlay"}) do
             local size = sections[name]

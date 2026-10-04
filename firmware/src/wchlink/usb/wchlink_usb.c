@@ -373,9 +373,6 @@ static void wchlink_cdc_service(void) {
     }
 }
 
-// 行编码 / DTR / RTS 的 usbd_cdc_acm_* 回调由 src/drv/drv_cdc_line.c 统一提供 ——
-// 双模式固件（--dap=y --wchlink=y）下两个模式各定义一份会撞成重复符号。
-
 static void wchlink_service_data_in(void) {
     size_t data_length;
 

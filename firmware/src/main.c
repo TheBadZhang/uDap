@@ -3,19 +3,12 @@
 
 #include <ch32x035.h>
 
-// 调试器功能由 xmake.lua 的选项控制，共有 4 种组合：
-//   --dap=y --wchlink=n   CMSIS-DAP（默认）
-//   --dap=n --wchlink=y   WCH-Link（RVSWD 目标调试 / Flash 烧录，见 src/wchlink）
-//   --dap=y --wchlink=y   双模式：一份固件，运行期用按键切换（见下）
-//   --dap=n --wchlink=n   只编 USB 骨架
-// 未定义时默认走 CMSIS-DAP，便于 MRS 等不传该宏的构建方式。
+// 本固件固定为**双模式**：CMSIS-DAP 与 WCH-Link 两套调试器代码都编入同一份固件，
+// 运行期用模式切换按键（PA4 接地）切换。没有「只编其中一个」的构建。
 //
-// mode_overlay.h 依据这两个宏推出 ENABLE_DUAL_MODE，并给出各模式私有
-// 代码/数据段的属性宏（单模式下退化成 .highcode，与改动前一致）。
+// mode_overlay.h 给出各模式私有代码/数据段的属性宏（overlay 段）。
 #include "mode_overlay.h"
 
-// 双模式：CMSIS-DAP 与 WCH-Link 两套代码都参与编译，运行期切换。
-//
 // 两者都要占用 PA2=SWCLK/DCK、PA3=SWDIO/DIO，所以**不可能同时运行**，
 // 只能互斥地跑：主循环里默认进 CMSIS-DAP，检测到模式切换按键就退出该循环、
 // 反初始化 USB，再进 WCH-Link 循环，反之亦然。
@@ -28,26 +21,20 @@
 //
 // 两种模式的私有代码与数据还会共用同一段 RAM（overlay），见 mode_overlay.h。
 
-// CDC（COM 口 <-> USART4，PB0=TX / PB1=RX）在三种调试器构建里行为一致，
-// 由 drv_uart_init() 与各自的周期性服务函数推进。纯 USB 骨架（两个都关）
-// 不注册 CDC 类，也就没必要初始化 UART。
-#if ENABLE_DAP || ENABLE_WCHLINK
-#define ENABLE_CDC_BRIDGE 1
-#else
-#define ENABLE_CDC_BRIDGE 0
-#endif
-
-#if ENABLE_CDC_BRIDGE
+// CDC（COM 口 <-> USART4，PB0=TX / PB1=RX）在两种模式下行为一致，
+// 由 drv_uart_init() 与各自的周期性服务函数推进。
 #include "drv/drv_uart.h"
-#endif
 
-#if ENABLE_DUAL_MODE
 #include <usbd_core.h>
 
+#include "dap_main.h"
 #include "drv/drv_mode_button.h"
+#include "drv/drv_mode_store.h"
+#include "wchlink/transport/rvswd_phy_gpio.h"
+#include "wchlink/usb/wchlink_usb.h"
 
 // ---------------------------------------------------------------------------
-// 双模式的 RAM overlay（见 src/mode_overlay.h 与
+// RAM overlay（见 src/mode_overlay.h 与
 // sdk/Ld/Link_highcode_nv_256B_dual.ld）
 // ---------------------------------------------------------------------------
 // 两种模式的私有代码与数据被链接到**同一段 RAM 地址**上：它们不同时运行
@@ -90,33 +77,10 @@ static void wchlink_overlay_init(void) {
                  _wchlink_overlay_code_end, _wchlink_overlay_bss_start,
                  _wchlink_overlay_bss_end);
 }
-#else
-// 单模式固件不做 overlay：段名退化成 .highcode（启动时由 startup 统一拷贝），
-// 数据留在常规 .bss/.data，所以这里什么都不用做。
-static void dap_overlay_init(void) {
-}
 
-static void wchlink_overlay_init(void) {
-}
-#endif
-
-#if ENABLE_DAP
-#include "dap_main.h"
-#endif
-
-#if ENABLE_WCHLINK
-#include "wchlink/transport/rvswd_phy_gpio.h"
-#include "wchlink/usb/wchlink_usb.h"
-#endif
-
-#if ENABLE_DAP
-// 双模式下按键一按下就退出本模式；单模式编译成常量 false，由 --gc-sections 回收
-static inline bool cmsisdap_mode_should_exit(void) {
-#if ENABLE_DUAL_MODE
+// 按键一按下就退出当前模式，回到 main 交出 USB 再切到另一种模式
+static inline bool mode_should_exit(void) {
     return drv_mode_button_pressed();
-#else
-    return false;
-#endif
 }
 
 // 注意：本函数自身就在 overlay 段（.highcode.dap）里，所以**不能**在这里调用
@@ -126,22 +90,12 @@ static void __attribute__((noinline, optimize("O2"))) cherrydap_process(void) DA
 static void __attribute__((noinline, optimize("O2"))) cherrydap_process(void) {
     chry_dap_init(0u, 0u);
 
-    while (!cmsisdap_mode_should_exit()) {
+    while (!mode_should_exit()) {
         chry_dap_handle();
         chry_dap_cdc_bridge();
     }
     // 模式切换时先回到 main（交出 USB 也在那里做），确保 overlay 被覆盖前
     // 已经不在执行 overlay 里的代码。
-}
-#endif
-
-#if ENABLE_WCHLINK
-static inline bool wchlink_mode_should_exit(void) {
-#if ENABLE_DUAL_MODE
-    return drv_mode_button_pressed();
-#else
-    return false;
-#endif
 }
 
 static void wchlink_process(void) {
@@ -151,11 +105,38 @@ static void wchlink_process(void) {
     rvswd_phy_gpio_init();
     wchlink_usb_init();
 
-    while (!wchlink_mode_should_exit()) {
+    while (!mode_should_exit()) {
         wchlink_usb_process();
     }
 }
-#endif
+
+// 进入一个模式并一直跑到按键要求退出。本函数在 .text（main 不参与 overlay），
+// 所以可以安全地先做该模式的 overlay 初始化、再跳进 overlay 里的 *_process()。
+// 新增模式时**只在这里加一个 case**（枚举定义见 drv/drv_mode_store.h）。
+static void mode_run(firmware_mode_t mode) {
+    switch (mode) {
+    case FIRMWARE_MODE_CMSIS_DAP:
+        // overlay 的初始化必须在**进入 overlay 代码之前**完成，所以放在这里
+        // （main 在 .text，不参与 overlay），不能放进 cherrydap_process() 内部。
+        dap_overlay_init();
+        cherrydap_process();
+        break;
+
+    case FIRMWARE_MODE_WCHLINK:
+        wchlink_overlay_init();
+        wchlink_process();
+        break;
+
+    default:
+        break;
+    }
+}
+
+// 轮转到下一个模式。取模实现：新模式只需在 firmware_mode_t 里追加成员，
+// 这里无需改动（FIRMWARE_MODE_COUNT 是哨兵）。
+static firmware_mode_t mode_next(firmware_mode_t mode) {
+    return (firmware_mode_t)(((unsigned)mode + 1u) % (unsigned)FIRMWARE_MODE_COUNT);
+}
 
 int main(void) {
     SystemInit();
@@ -165,48 +146,36 @@ int main(void) {
     bsp_delay_ms(10u);
 
     // COM 口 <-> USART4 (PB0=TX, PB1=RX)，默认 115200；
-    // 主机改 CDC 行编码时波特率会跟着变
-#if ENABLE_CDC_BRIDGE
+    // 两种模式下行为一致，主机改 CDC 行编码时波特率会跟着变
     drv_uart_init(0u);
-#endif
 
-#if ENABLE_DUAL_MODE
-    enum firmware_mode {
-        FIRMWARE_MODE_CMSIS_DAP = 0,
-        FIRMWARE_MODE_WCHLINK,
-    };
-    enum firmware_mode mode = FIRMWARE_MODE_CMSIS_DAP;
+    // 模式枚举与持久化的编码共用 firmware_mode_t（见 drv/drv_mode_store.h）：
+    // 枚举值就是写进用户选择字 Data0 的值。新增模式 = 枚举末尾追加成员 +
+    // 在 mode_run() 里加一个 case，主循环本身不用改。
+    firmware_mode_t mode = FIRMWARE_MODE_CMSIS_DAP;
 
     drv_mode_button_init();
 
+    // 上电时从用户选择字 Data0 恢复上次保存的模式；没有有效记录（全新芯片、
+    // 擦除态或校验失败）就保持默认的 CMSIS-DAP。
+    drv_mode_store_load(&mode);
+
     for (;;) {
-        if (mode == FIRMWARE_MODE_CMSIS_DAP) {
-            // overlay 的初始化必须在**进入 overlay 代码之前**完成，所以放在这里
-            // （main 在 .text，不参与 overlay），不能放进 cherrydap_process() 内部。
-            dap_overlay_init();
-            cherrydap_process();
-            // 交出 USB：下一个模式会用自己的描述符重新注册并初始化。
-            // 此时已经退出 overlay 代码，可以安全覆盖那段 RAM。
-            usbd_deinitialize(0u);
-            mode = FIRMWARE_MODE_WCHLINK;
-        } else {
-            wchlink_overlay_init();
-            wchlink_process();
-            usbd_deinitialize(0u);
-            mode = FIRMWARE_MODE_CMSIS_DAP;
-        }
+        // 进入当前模式并跑到按键要求退出（内部会先做该模式的 overlay 初始化）。
+        mode_run(mode);
+
+        // 交出 USB：下一个模式会用自己的描述符重新注册并初始化。
+        // 此时已经退出 overlay 代码，可以安全覆盖那段 RAM。
+        usbd_deinitialize(0u);
+
+        mode = mode_next(mode);
+
+        // 把新选的模式写回用户选择字 Data0，供下次上电恢复。写失败（读保护开启 /
+        // 擦写失败）只影响持久化，本次运行仍用刚切换过去的模式。
+        drv_mode_store_save(mode);
 
         // 同一次按住不要立刻触发反向切换。此时 USB 已反初始化，没有需要服务的
         // 端点，短暂自旋是安全的。
         drv_mode_button_wait_release();
     }
-#elif ENABLE_DAP
-    cherrydap_process();
-#elif ENABLE_WCHLINK
-    wchlink_process();
-#else
-    for (;;) {
-        bsp_delay_ms(1000u);
-    }
-#endif
 }
