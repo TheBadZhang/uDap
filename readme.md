@@ -1,10 +1,12 @@
-# uDap2
+# uDap
 
 基于 **CH32X035F8U** 的 **CMSIS-DAP 调试器 + USB↔串口桥**，单颗 USB 全速设备口同时提供
 SWD 调试和一路虚拟串口。仓库包含固件（`firmware/`）、KiCad 硬件设计（`hardware/`）与上位机
 脚本（`software/`）。
 
 - 调试器：CMSIS-DAP（bulk，WinUSB）——OpenOCD / pyOCD / probe-rs 可直接使用
+- 备选固件：**WCH-Link**（RVSWD，`1a86:8010`）——与 CMSIS-DAP 二选一，也可编成
+  **双模式固件**运行期按键切换，见第 4 节
 - 桥接串口：CDC ACM，对端是目标板上的 USART4（PB0=TX / PB1=RX），**不限制波特率**
 - SWD 时钟：请求 **≥6 MHz** 自动切到「快路径」，实测读写 **125 / 121 KiB/s**（16 KiB 块）
 - SWD 推荐档位：**6 MHz**（更快与更快实际同速，填高只减时序余量）
@@ -93,13 +95,15 @@ USB 描述符（`src/dap/dap_main.c`）：
 | USB 协议栈 | **CherryUSB** | 上游 submodule，不改动；端口 glue 在 `src/port/` |
 | 环形缓冲 | **CherryRB** | `chry_ringbuffer`，USB↔UART 两个方向的 FIFO |
 | DAP 协议栈 | **CherryDAP** | CMSIS-DAP 命令解析、SWD 事务层 |
+| 备选协议栈 | **WCH-Link**（`src/wchlink/`） | RVSWD 目标调试 / Flash 烧录，与 CherryDAP 二选一 |
 | 芯片 SDK | WCH CH32X035 SDK | Core / Peripheral / Startup / Linker，位于 `sdk/` |
 | 语言 | C（gnu11），无 RTOS，裸机主循环 + 中断 | |
-| USB 类 | CMSIS-DAP（WinUSB）+ CDC ACM | |
+| USB 类 | CMSIS-DAP（WinUSB）+ CDC ACM，或 WCH-Link 厂商接口 + CDC ACM | |
 | 自定义 SWD 后端 | `src/dap/sw_dp.c` | 快/慢双路径位翻转，热路径放 RAM |
 
 架构约定：`third_party/` **只放上游 submodule**，针对本板的适配（glue）全部放在
-`src/port/`、`src/bsp/`、`src/dap/`、`src/drv/` 与 `src/usb_config.h`，升级依赖不会产生冲突。
+`src/port/`、`src/bsp/`、`src/dap/`、`src/wchlink/`、`src/status/`、`src/drv/` 与
+`src/usb_config.h`，升级依赖不会产生冲突。
 
 ### 工具链与构建
 
@@ -107,9 +111,9 @@ USB 描述符（`src/dap/dap_main.c`）：
 | --- | --- |
 | 构建系统 | **xmake**（`firmware/xmake.lua`，工程根 = `firmware/`） |
 | 编译器 | WCH RISC-V Embedded GCC 12（`riscv-wch-elf-*`，MounRiver Studio 2 自带） |
-| 编译选项 | `-march=rv32imacxw -mabi=ilp32 -msmall-data-limit=8 -mno-save-restore`，`-O3 -Wall -std=gnu11`（release） |
-| 优化 | LTO + `--gc-sections`；`.highcode` 段启动时从 Flash 搬到 RAM 执行 |
-| 辅助脚本 | `firmware/build.ps1`（PowerShell，包了工具链路径与 `--dap=y/n` / `--esig_sn=y/n`） |
+| 编译选项 | `-march=rv32imacxw -mabi=ilp32 -msmall-data-limit=8 -mno-save-restore`，`-Wall -std=gnu11`（release） |
+| 优化 | LTO + `--gc-sections`；`.highcode` 段启动时从 Flash 搬到 RAM 执行。CMSIS-DAP 用 `-O3`，WCH-Link 必须用 `-Os`（否则 `.highcode` 膨胀到 18.5 KiB，Flash/RAM 都装不下） |
+| 辅助脚本 | `firmware/build.ps1`（PowerShell，包了工具链路径与 `--dap=y/n` / `--wchlink=y/n` / `--esig_sn=y/n`） |
 | 烧录 | `wlink`（WCH 官方）或 `wchisp` |
 
 ### 上位机 / 测试脚本
@@ -142,6 +146,20 @@ KiCad 工程：`hardware/uDap.kicad_sch` / `uDap.kicad_pcb`（含 Type-C 子图 
   （同一份字符串也用于 CMSIS-DAP 的 `DAP_GetSerNum`），多块板子可区分；
   默认仍是固定的 `DEADBEEF`。见 `firmware/README.md` 的「序列号」一节。
 - **可裁剪**：`xmake f --dap=n` 可关掉调试器功能，只编 USB 骨架（Flash 12.5 KiB）。
+- **可切换成 WCH-Link**：`xmake f --dap=n --wchlink=y` 编译成 WCH-Link（RVSWD），
+  主机侧识别为 `1a86:8010` / `WCH-Link`（Windows 自动绑定 WCH 官方 `WCHLink_A64`
+  驱动，设备名 `WCH-LinkRV`），支持 6 个目标族
+  （CH32X03X / CH32L10X / CH32V20X / CH32V30X / CH58X / CH59X）的连接、读写、擦除、
+  下载与校验，代码移植自 `firmware/ch32x035-usb-wchlink-main/`（Flash 41.8 KiB）。
+  **已上板实测**：WCH 官方 OpenOCD 连接并 examine 目标核，62 KB 整片擦除 + 编程 +
+  校验通过。与 CMSIS-DAP 不能同时运行（两者都用 PA2/PA3），CDC 串口行为完全不变。
+  本板没有状态灯 / 目标电源开关，相关命令成功但不生效，详见 `firmware/README.md`。
+- **双模式固件**：`xmake f --dap=y --wchlink=y` 把两套调试器代码编进**同一份固件**
+  （Flash 58.6 KiB / RAM 17.2 KiB），启动默认进 CMSIS-DAP，外接按键（**PA4 接 GND**）
+  可在运行期切到 WCH-Link 再切回来（切换会重新枚举 USB，主机侧等同于换设备）。
+  两者不同时运行，所以各自私有的代码与数据用链接脚本 `OVERLAY` 复用同一段 RAM
+  （RAM 从 25.3 KiB 降到 17.2 KiB）。不需要按键时用镊子把 PA4 短到 GND 也行。
+  见 `firmware/README.md` 的「双模式」一节。
 
 ---
 
@@ -155,12 +173,21 @@ cd firmware
 # 便捷脚本（release，CMSIS-DAP 默认启用）
 .\build.ps1
 .\build.ps1 -Dap n        # 只编 USB 骨架
+.\build.ps1 -Dap n -Wchlink y   # 编 WCH-Link（RVSWD 调试/烧录）
 .\build.ps1 -EsigSn y     # 用芯片 ESIG UID 作序列号（每颗芯片唯一）
 .\build.ps1 -Clean        # 先清理
 
 # 或直接用 xmake
 $env:WCH_TOOLCHAIN_ROOT = "D:/program/wch/MounRiver_Studio2/resources/app/resources/win32/components/WCH/Toolchain/RISC-V Embedded GCC12"
 xmake f -m release -y
+xmake -r
+
+# 编 WCH-Link（只编 WCH-Link 时需显式关掉 DAP）
+xmake f -m release --dap=n --wchlink=y -y
+xmake -r
+
+# 双模式：两套都编入，运行期按键切换（PA4 接 GND）
+xmake f -m release --dap=y --wchlink=y -y
 xmake -r
 
 # 用芯片 ESIG UID 作序列号（每颗芯片唯一，多块板子可区分）
@@ -170,13 +197,17 @@ xmake -r
 
 产物：`firmware/build/release/firmware.elf` / `.bin` / `.map`。
 
-> ⚠️ xmake 会把 option 值持久化到本地配置，构建脚本每次显式传 `--dap=...` 与
-> `--esig_sn=...`；直接敲 xmake 时也请显式指定，否则结果会被上一次的配置决定。
+> ⚠️ xmake 会把 option 值持久化到本地配置，构建脚本每次显式传 `--dap=...`、
+> `--wchlink=...` 与 `--esig_sn=...`；直接敲 xmake 时也请显式指定，
+> 否则结果会被上一次的配置决定。
 >
 > ⚠️ `--esig_sn=y` **需要** `--dap=y`（序列号在 `src/dap/dap_main.c` 里设置，
 > 该文件只在启用 CMSIS-DAP 时编译）。这个组合会被直接拒绝并给出提示。
 > 打开后 USB 序列号从 `DEADBEEF` 变成芯片 UID，主机侧会当成**另一台设备**，
 > 需要重新匹配一次驱动（WinUSB 自动匹配，无需手工装）。
+>
+> ⚠️ `--dap=y --wchlink=y` 是**双模式固件**：两套代码都编入，运行期用按键切换
+> （两者都占用 PA2/PA3，不能同时运行）。只想要其中一种时，另一个选项要显式设 n。
 
 ### 烧录
 
@@ -497,6 +528,11 @@ CH32X035 的 USART 是 **16 倍过采样**，`BRR = fPCLK / 波特率` 必须是
 | 单颗状态灯 | PB12 接的是 CMSIS-DAP `LED_CONNECTED_OUT`，由主机的 `DAP_HostStatus` 驱动。**OpenOCD 不发该命令 → 灯不亮**；pyOCD 会亮。详见 `firmware/README.md`。 |
 | 引脚未核对原理图 | SWD/nRESET/串口引脚取自参考工程，需按 `hardware/uDap.kicad_sch` 复核。 |
 | HSI 无晶振 | 波特率/时序精度依赖内部 RC，与标称值有零点几百分比偏差。 |
+| WCH-Link 功能已上板实测 | 已实测通过：USB 枚举、WCH 官方驱动识别为 `WCH-LinkRV`、WCH 官方 OpenOCD 连接并 examine 目标核、目标 ChipID/ESIG/Flash 读取、目标 RAM 读写、16 KiB 批量读（toggle 无异常）、**62 KiB 整片擦除 + 编程 + 校验**、CDC 开关与改波特率。测试前已备份目标 Flash，测后逐字节还原。详见 `firmware/README.md` 的「验证 → WCH-Link 模式」。 |
+| WCH-Link 模式无供电/指示 | 本板没有目标供电开关（参考工程的 PB12 在本板是 DAP 连通指示灯），也没有状态灯，因此 3.3V/5V 电源命令**成功但不生效**，会话状态也不可见。 |
+| WCH-Link 只支持 RISC-V 模式 | WCH-Link 官方有 RISC-V 与 ARM/DAP 两套模式，且**切换方式是替换 link 固件**（进 IAP 后写另一份固件：`WCH-Link_APP_IAP_RV.bin` / `..._ARM.bin` / `WCH-DAPLink_APP_IAP.bin`）。本工程只实现 RISC-V 那套：`--wchlink=y` 时它对模式查询恒答「RISC-V」，并实现了 IAP 钩子，但**它自己**不能变成官方 ARM 模式。本工程双模式固件里的"DAP 侧"是本工程自己的 CMSIS-DAP（`0d28:0204`），不是 WCH 的 ARM 固件。详见 `firmware/README.md` 的「Link 模式」。 |
+| WCH-Link 主机工具受限 | 只有支持 RVSWD 的主机能用。WCH 官方 OpenOCD 的 `wlinke` 适配器可正常连接（CH32X035 的 SDI 就是 DCK+DIO 两线）；**通用 OpenOCD/pyOCD 的 CMSIS-DAP 路径不适用于本模式**（此时 USB 身份是 `1a86:8010` 的 WCH-Link，不是 CMSIS-DAP）。 |
+| WCH-Link 与 CMSIS-DAP 不能同时运行 | 两者都用 PA2(SWCLK) / PA3(SWDIO)，任意时刻只有一套在跑。可以编成**双模式固件**（`--dap=y --wchlink=y`）用外接按键运行期切换，但切换会重新枚举 USB（主机侧等同于换设备）。 |
 
 ---
 
@@ -507,14 +543,16 @@ uDap2/
 ├── readme.md                    本文件：项目总览 + 性能数据
 ├── firmware/                    固件工程（xmake 工程根）
 │   ├── src/                     本工程代码（应用 + 移植 glue）
-│   │   ├── main.c               入口（ENABLE_DAP 分两条路径）
+│   │   ├── main.c               入口（ENABLE_DAP / ENABLE_WCHLINK 分路径）
 │   │   ├── system_ch32x035.c    时钟与系统初始化
 │   │   ├── ch32x035_it.c        中断实现
 │   │   ├── usb_config.h         CherryUSB 应用侧配置（必选）
-│   │   ├── bsp/                 延时 / 打印 / 系统 / USB 硬件初始化
-│   │   ├── port/                CherryUSB 的 CH32X035 USBFS 端口 glue
+│   │   ├── bsp/                 延时 / 打印 / 系统 / USB 硬件初始化 / 芯片 UID
+│   │   ├── port/                CherryUSB 的 CH32X035 USBFS 端口 glue（+ IN 传输取消扩展）
 │   │   ├── dap/                 CMSIS-DAP glue（DAP_config.h / dap_main.c / sw_dp.c）
-│   │   └── drv/drv_uart.c       CDC ↔ USART4 桥（CherryRB FIFO + 背压）
+│   │   ├── wchlink/             WCH-Link glue（RVSWD transport/protocol/rvswd/target/flash/session/usb）
+│   │   ├── status/status_led.c  状态灯接口（本板无灯，空实现）
+│   │   └── drv/                 drv_uart.c（CDC ↔ USART4 桥）+ drv_power_switch.c（空实现）
 │   ├── sdk/                     WCH CH32X035 SDK
 │   ├── third_party/             仅上游 submodule（cherryusb / cherryrb / cherrydap）
 │   ├── docs/                    性能文档与原始 CSV

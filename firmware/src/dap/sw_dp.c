@@ -1,5 +1,7 @@
 #include "DAP_config.h"
 
+#include "mode_overlay.h"
+
 #include <DAP.h>
 
 // 把快路径的半时钟等待换成带余量的实现（见 DAP_config.h 的说明）。
@@ -114,7 +116,7 @@ __STATIC_FORCEINLINE uint32_t SWD_Parity32(uint32_t value) {
         PIN_DELAY_FAST();             \
     } while (0)
 
-__attribute__((section(".highcode"), noinline, optimize("O2"))) static void SWD_FastWriteData(uint32_t val) {
+DAP_HIGHCODE_SECTION __attribute__((noinline, optimize("O2"))) static void SWD_FastWriteData(uint32_t val) {
     uint32_t n;
     uint32_t parity = SWD_Parity32(val);
 
@@ -138,7 +140,7 @@ __attribute__((section(".highcode"), noinline, optimize("O2"))) static void SWD_
 //   count:  sequence bit count
 //   data:   pointer to sequence bit data
 //   return: none
-__attribute__((section(".highcode"))) void SWJ_Sequence(uint32_t count, const uint8_t *data) {
+DAP_HIGHCODE_SECTION void SWJ_Sequence(uint32_t count, const uint8_t *data) {
     uint32_t val;
     uint32_t n;
 
@@ -205,7 +207,7 @@ void SWD_Sequence(uint32_t info, const uint8_t *swdo, uint8_t *swdi) {
 //   request: A[3:2] RnW APnDP
 //   data:    DATA[31:0]
 //   return:  ACK[2:0]
-__attribute__((section(".highcode"))) static uint8_t SWD_TransferFast(
+DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFast(
     uint32_t request, uint32_t *data) {
     uint32_t ack;
     uint32_t bit, bit1;
@@ -668,7 +670,7 @@ __attribute__((noinline)) static uint8_t SWD_TransferSlow(
 //   request: A[3:2] RnW APnDP
 //   data:    DATA[31:0]
 //   return:  ACK[2:0]
-__attribute__((section(".highcode"))) uint8_t SWD_Transfer(uint32_t request, uint32_t *data) {
+DAP_HIGHCODE_SECTION uint8_t SWD_Transfer(uint32_t request, uint32_t *data) {
     if (DAP_Data.fast_clock) {
         return SWD_TransferFast(request, data);
     } else {

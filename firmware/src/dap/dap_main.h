@@ -1,6 +1,8 @@
 #ifndef DAP_MAIN_H
 #define DAP_MAIN_H
 
+#include "mode_overlay.h"
+
 #include "DAP_config.h"
 
 // CherryUSB 的 class/cdc/usbd_cdc_acm.h 用了 bool 但自己没包含 <stdbool.h>，
@@ -68,7 +70,7 @@ extern struct usbd_interface hid_intf;
 
 void chry_dap_init(uint8_t busid, uint32_t reg_base);
 
-void chry_dap_handle(void) __attribute__((section(".highcode")));
+void chry_dap_handle(void) DAP_HIGHCODE_SECTION;
 
 // COM 口 <-> 目标串口（USART4）的周期性服务，两个方向都在这里推进：
 //   OUT 方向：CDC OUT 背压恢复（TX FIFO 余量足够后重挂端点）

@@ -432,9 +432,9 @@ static volatile uint16_t USB_ResponseCountI = 0;  // Response Count In
 static volatile uint16_t USB_ResponseCountO = 0;  // Response Count Out
 static volatile uint8_t USB_ResponseIdle = 1;     // Response Idle  Flag
 
-static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t USB_Request[DAP_PACKET_COUNT][DAP_PACKET_SIZE];   // Request  Buffer
-static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t USB_Response[DAP_PACKET_COUNT][DAP_PACKET_SIZE];  // Response Buffer
-static uint16_t USB_RespSize[DAP_PACKET_COUNT];                                                         // Response Size
+static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t USB_Request[DAP_PACKET_COUNT][DAP_PACKET_SIZE] DAP_PRIVATE_SECTION;   // Request  Buffer
+static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t USB_Response[DAP_PACKET_COUNT][DAP_PACKET_SIZE] DAP_PRIVATE_SECTION;  // Response Buffer
+static uint16_t USB_RespSize[DAP_PACKET_COUNT] DAP_PRIVATE_SECTION;                                                          // Response Size
 
 // COM 口现在是 USART4 (PB0=TX, PB1=RX) 的双向桥。
 //
@@ -451,9 +451,8 @@ static uint16_t USB_RespSize[DAP_PACKET_COUNT];                                 
 #define CDC_OUT_BUFFER_SIZE DAP_PACKET_SIZE
 #define CDC_IN_BUFFER_SIZE  512u
 
-static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t cdc_out_buffer[CDC_OUT_BUFFER_SIZE];
-static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t cdc_in_buffer[CDC_IN_BUFFER_SIZE];
-static volatile struct cdc_line_coding g_cdc_lincoding;
+static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t cdc_out_buffer[CDC_OUT_BUFFER_SIZE] DAP_PRIVATE_SECTION;
+static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t cdc_in_buffer[CDC_IN_BUFFER_SIZE] DAP_PRIVATE_SECTION;
 static volatile uint8_t cdc_tx_busy;
 
 // CDC OUT 背压标志：UART TX FIFO 余量不足时置位，表示 OUT 端点已停止重挂。
@@ -564,7 +563,7 @@ void usbd_event_handler(uint8_t busid, uint8_t event) {
     }
 }
 
-void dap_out_callback(uint8_t busid, uint8_t ep, uint32_t nbytes) __attribute__((section(".highcode")));
+void dap_out_callback(uint8_t busid, uint8_t ep, uint32_t nbytes) DAP_HIGHCODE_SECTION;
 void dap_out_callback(uint8_t busid, uint8_t ep, uint32_t nbytes) {
     (void)busid;
     if (USB_Request[USB_RequestIndexI][0] == ID_DAP_TransferAbort) {
@@ -585,7 +584,7 @@ void dap_out_callback(uint8_t busid, uint8_t ep, uint32_t nbytes) {
     }
 }
 
-void dap_in_callback(uint8_t busid, uint8_t ep, uint32_t nbytes) __attribute__((section(".highcode")));
+void dap_in_callback(uint8_t busid, uint8_t ep, uint32_t nbytes) DAP_HIGHCODE_SECTION;
 void dap_in_callback(uint8_t busid, uint8_t ep, uint32_t nbytes) {
     (void)busid;
     if (USB_ResponseCountI != USB_ResponseCountO) {
@@ -601,7 +600,7 @@ void dap_in_callback(uint8_t busid, uint8_t ep, uint32_t nbytes) {
     }
 }
 
-void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes) __attribute__((section(".highcode"), noinline));
+void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes) DAP_HIGHCODE_SECTION __attribute__((noinline));
 void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes) {
     (void)busid;
     (void)ep;
@@ -626,7 +625,7 @@ void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes) {
     }
 }
 
-void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes) __attribute__((section(".highcode"), noinline));
+void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes) DAP_HIGHCODE_SECTION __attribute__((noinline));
 void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes) {
     (void)busid;
     (void)ep;
@@ -801,26 +800,8 @@ void chry_dap_handle(void) {
     }
 }
 
-void usbd_cdc_acm_set_line_coding(uint8_t busid, uint8_t intf, struct cdc_line_coding *line_coding) {
-    (void)busid;
-    (void)intf;
-
-    // 行编码除了回存（主机打开串口时要能读回自己的配置），还用来设真实波特率。
-    //
-    // 不再对速率做上限检查（见文件上方「关于 COM 口波特率」的说明）：主机下什么
-    // 就设什么，UART 硬件能产生多少就是多少。注意 USART 是 16 倍过采样，
-    // BRR = 48 MHz / 波特率，标称上限 3 Mbaud；超过后 BRR 整数部分为 0，
-    // 实际速率不再受控（≈48 MHz / BRR）。
-    if (line_coding != NULL && line_coding->dwDTERate != 0U) {
-        memcpy((uint8_t *)&g_cdc_lincoding, line_coding, sizeof(struct cdc_line_coding));
-        drv_uart_set_baudrate(line_coding->dwDTERate);
-    }
-}
-
-void usbd_cdc_acm_get_line_coding(uint8_t busid, uint8_t intf, struct cdc_line_coding *line_coding) {
-    (void)busid;
-    memcpy(line_coding, (uint8_t *)&g_cdc_lincoding, sizeof(struct cdc_line_coding));
-}
+// 行编码的 4 个 usbd_cdc_acm_* 回调由 src/drv/drv_cdc_line.c 统一提供 ——
+// 双模式固件（--dap=y --wchlink=y）下如果两个模式各定义一份，会撞成重复符号。
 
 #if CONFIG_CHERRYDAP_USE_MSC
 #define BLOCK_SIZE  512
