@@ -1,0 +1,113 @@
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+// WCH-Link USB wire family 编号
+enum wchlink_wire_family {
+    WCHLINK_FAMILY_CONFIG = 0x06u,
+    WCHLINK_FAMILY_DMI = 0x08u,
+    WCHLINK_FAMILY_PARTIAL_WRITE = 0x0au,
+    WCHLINK_FAMILY_RESET = 0x0bu,
+    WCHLINK_FAMILY_SPEED = 0x0cu,
+    WCHLINK_FAMILY_CONTROL = 0x0du,
+    WCHLINK_FAMILY_DEVICE_MODE = 0x0fu,
+    WCHLINK_FAMILY_INFO = 0x11u,
+};
+
+enum wchlink_wire_prefix {
+    WCHLINK_COMMAND_PREFIX = 0x81u,
+    WCHLINK_REPLY_PREFIX = 0x82u,
+};
+
+enum wchlink_dmi_operation {
+    WCHLINK_DMI_OPERATION_READ = 0x01u,
+    WCHLINK_DMI_OPERATION_WRITE = 0x02u,
+};
+
+enum wchlink_partial_write_reply {
+    WCHLINK_PARTIAL_WRITE_REPLY_OK = 0x02u,
+    WCHLINK_PARTIAL_WRITE_REPLY_FAILED = 0x15u,
+};
+
+enum wchlink_config_command {
+    WCHLINK_CONFIG_READ_PROTECTION = 0x01u,
+    WCHLINK_CONFIG_DISABLE_PROTECTION = 0x02u,
+    WCHLINK_CONFIG_ENABLE_PROTECTION = 0x03u,
+    WCHLINK_CONFIG_WRITE_PROTECTION = 0x04u,
+};
+
+enum wchlink_config_reply {
+    WCHLINK_CONFIG_WRITE_UNPROTECTED = 0x00u,
+    WCHLINK_CONFIG_READ_PROTECTED = 0x01u,
+    WCHLINK_CONFIG_READ_UNPROTECTED = 0x02u,
+    WCHLINK_CONFIG_WRITE_PROTECTED = 0x11u,
+};
+
+enum wchlink_control_command {
+    WCHLINK_CONTROL_IDENTIFY = 0x01u,
+    WCHLINK_CONTROL_CONNECT = 0x02u,
+    WCHLINK_CONTROL_HOLD = 0x03u,
+    WCHLINK_CONTROL_SET_CHIP_TYPE = 0x04u,
+    WCHLINK_CONTROL_GET_ROMRAM_OLD = 0x04u,
+    WCHLINK_CONTROL_SET_ROMRAM_OLD = 0x05u,
+    WCHLINK_CONTROL_CHECK_QE = 0x06u,
+    WCHLINK_CONTROL_ENABLE_QE = 0x07u,
+    WCHLINK_CONTROL_CLEAR_CODE_FLASH = 0x08u,
+    WCHLINK_CONTROL_POWER_3V3_ON = 0x09u,
+    WCHLINK_CONTROL_POWER_3V3_OFF = 0x0au,
+    WCHLINK_CONTROL_POWER_5V_ON = 0x0bu,
+    WCHLINK_CONTROL_POWER_5V_OFF = 0x0cu,
+    WCHLINK_CONTROL_CLEAR_CODE_FLASH_B = 0x0fu,
+    WCHLINK_CONTROL_GET_ROMRAM_NEW = 0x17u,
+    WCHLINK_CONTROL_SET_ROMRAM_NEW = 0x18u,
+    WCHLINK_CONTROL_RESET_LOW = 0x13u,
+    WCHLINK_CONTROL_STOP = 0xffu,
+};
+
+enum wchlink_reset_command {
+    WCHLINK_RESET_SOFT = 0x01u,
+    WCHLINK_RESET_NORMAL = 0x03u,
+    WCHLINK_RESET_MRS_RUN = 0x06u,
+};
+
+enum wchlink_device_mode_command {
+    WCHLINK_DEVICE_MODE_IAP = 0x01u,
+    WCHLINK_DEVICE_MODE_QUERY = 0x02u,
+};
+
+struct wchlink_wire_chip_info {
+    bool legacy_layout;
+    uint32_t flash_size;
+    uint32_t uid_low;
+    uint32_t uid_high;
+    uint32_t uid_tail;
+    uint32_t chip_id;
+};
+
+// Wire encoder 只写入调用者提供的 buffer，容量不足或参数无效时返回 0
+size_t wchlink_wire_ack(uint8_t *response, size_t capacity, uint8_t family);
+size_t wchlink_wire_unsupported(uint8_t *response, size_t capacity,
+                                uint8_t family);
+size_t wchlink_wire_family_error(uint8_t *response, size_t capacity,
+                                 uint8_t family, uint32_t code);
+size_t wchlink_wire_target_error(uint8_t *response, size_t capacity,
+                                 uint32_t code);
+size_t wchlink_wire_command_reply(uint8_t *response, size_t capacity,
+                                  uint8_t family, uint8_t command);
+size_t wchlink_wire_identity(uint8_t *response, size_t capacity);
+size_t wchlink_wire_connect_reply(uint8_t *response, size_t capacity,
+                                  bool connected, uint32_t error,
+                                  uint8_t family, uint32_t chip_id);
+size_t wchlink_wire_chip_info(uint8_t *response, size_t capacity,
+                              const struct wchlink_wire_chip_info *info);
+size_t wchlink_wire_dmi_reply(uint8_t *response, size_t capacity,
+                              uint8_t address, uint32_t data, bool success,
+                              bool retryable);
+size_t wchlink_wire_loader_error(uint8_t *response, size_t capacity,
+                                 uint8_t family, uint8_t loader_error,
+                                 uint8_t dmi_status, uint32_t address,
+                                 uint32_t abstractcs);
+size_t wchlink_wire_data_reply(uint8_t *response, size_t capacity,
+                               uint8_t status);

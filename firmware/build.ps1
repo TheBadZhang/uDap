@@ -3,6 +3,8 @@
 # 用法:
 #   .\build.ps1               # release 构建（CMSIS-DAP 启用，序列号固定）
 #   .\build.ps1 -Dap n        # 关闭 CMSIS-DAP，只编 USB 骨架
+#   .\build.ps1 -Wchlink y    # 编 WCH-Link（RVSWD 调试/烧录）而不是 CMSIS-DAP
+#   .\build.ps1 -Dap y -Wchlink y   # 双模式：两套都编入，运行期按键切换（PA4 接地）
 #   .\build.ps1 -EsigSn y     # 用芯片 ESIG UID 作序列号（每颗芯片唯一）
 #   .\build.ps1 -Clean        # 先清理再构建
 #   .\build.ps1 -Mode debug   # debug 构建
@@ -26,6 +28,12 @@ param(
     [ValidateSet('y', 'n')]
     [string]$Dap = 'y',
 
+    # WCH-Link（RVSWD 目标调试 / Flash 烧录，见 src/wchlink）开关，对应
+    # xmake.lua 的 option("wchlink")，与 -Dap 互斥（两者都用 PA2/PA3）。
+    # 同样每次都显式传 --wchlink=...（xmake 选项值会持久化）。
+    [ValidateSet('y', 'n')]
+    [string]$Wchlink = 'n',
+
     # 用芯片出厂 UID（ESIG 区，96 位）作 USB 序列号，对应 xmake.lua 的 option("esig_sn")。
     # 默认 n = 固定串 "DEADBEEF"。打开后多块板子才能被主机区分。
     # 同样每次都显式传 --esig_sn=...（xmake 选项值会持久化）。
@@ -47,10 +55,15 @@ $env:WCH_TOOLCHAIN_ROOT = 'D:\program\wch\MounRiver_Studio2\resources\app\resour
 Push-Location $PSScriptRoot
 try {
     $dapLabel = if ($Dap -eq 'y') { '启用' } else { '关闭' }
+    $wchlinkLabel = if ($Wchlink -eq 'y') { '启用' } else { '关闭' }
     $snLabel = if ($EsigSn -eq 'y') { '芯片 ESIG UID（每颗唯一）' } else { '固定 DEADBEEF' }
     Write-Host "工具链: $env:WCH_TOOLCHAIN_ROOT" -ForegroundColor DarkGray
     Write-Host "CMSIS-DAP: $dapLabel (-Dap $Dap)" -ForegroundColor DarkGray
+    Write-Host "WCH-Link : $wchlinkLabel (-Wchlink $Wchlink)" -ForegroundColor DarkGray
     Write-Host "序列号   : $snLabel (-EsigSn $EsigSn)" -ForegroundColor DarkGray
+    if ($Dap -eq 'y' -and $Wchlink -eq 'y') {
+        Write-Host '模式     : 双模式（两套代码都编入，运行期用模式切换按键切换）' -ForegroundColor Yellow
+    }
 
     # 序列号在 src/dap/dap_main.c 里设置，该文件只在启用 DAP 时编译。
     # xmake.lua 里也有同样的检查，这里先拦一次给出更直白的提示。
@@ -64,7 +77,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'xmake clean 失败' }
     }
 
-    $configArgs = @('f', '-m', $Mode, "--dap=$Dap", "--esig_sn=$EsigSn", '-y')
+    $configArgs = @('f', '-m', $Mode, "--dap=$Dap", "--wchlink=$Wchlink", "--esig_sn=$EsigSn", '-y')
     if ($Reconfigure) { $configArgs += '-c' }
     Write-Host "==> xmake $($configArgs -join ' ')" -ForegroundColor Cyan
     & xmake @configArgs

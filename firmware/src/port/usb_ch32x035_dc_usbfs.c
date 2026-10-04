@@ -13,6 +13,8 @@
 #include <ch32x035_usb.h>
 #include <usbd_core.h>
 
+#include "usb_ch32x035_dc_usbfs.h"
+
 #ifdef CONFIG_USB_HS
 #error "CH32X035 only provides a USB full-speed device controller"
 #endif
@@ -752,6 +754,28 @@ int usbd_ep_close(uint8_t busid, const uint8_t ep) {
         x035_usb_set_mode(ep_idx, in, false);
         x035_usb_restore_dma(ep_idx);
     }
+    return 0;
+}
+
+int ch32x035_usbd_ep_abort_in(uint8_t busid, uint8_t ep) {
+    uint8_t ep_idx = USB_EP_GET_IDX(ep);
+    x035_usb_ep_state_t *state;
+
+    if (!x035_usb_bus_valid(busid) || !USB_EP_DIR_IS_IN(ep) || (ep & 0x70u) != 0u ||
+        ep_idx == 0u || !x035_usb_ep_valid(ep_idx)) {
+        return -USB_ERR_INVAL;
+    }
+
+    state = &s_dcd.in_ep[ep_idx];
+    if (!state->enabled || state->stalled) {
+        return -USB_ERR_NOTCONN;
+    }
+
+    // 废弃尚未被主机读取的 IN 传输：清空 TX_LEN 并回到 NAK，
+    // **不翻转 toggle**，让下一次写入沿用当前 Bulk 会话的 DATA PID。
+    x035_usb_reset_transfer(state);
+    *x035_usb_tx_len_reg(ep_idx) = 0u;
+    x035_usb_set_tx_response(ep_idx, USBFS_UEP_T_RES_NAK);
     return 0;
 }
 
