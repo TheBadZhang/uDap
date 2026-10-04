@@ -32,7 +32,7 @@ param(
     # xmake.lua 的 option("wchlink")，与 -Dap 互斥（两者都用 PA2/PA3）。
     # 同样每次都显式传 --wchlink=...（xmake 选项值会持久化）。
     [ValidateSet('y', 'n')]
-    [string]$Wchlink = 'n',
+    [string]$Wchlink = 'y',
 
     # 用芯片出厂 UID（ESIG 区，96 位）作 USB 序列号，对应 xmake.lua 的 option("esig_sn")。
     # 默认 n = 固定串 "DEADBEEF"。打开后多块板子才能被主机区分。
