@@ -44,7 +44,8 @@ param(
 
     [string]$Interface = 'cmsis-dap',
 
-    # OpenOCD 安装根目录（bin/ 与 scripts/ 的父目录）
+    # OpenOCD 安装根目录（其下有 bin\openocd.exe；scripts 在 scripts\ 或
+    # share\openocd\scripts\，两种布局都能识别）。留空或路径不存在时回退到 PATH。
     [string]$OpenOcdRoot = 'D:\program\wch\MounRiver_Studio2\resources\app\resources\win32\components\WCH\OpenOCD\OpenOCD',
 
     # 固件切到「快路径」的 SWCLK 阈值（kHz），只用于打印标注；
@@ -64,32 +65,73 @@ function Fail([string]$Message) {
 
 # ---------- 定位 OpenOCD ----------
 
+# OpenOCD 的 scripts 目录不叫一个名字：官方 Windows/scoop 包放在
+# <root>\share\openocd\scripts，MounRiver/WCH 包放在 <root>\scripts。
+# 从某个目录起向上最多找 4 层，返回第一个真正含 interface\ 与 target\ 的候选。
+function Find-OpenOcdScripts {
+    param([string]$StartDir)
+
+    $dir = $StartDir
+    for ($i = 0; $i -lt 4 -and $dir; $i++) {
+        foreach ($rel in 'scripts', 'share\openocd\scripts', 'share\scripts') {
+            $cand = Join-Path $dir $rel
+            if ((Test-Path (Join-Path $cand 'interface')) -and
+                (Test-Path (Join-Path $cand 'target'))) {
+                return $cand
+            }
+        }
+        $dir = Split-Path $dir -Parent
+    }
+    return $null
+}
+
+# scoop 等包管理器把 shim 放在 <pkgmgr>\shims\openocd.exe，真实 exe 在别处；
+# shim 旁边的同名 .shim 文件里写着真实路径（形如 path = "C:\...\openocd.exe"）。
+# 定位 scripts 必须用真实安装目录，否则向上找只会落到包管理器根目录。
+function Resolve-OpenOcdShim {
+    param([string]$ExePath)
+
+    $shim = [System.IO.Path]::ChangeExtension($ExePath, '.shim')
+    if (-not (Test-Path $shim)) { return $null }
+
+    $hit = Select-String -Path $shim -Pattern '^\s*path\s*=\s*"(.+?)"' |
+           Select-Object -First 1
+    if (-not $hit) { return $null }
+    return $hit.Matches[0].Groups[1].Value
+}
+
 function Resolve-OpenOcd {
     param([string]$Root)
 
     if ($Root) {
         $exe = Join-Path $Root 'bin\openocd.exe'
-        $scripts = Join-Path $Root 'scripts'
         if (Test-Path $exe) {
-            return @{ Exe = $exe; Scripts = $scripts }
+            $scripts = Find-OpenOcdScripts $Root
+            if ($scripts) {
+                return @{ Exe = $exe; Scripts = $scripts }
+            }
         }
     }
 
-    # 退而求其次：从 PATH 里找，scripts 用同级的 scripts 目录
+    # 退而求其次：从 PATH 里找。命中的可能是真 exe，也可能是包管理器的 shim。
     $cmd = Get-Command openocd -ErrorAction SilentlyContinue
     if ($cmd) {
-        $binDir = Split-Path $cmd.Source -Parent
-        $scripts = Join-Path (Split-Path $binDir -Parent) 'scripts'
-        return @{ Exe = $cmd.Source; Scripts = $scripts }
+        $shimTarget = Resolve-OpenOcdShim $cmd.Source
+        foreach ($candidate in @($shimTarget, $cmd.Source)) {
+            if (-not $candidate) { continue }
+            $scripts = Find-OpenOcdScripts (Split-Path $candidate -Parent)
+            if ($scripts) {
+                return @{ Exe = $candidate; Scripts = $scripts }
+            }
+        }
+        Fail ("找到了 openocd.exe（$($cmd.Source)），但没能在它附近找到 scripts 目录。" +
+              "请用 -OpenOcdRoot 指定安装根目录。")
     }
 
-    Fail "找不到 openocd.exe。请用 -OpenOcdRoot 指定安装根目录（含 bin\ 和 scripts\）。"
+    Fail "找不到 openocd.exe。请用 -OpenOcdRoot 指定安装根目录（含 bin\openocd.exe）。"
 }
 
 $ocd = Resolve-OpenOcd $OpenOcdRoot
-if (-not (Test-Path $ocd.Scripts)) {
-    Fail "找不到 OpenOCD scripts 目录: $($ocd.Scripts)"
-}
 
 # ---------- 校验参数 ----------
 

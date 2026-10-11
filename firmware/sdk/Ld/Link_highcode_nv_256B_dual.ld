@@ -9,19 +9,29 @@
  * Flash 够（约 51 KiB / 63232 B），但 RAM 需要约 25.3 KiB 而只有 20 KiB。
  * 两者既然不同时运行，各自私有的那部分 RAM 就可以重叠。
  *
- * 段划分：
- *   .highcode            共用（USB 端口层热路径），照原样在启动时从 Flash 拷入 RAM
- *   .highcode.dap        仅 CMSIS-DAP：sw_dp.c / dap_main.c 的热路径
- *   .text.DAP_ProcessCommand  仅 CMSIS-DAP（CherryDAP 的命令分发）
- *   .overlay.dap         仅 CMSIS-DAP：USB 收发缓冲
+ * 段划分（重构后：**只有数据**还参与 overlay）：
+ *   .highcode            共用（USB 端口层热路径）+ CMSIS-DAP 私有热路径
+ *                        （.highcode.dap），启动时一次性从 Flash 拷入 RAM
+ *   .highcode.dap        仅 CMSIS-DAP：sw_dp.c / dap_main.c 的热路径（并进 .highcode）
+ *   .text.DAP_ProcessCommand  仅 CMSIS-DAP（CherryDAP 的命令分发）—— **留在 Flash**：
+ *                        收进 RAM 会多占 2.9 KiB 并让 RAM 溢出（见 .highcode 处说明）
+ *   .overlay.dap         仅 CMSIS-DAP：USB 收发缓冲（RAM，overlay）
  *   .highcode.wchlink    仅 WCH-Link：rvswd_phy_gpio.c 的位翻转
- *   .overlay.wchlink     仅 WCH-Link：会话/传输状态与大缓冲
+ *                        **链接进 .text，直接在 Flash 上执行（XIP）**
+ *   .overlay.wchlink     仅 WCH-Link：会话/传输状态与大缓冲（RAM，overlay）
  *
- * OVERLAY 把 dap_overlay 与 wchlink_overlay 放在同一段 VMA（取两者较大的），
- * 并为每段生成 __load_start_<name> / __load_stop_<name> 作为 Flash 侧 LMA。
- * 由于启动时无法同时初始化两份内容，**由 src/main.c 在进入各自模式时**：
- *   1. 把该模式的代码段从 __load_start_ 拷到 _xxx_overlay_code_start；
- *   2. 把该模式的 BSS（_xxx_overlay_bss_start.._end）清零。
+ * 为什么只有数据留在 overlay：
+ *   1. 数据不能放 Flash（要写），而两模式的数据互斥 —— 重叠才省 RAM。实测
+ *      WCH-Link 数据 6.0 KiB vs CMSIS-DAP 数据 1.6 KiB，窗口取较大的 6.0 KiB。
+ *   2. 代码不需要复制：DAP 热路径（2.4 KiB）并进常驻 RAM 的 .highcode，由
+ *      startup_ch32x035_highcode.S 在**启动时**拷一次；WCH-Link 热路径
+ *      （2.0 KiB）改为在 Flash 上执行。代价是 WCH-Link 每次取指多 2 个等待
+ *      周期（48 MHz 下 FLASH_ACTLR_LATENCY_2），换来省掉运行期代码拷贝。
+ *
+ * 于是运行期只剩**清零数据段**（没有代码拷贝）：由 src/main.c 在进入某模式时执行
+ *   _xxx_overlay_bss_start.._xxx_overlay_bss_end = 0
+ * OVERLAY 取两者较大的作为窗口，并保留 AT(...) 让这段零内容仍有合法 LMA
+ * （否则 LMA=VMA 落在 RAM 地址上，objcopy 生成 .bin 时会撑爆）。
  *
  * 注意 .bss 在本脚本里去掉了 `AT > FLASH`：原来那会让 NOBITS 的 .bss 在
  * Flash 地址空间里白占一份等长区间（实测 0x31ac ≈ 12.7 KiB），而 overlay 的
@@ -68,8 +78,16 @@ SECTIONS
     {
         . = ALIGN(4);
         PROVIDE(_highcode_vma_start = .);
-        /* 只收共用的 .highcode；.highcode.dap / .highcode.wchlink 走下面的 OVERLAY */
+        /* 常驻 RAM 的热路径，启动时由 startup_ch32x035_highcode.S 一次性拷入：
+         *   .highcode       共用（USB 端口层）
+         *   .highcode.dap   仅 CMSIS-DAP（sw_dp.c / dap_main.c）
+         * 两者不再参与运行期 overlay，所以切进 DAP 模式时无需任何代码拷贝。
+         *
+         * 注意 .text.DAP_ProcessCommand（CherryDAP 的命令分发，约 2.9 KiB）**不**收进来：
+         * 它由下面 .text 的 *(.text.*) 收走，留在 Flash。收进 RAM 会多占 2.9 KiB，
+         * 实测 RAM 会到 20.50 KiB（> 20 KiB 上限）且 .bss 会压到 .stack 上。 */
         *(.highcode);
+        *(.highcode.dap)
         . = ALIGN(4);
         PROVIDE(_highcode_vma_end = .);
     } > RAM AT > FLASH
@@ -79,6 +97,9 @@ SECTIONS
         . = ALIGN(4);
         *(.text)
         *(.text.*)
+        /* WCH-Link 私有热路径：直接在 Flash 上执行（XIP，2 个等待周期）。
+         * 放在这里 = 不占 RAM、也不需要运行期拷贝；代价见文件头的说明。 */
+        *(.highcode.wchlink)
         *(.rodata)
         *(.rodata*)
         *(.gnu.linkonce.t.*)
@@ -169,8 +190,9 @@ SECTIONS
     } > RAM AT > FLASH
 
     /*
-     * ===== 双模式 overlay：两种模式各自的私有代码与数据共用这段地址 =====
-     * LMA 紧跟在 .data 的 LMA 之后；两段取较大的作为窗口大小。
+     * ===== 双模式 overlay：两种模式各自的私有**数据**共用这段地址 =====
+     * 代码已分别并进 .highcode（RAM，启动时拷入）与 .text（Flash XIP），
+     * 这里只剩数据；LMA 紧跟在 .data 的 LMA 之后，两段取较大的作为窗口大小。
      */
     __dual_overlay_lma = LOADADDR(.data) + SIZEOF(.data);
 
@@ -179,12 +201,6 @@ SECTIONS
         dap_overlay
         {
             . = ALIGN(4);
-            _dap_overlay_code_start = .;
-            *(.highcode.dap)
-            *(.text.DAP_ProcessCommand)
-            . = ALIGN(4);
-            _dap_overlay_code_end = .;
-
             _dap_overlay_bss_start = .;
             *(.overlay.dap)
             . = ALIGN(4);
@@ -194,11 +210,6 @@ SECTIONS
         wchlink_overlay
         {
             . = ALIGN(4);
-            _wchlink_overlay_code_start = .;
-            *(.highcode.wchlink)
-            . = ALIGN(4);
-            _wchlink_overlay_code_end = .;
-
             _wchlink_overlay_bss_start = .;
             *(.overlay.wchlink)
             . = ALIGN(4);

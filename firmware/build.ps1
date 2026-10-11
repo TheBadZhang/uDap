@@ -4,8 +4,8 @@
 # 运行期用模式切换按键（PA4 接地）切换。没有「只编其中一个」的构建。
 #
 # 用法:
-#   .\build.ps1               # release 构建（序列号固定）
-#   .\build.ps1 -EsigSn y     # 用芯片 ESIG UID 作序列号（每颗芯片唯一）
+#   .\build.ps1               # release 构建（默认用芯片 ESIG UID 作序列号）
+#   .\build.ps1 -EsigSn n     # 退回固定串 DEADBEEF（所有板子相同）
 #   .\build.ps1 -Clean        # 先清理再构建
 #   .\build.ps1 -Mode debug   # debug 构建
 #   .\build.ps1 -Reconfigure  # 强制重新生成配置（工具链路径变化后用）
@@ -23,12 +23,12 @@ param(
     [string]$Mode = 'release',
 
     # 用芯片出厂 UID（ESIG 区，96 位）作 CMSIS-DAP 的 USB 序列号，对应
-    # xmake.lua 的 option("esig_sn")。默认 n = 固定串 "DEADBEEF"，
-    # 打开后多块板子才能被主机区分。
+    # xmake.lua 的 option("esig_sn")。**默认 y** —— 每颗芯片唯一，多块板子
+    # 同时插在一台机器上才能被主机区分；传 n 退回固定的 "DEADBEEF"。
     # 注意：xmake 会把选项值持久化到本地配置。所以这里每次都显式传
     # --esig_sn=...，保证构建结果只由参数决定。
     [ValidateSet('y', 'n')]
-    [string]$EsigSn = 'n',
+    [string]$EsigSn = 'y',
 
     [switch]$Clean,
     [switch]$Reconfigure

@@ -39,7 +39,7 @@ flowchart LR
     USBFS --> DAPC
     USBFS --> BR
     DAPC -- "SWD 位翻转" --> TGT
-    BR -- "USART4 115200~2M" --> UART
+    BR -- "USART4 3M Max" --> UART
 ```
 
 ---
@@ -56,7 +56,7 @@ flowchart LR
 | Flash | 62 KiB 可用（链接脚本按「62K − 256B」划分，末尾 256B 留给 NV 配置） |
 | SRAM | 20 KiB |
 | USB | 内置 USB 全速（12 Mbps）设备控制器，DP/DM 固定在 PC16/PC17 |
-| 固件体积 | Flash ≈ 58.5 KiB（`.bin` 59932 B，双模式固件）、RAM ≈ 17.2 KiB |
+| 固件体积 | Flash ≈ 58.5 KiB（`.bin` 59932 B）、RAM ≈ 17.2 KiB |
 
 芯片外设在本工程中用到的部分：USBFS、USART4、GPIOA/GPIOB（含 BSHR/BCR 原子置位复位，
 SWD 位翻转靠它做到单指令翻转）、SysTick、Flash。
@@ -94,12 +94,10 @@ USB 描述符（`src/dap/dap_main.c`）：
 | --- | --- | --- |
 | USB 协议栈 | **CherryUSB** | 上游 submodule，不改动；端口 glue 在 `src/port/` |
 | 环形缓冲 | **CherryRB** | `chry_ringbuffer`，USB↔UART 两个方向的 FIFO |
-| DAP 协议栈 | **CherryDAP** | CMSIS-DAP 命令解析、SWD 事务层 |
-| 第二调试协议栈 | **WCH-Link**（`src/wchlink/`） | RVSWD 目标调试 / Flash 烧录，与 CherryDAP **同编入一份固件**，运行期按键切换 |
+| dap-link | **CherryDAP** | CMSIS-DAP 命令解析、SWD 事务层 |
+| wch-link | **WCH-Link**（`src/wchlink/`） | RVSWD 目标调试 / Flash 烧录 |
 | 芯片 SDK | WCH CH32X035 SDK | Core / Peripheral / Startup / Linker，位于 `sdk/` |
 | 语言 | C（gnu11），无 RTOS，裸机主循环 + 中断 | |
-| USB 类 | 两种模式各一套描述符：CMSIS-DAP（WinUSB）+ CDC ACM，或 WCH-Link 厂商接口 + CDC ACM | |
-| 自定义 SWD 后端 | `src/dap/sw_dp.c` | 快/慢双路径位翻转，热路径放 RAM |
 
 架构约定：`third_party/` **只放上游 submodule**，针对本板的适配（glue）全部放在
 `src/port/`、`src/bsp/`、`src/dap/`、`src/wchlink/`、`src/status/`、`src/drv/` 与
@@ -122,7 +120,7 @@ Python（pyserial）+ TCL（OpenOCD）+ PowerShell，全部在 `firmware/tools/`
 
 ### 硬件设计
 
-KiCad 工程：`hardware/uDap.kicad_sch` / `uDap.kicad_pcb`（含 Type-C 子图 `usb_typec.kicad_sch`）。
+KiCad 工程：`hardware/uDap.kicad_sch` / `uDap.kicad_pcb`。
 
 ---
 
@@ -152,9 +150,9 @@ KiCad 工程：`hardware/uDap.kicad_sch` / `uDap.kicad_pcb`（含 Type-C 子图 
   **已上板实测**：WCH 官方 OpenOCD 连接并 examine 目标核，62 KB 整片擦除 + 编程 +
   校验通过。CDC 串口行为与 CMSIS-DAP 模式完全一致；本板没有状态灯 / 目标电源开关，
   相关命令成功但不生效，详见 `firmware/README.md`。
-- **固定双模式固件**：CMSIS-DAP 与 WCH-Link 两套调试器代码**始终**编进同一份固件
-  （Flash 58.5 KiB / RAM 17.2 KiB），**没有裁剪选项**。启动默认进 CMSIS-DAP，外接按键
-  （**PA4 接 GND**）可在运行期切到 WCH-Link 再切回来（切换会重新枚举 USB，主机侧等同
+- **双模式固件**：CMSIS-DAP 与 WCH-Link 两套调试器代码**始终**编进同一份固件
+  （Flash 58.5 KiB / RAM 17.2 KiB），**没有裁剪选项**。根据不同的用户配置会进 CMSIS-DAP或者WCH-Link，
+  通过按键（**PA4 接 GND**）可互相切换，并记录当前的模式（切换会重新枚举 USB，主机侧等同
   于换设备）。两者不同时运行，所以各自私有的代码与数据用链接脚本 `OVERLAY` 复用同一
   段 RAM（RAM 从 25.3 KiB 降到 17.2 KiB）。不需要按键时用镊子把 PA4 短到 GND 也行。
   见 `firmware/README.md` 的「双模式」一节。

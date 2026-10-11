@@ -37,45 +37,31 @@
 // RAM overlay（见 src/mode_overlay.h 与
 // sdk/Ld/Link_highcode_nv_256B_dual.ld）
 // ---------------------------------------------------------------------------
-// 两种模式的私有代码与数据被链接到**同一段 RAM 地址**上：它们不同时运行
-// （都要占 PA2/PA3，USB 身份也不同），所以可以复用。代价是每次进入某个模式
-// 都要把该模式的代码从 Flash 拷进这段 RAM、并把该模式的 BSS 清零 ——
-// 别的模式的代码/数据在此之前占据着同一段地址，必须重写。
-extern uint32_t __load_start_dap_overlay[];
-extern uint32_t __load_start_wchlink_overlay[];
-
-extern uint32_t _dap_overlay_code_start[];
-extern uint32_t _dap_overlay_code_end[];
+// 两种模式的私有**数据**被链接到同一段 RAM 地址：它们不同时运行（都要占
+// PA2/PA3，USB 身份也不同），所以可以复用。别的模式的数据在此之前占据着同一段
+// 地址，所以每次进入某模式都要把该模式的数据段清零。
+//
+// 代码不再走这条路：CMSIS-DAP 的热路径并进常驻 .highcode（由 startup .S 在启动时
+// 拷一次），WCH-Link 的热路径直接编在 Flash 上执行。所以运行期**没有代码拷贝**。
 extern uint32_t _dap_overlay_bss_start[];
 extern uint32_t _dap_overlay_bss_end[];
 
-extern uint32_t _wchlink_overlay_code_start[];
-extern uint32_t _wchlink_overlay_code_end[];
 extern uint32_t _wchlink_overlay_bss_start[];
 extern uint32_t _wchlink_overlay_bss_end[];
 
-// 把 overlay 的代码段从 Flash 拷到位，并清零它的 BSS
-static void overlay_load(const uint32_t *lma, uint32_t *code_start,
-                         const uint32_t *code_end, uint32_t *bss_start,
-                         const uint32_t *bss_end) {
-    for (uint32_t *dst = code_start; dst != code_end; ++dst) {
-        *dst = *lma++;
-    }
-    for (uint32_t *dst = bss_start; dst != bss_end; ++dst) {
+// 清零本模式的数据段（没有代码拷贝，见上面的说明）
+static void overlay_bss_clear(uint32_t *start, const uint32_t *end) {
+    for (uint32_t *dst = start; dst != end; ++dst) {
         *dst = 0u;
     }
 }
 
 static void dap_overlay_init(void) {
-    overlay_load(__load_start_dap_overlay, _dap_overlay_code_start,
-                 _dap_overlay_code_end, _dap_overlay_bss_start,
-                 _dap_overlay_bss_end);
+    overlay_bss_clear(_dap_overlay_bss_start, _dap_overlay_bss_end);
 }
 
 static void wchlink_overlay_init(void) {
-    overlay_load(__load_start_wchlink_overlay, _wchlink_overlay_code_start,
-                 _wchlink_overlay_code_end, _wchlink_overlay_bss_start,
-                 _wchlink_overlay_bss_end);
+    overlay_bss_clear(_wchlink_overlay_bss_start, _wchlink_overlay_bss_end);
 }
 
 // 按键一按下就退出当前模式，回到 main 交出 USB 再切到另一种模式

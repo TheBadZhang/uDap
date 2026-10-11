@@ -137,13 +137,6 @@ __STATIC_FORCEINLINE uint32_t PIN_SWDIO_TMS_IN(void) { return (GPIOA->INDR & GPI
 __STATIC_FORCEINLINE void PIN_SWDIO_TMS_SET(void) { GPIOA->BSHR = GPIO_Pin_3; }
 __STATIC_FORCEINLINE void PIN_SWDIO_TMS_CLR(void) { GPIOA->BCR = GPIO_Pin_3; }
 #define PIN_SWDIO_IN() ((GPIOA->INDR & GPIO_Pin_3) != 0U)
-// 在 BSHR 的置位与复位半字间选择，避免每个数据位都执行条件分支
-#define PIN_SWDIO_OUT(bit) {GPIOA->BSHR = (GPIO_Pin_3 << 16) >> ((bit & 1U) << 4);}
-// 设置 SWDIO 数据，并将 SWCLK 原子拉低，为下一个 SWD 数据位准备
-__STATIC_FORCEINLINE void PIN_SWDIO_OUT_SWCLK_CLR(uint32_t bit) {
-    // 同时设置 PA3 数据并拉低 PA2，bit 为 0 时选择 BSHR 的复位半字
-    GPIOA->BSHR = ((GPIO_Pin_3 << 16) >> ((bit & 1U) << 4));
-}
 // CFGLR 为 PA0 至 PA7 每个引脚分配 4 位，0x1 为推挽输出，0x4 为浮空输入
 __STATIC_FORCEINLINE void PIN_SWDIO_OUT_ENABLE(void) {
     // PA3 的 12 至 15 位，从浮空输入切换为推挽输出

@@ -12,23 +12,44 @@
  *      Flash 约 51 KiB / 可用 63232 B   —— 够
  *      但 RAM 需要约 25.3 KiB / 可用 20 KiB —— 超约 4.8 KiB
  *
- * 既然两者不同时运行，它们**各自私有的**代码与数据就可以共用同一段地址
- * （overlay）：进哪个模式就初始化哪一份。共用部分（USB 端口层、CherryUSB 核心、
- * CDC 类、drv_uart、SDK）不属于任何单一模式，仍放在常规区域。
+ * 既然两者不同时运行，它们**各自私有的数据**就可以共用同一段地址（overlay）：
+ * 进哪个模式就把哪一份清零。共用部分（USB 端口层、CherryUSB 核心、CDC 类、
+ * drv_uart、SDK）不属于任何单一模式，仍放在常规区域。
  *
  * ============================ 段划分 ============================
- *   .highcode          共用：USB 端口层热路径
+ *   .highcode          共用：USB 端口层热路径（RAM，启动时拷入）
  *   .highcode.dap      CMSIS-DAP 私有代码（sw_dp.c / dap_main.c 的热路径）
+ *                      —— 并进常驻 RAM 的 .highcode，启动时拷一次
  *   .overlay.dap       CMSIS-DAP 私有数据（DAP 的 USB 收发缓冲）
  *   .highcode.wchlink  WCH-Link 私有代码（rvswd_phy_gpio.c 的位翻转）
+ *                      —— 链接进 .text，**直接在 Flash 上执行**（XIP）
  *   .overlay.wchlink   WCH-Link 私有数据（会话/传输状态与大缓冲）
  *
- * 链接脚本 sdk/Ld/Link_highcode_nv_256B_dual.ld 用 ld 的 OVERLAY 命令把
- * `.highcode.dap`+`.overlay.dap` 与 `.highcode.wchlink`+`.overlay.wchlink`
- * 放到**同一段 VMA** 上；main.c 在进入各自模式时把代码从 Flash 拷进这段 RAM、
- * 并把该模式的 BSS 清零（见 src/main.c 的 dap_overlay_init / wchlink_overlay_init）。
+ * 链接脚本 sdk/Ld/Link_highcode_nv_256B_dual.ld：
+ *   - OVERLAY 只把 `.overlay.dap` 与 `.overlay.wchlink` 放到**同一段 VMA**
+ *     （数据不能进 Flash，重叠才省 RAM；窗口取较大的 WCH-Link 那份）；
+ *   - 代码不进 overlay：`.highcode.dap` 并在 `.highcode` 里由启动代码拷一次，
+ *     `.highcode.wchlink` 直接编在 Flash 上。
+ * 所以 main.c 在进入各自模式时**只需清零该模式的数据段**，没有代码拷贝
+ * （见 src/main.c 的 dap_overlay_init / wchlink_overlay_init）。
+ *
+ * 代价：WCH-Link 的位翻转代码改为在 Flash 上执行，48 MHz 下每次取指多 2 个等待
+ * 周期（FLASH_ACTLR_LATENCY_2），RVSWD 时钟会比放在 RAM 时低。
  */
 
+/* 用途对照（详细说明见本文件开头）：
+ *
+ *   DAP_HIGHCODE_SECTION      CMSIS-DAP 热路径代码 -> .highcode.dap，链接进常驻
+ *                             RAM 段，启动时拷入一次（运行期不拷贝）
+ *   DAP_PRIVATE_SECTION       CMSIS-DAP 私有数据   -> .overlay.dap，RAM，
+ *                             进 DAP 模式时清零
+ *   WCHLINK_HIGHCODE_SECTION  WCH-Link 热路径代码  -> .highcode.wchlink，链接进
+ *                             .text，直接在 Flash 上执行（XIP）
+ *   WCHLINK_PRIVATE_SECTION   WCH-Link 私有数据    -> .overlay.wchlink，RAM，
+ *                             进 WCH-Link 模式时清零
+ *
+ * 两个 PRIVATE 段共用同一段 VMA（ld OVERLAY），因为它们不同时存在。
+ */
 #define DAP_HIGHCODE_SECTION     __attribute__((section(".highcode.dap")))
 #define DAP_PRIVATE_SECTION      __attribute__((section(".overlay.dap")))
 #define WCHLINK_HIGHCODE_SECTION __attribute__((section(".highcode.wchlink")))

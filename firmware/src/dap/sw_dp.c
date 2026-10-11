@@ -1,5 +1,5 @@
 #include "DAP_config.h"
-
+#include <stdint.h>
 #include "mode_overlay.h"
 
 #include <DAP.h>
@@ -20,12 +20,32 @@
 #define PIN_DELAY_SLOW(delay) x035_pin_delay_slow(delay)
 
 // SW Macros
+// SWD 两个引脚（SWCLK=PA2、SWDIO=PA3）同属 GPIOA，合并写 BSHR 时用这个别名。
+#define PIN_SWD_PORT GPIOA
+#define PIN_SWCLK GPIO_Pin_2
+#define PIN_SWCLK_SHIFT 2
+#define PIN_SWDIO GPIO_Pin_3
+#define PIN_SWDIO_SHIFT 3
 
 // 上升沿 / 下降沿之后各补一段可调等待，用来修 SWCLK 占空比（见 DAP_config.h）。
 // 这两个宏在本文件里只以 PIN_SWCLK_SET() / PIN_SWCLK_CLR() 形式使用，所以直接
 // 重定义即可覆盖全部调用点，不必逐处修改；后面的 PIN_DELAY_FAST() 仍会执行。
-#define PIN_SWCLK_SET() do { PIN_SWCLK_TCK_SET(); __NOP(); } while (0)
-#define PIN_SWCLK_CLR() do { PIN_SWCLK_TCK_CLR(); __NOP(); } while (0)
+#define PIN_SWCLK_SET() { PIN_SWCLK_TCK_SET(); __NOP(); }
+#define PIN_SWCLK_CLR() { PIN_SWCLK_TCK_CLR(); __NOP(); }
+// #define PIN_SWDIO_SET() {}
+// #define PIN_SWDIO_CLR() {}
+
+#define PIN_SWDIO_OUTPUT() { PIN_SWD_PORT->CFGLR = PIN_SWD_PORT->CFGLR & ~(0xFU << 12) | (0x1U << 12); }
+#define PIN_SWDIO_INPUT() { PIN_SWD_PORT->CFGLR = PIN_SWD_PORT->CFGLR & ~(0xFU << 12) | (0x4U << 12); }
+
+
+// 在 BSHR 的置位与复位半字间选择，避免每个数据位都执行条件分支
+#define PIN_SWDIO_OUT(bit) {GPIOA->BSHR = (GPIO_Pin_3 << 16) >> ((bit & 1U) << 4);}
+
+#define PIN_SWCLK_CLR_SWDIO_CLR() { PIN_SWD_PORT->BSHR = (PIN_SWCLK << 16) | (PIN_SWDIO << 16); }
+#define PIN_SWCLK_CLR_SWDIO_SET() { PIN_SWD_PORT->BSHR = (PIN_SWDIO | PIN_SWCLK << 16); }
+// 设置 SWDIO 数据，并将 SWCLK 原子拉低，为下一个 SWD 数据位准备
+#define PIN_SWCLK_CLR_SWDIO_OUT(bit) {GPIOA->BSHR = (GPIO_Pin_2 << 16) | (GPIO_Pin_3 << 16) >> ((bit & 1U) << 4);}
 
 // 读路径专用的时钟宏。
 // 读路径的采样（读 INDR）与位打包都落在**低电平期**，低电平期本来就长，
@@ -38,13 +58,6 @@
     PIN_SWCLK_CLR();     \
     PIN_DELAY();         \
     PIN_SWCLK_SET();     \
-    PIN_DELAY()
-
-#define SW_WRITE_BIT(bit) \
-    PIN_SWDIO_OUT(bit);   \
-    PIN_SWCLK_CLR();      \
-    PIN_DELAY();          \
-    PIN_SWCLK_SET();      \
     PIN_DELAY()
 
 #define SW_READ_BIT(bit)  \
@@ -65,33 +78,13 @@ __STATIC_FORCEINLINE uint32_t SWD_Parity32(uint32_t value) {
     return value & 1U;
 }
 
-#define SWD_FAST_READ_DATA_BIT() \
-    do {                         \
-        PIN_SWCLK_CLR();         \
-        PIN_DELAY_FAST();        \
-        bit = PIN_SWDIO_IN();    \
-        PIN_SWCLK_SET();         \
-        PIN_DELAY_FAST();        \
-        val >>= 1;               \
-        val |= bit << 31;        \
-    } while (0)
-
-#define SWD_FAST_READ_SAMPLE(sample) \
-    do {                             \
-        PIN_SWCLK_CLR();             \
-        PIN_DELAY_FAST();            \
-        sample = GPIOA->INDR;        \
-        PIN_SWCLK_SET();             \
-        PIN_DELAY_FAST();            \
-    } while (0)
-
 // 读取时把「采样」与「拉高」拆开，好把位打包的工作放进低电平期。
 // 采样点与原先一致（下降沿后延时一拍），所以数据有效性不变；
 // 多出的打包指令不会再拉长高电平期。
 #define SWD_FAST_READ_LOW(sample)   \
     do {                            \
         PIN_SWCLK_CLR_READ();       \
-        sample = GPIOA->INDR;       \
+        sample = PIN_SWD_PORT->INDR;       \
     } while (0)
 
 #define SWD_FAST_READ_HIGH()  \
@@ -103,33 +96,71 @@ __STATIC_FORCEINLINE uint32_t SWD_Parity32(uint32_t value) {
 #define SWD_FAST_PACK_BARRIER() \
     __asm__ volatile("" : "+r"(packed) : : "memory")
 
-// 注意：数据与下降沿在同一条 BSHR 写里完成，不经过 PIN_SWCLK_CLR，
-// 所以这里要显式补上低电平期延时，否则写数据位的低电平期仍偏短。
-#define SWD_FAST_WRITE_DATA_BIT()     \
-    do {                              \
-        GPIOA->BSHR = ((GPIO_Pin_3 << 16) >> ((val & 1U) << 4));\
-        GPIOA->BSHR = (GPIO_Pin_2 << 16); \
-        val >>= 1;                    \
-        PIN_DELAY_FAST();             \
-        PIN_DELAY_FAST();             \
-        PIN_SWCLK_SET();              \
-        PIN_DELAY_FAST();             \
-    } while (0)
+DAP_HIGHCODE_SECTION __attribute__((noinline, optimize("O2")))
+static void SWD_FastWriteData(uint32_t val) {
+    const uint32_t parity = SWD_Parity32(val);
+    volatile uint32_t *const pa = &PIN_SWD_PORT->BSHR;
 
-DAP_HIGHCODE_SECTION __attribute__((noinline, optimize("O2"))) static void SWD_FastWriteData(uint32_t val) {
-    uint32_t n;
-    uint32_t parity = SWD_Parity32(val);
+    // -----------------------------------------------------------------------
+    // 32 位数据相位：内联汇编 + 按位常量掩码取位
+    // -----------------------------------------------------------------------
+    // 为什么必须用汇编：用 C 写时 GCC 会把「算下一位 BSHR 值」的 ALU 重新贴到
+    // 下降沿那条 store **之前**，于是低电平期 0 条指令（实测 20 ns）、高电平期
+    // 5 条（120 ns），占空比 6:1。volatile + memory clobber 才能钉住顺序。
+    //
+    // 用「按位常量掩码」而不是逐位 `val >>= 1`：
+    //   shift_k = 第 k 位 << 4 = 0 或 16
+    //     k <  4 : (val << (4 - k)) & 16
+    //     k == 4 : val & 16
+    //     k >  4 : (val >> (k - 4)) & 16
+    // 两种写法取出 shift 都是 2 条指令，但常量掩码**不必推进 val**，
+    // 于是每 bit 少一条 `srli val, val, 1`（32 个 bit 共省 32 条）。
+    // 代价是每个 bit 的立即数不同，用 GAS 的 .set + .if 按 k 生成。
+    //
+    // 每 bit 的排布（ALU 拆 2+2，让占空比接近 1:1）：
+    //   ① sw t0 : 清 SWCLK + 按位设/清 SWDIO  （下降沿；t0 在上一轮已算好）
+    //   -- 低电平期：slli/andi 2 条 --
+    //   ② sw hi : 置 SWCLK                    （上升沿）
+    //   -- 高电平期：srl/or 2 条 + 可调 NOP --
+    //
+    // 这 4 条 ALU 只依赖 val，不依赖①要写的 t0，所以拆到上升沿两侧**不会**引入
+    // 额外停顿；而 or 算完后隔着 nop + sw 才是下一轮的 sw t0，也没写后写气泡。
+    // 想继续调：把 srl/or 之一搬到②之前，或删掉 nop。
+    //
+    // 寄存器：t0 = 当前位 BSHR 值  t2 = 0x00080000（清 SWDIO）  t3 = 0x00040000（清 SWCLK）
+    __asm__ volatile(
+        /* 先算第 0 位（k=0 -> (val << 4) & 16），作为流水线初值 */
+        "slli t0, %[val], 4\n\t"
+        "andi t0, t0, 16\n\t"
+        "lui  t2, 0x80\n\t"
+        "srl  t0, t2, t0\n\t"
+        "lui  t3, 0x40\n\t"
+        "or   t0, t0, t3\n\t"
+        ".set wb_k, 0\n\t"
+        ".rept 32\n\t"
+        "sw   t0, 0(%[pa])\n\t"
+        ".if (wb_k + 1) < 4\n\t"
+        "slli t0, %[val], (3 - wb_k)\n\t"
+        ".elseif (wb_k + 1) == 4\n\t"
+        "andi t0, %[val], 16\n\t"
+        ".else\n\t"
+        "srli t0, %[val], (wb_k - 3)\n\t"
+        ".endif\n\t"
+        ".if (wb_k + 1) != 4\n\t"
+        "andi t0, t0, 16\n\t"
+        ".endif\n\t"
+        "sw   %[hi], 0(%[pa])\n\t"
+        "srl  t0, t2, t0\n\t"
+        "or   t0, t0, t3\n\t"
+        "nop\n\t"
+        ".set wb_k, wb_k + 1\n\t"
+        ".endr\n\t"
+        :
+        : [val] "r"(val), [pa] "r"(pa), [hi] "r"((uint32_t)PIN_SWCLK)
+        : "t0", "t2", "t3", "memory");
 
-    // 展开 32 位数据输出，减少逐组循环的分支开销
-    #pragma GCC unroll 8
-    for (n = 8U; n; n--) {
-        SWD_FAST_WRITE_DATA_BIT();
-        SWD_FAST_WRITE_DATA_BIT();
-        SWD_FAST_WRITE_DATA_BIT();
-        SWD_FAST_WRITE_DATA_BIT();
-    }
-    PIN_SWDIO_OUT_SWCLK_CLR(parity);
-    GPIOA->BSHR = (GPIO_Pin_2 << 16);
+    PIN_SWCLK_CLR_SWDIO_OUT(parity);
+    PIN_SWD_PORT->BSHR = (PIN_SWCLK << 16);
     PIN_DELAY_FAST();
     PIN_SWCLK_SET();
     PIN_DELAY_FAST();
@@ -194,7 +225,10 @@ void SWD_Sequence(uint32_t info, const uint8_t *swdo, uint8_t *swdi) {
         while (n) {
             val = *swdo++;
             for (k = 8U; k && n; k--, n--) {
-                SW_WRITE_BIT(val);
+                PIN_SWCLK_CLR_SWDIO_OUT(val);
+                PIN_DELAY();
+                PIN_SWCLK_SET();
+                PIN_DELAY();
                 val >>= 1;
             }
         }
@@ -210,73 +244,117 @@ void SWD_Sequence(uint32_t info, const uint8_t *swdo, uint8_t *swdi) {
 DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFast(
     uint32_t request, uint32_t *data) {
     uint32_t ack;
-    uint32_t bit, bit1;
+    uint32_t bit;
     uint32_t val;
     uint32_t parity;
     uint32_t packed;
 
     uint32_t n;
-    const uint32_t swdio_cfglr_base = GPIOA->CFGLR & ~(0xFU << 12);
-    const uint32_t swdio_cfglr_output = swdio_cfglr_base | (0x1U << 12);
-    const uint32_t swdio_cfglr_input = swdio_cfglr_base | (0x4U << 12);
 
-    /* Packet Request
+    /* Packet Request —— 8 个 SWCLK（start/APnDP/RnW/A2/A3/parity/stop）
      *
-     * 位序改成「拉低 -> 低电平延时 -> 算位并更新数据 -> 拉高 -> 高电平延时」。
-     * 原实现是「算位 -> 更新数据 -> 拉低 -> 延时 -> 拉高 -> 延时」：数据更新与
-     * 下降沿同时发生（拉高沿前的建立时间近乎为零），而下一位的移位/异或/写端口
-     * 全部落在**高电平期**，实测 SWCLK 占空比 高:低 约 3:1。
-     * 改后建立时间充足，且高低电平期长度接近（总周期不变，频率不受影响）。
+     * 和 SWD_FastWriteData 同样的理由这段 C 用编译器是钉不住的：GCC 永远把
+     * 「算下一位 BSHR 值」的 ALU 提到下降沿那条 store **之前**（它总是尽早算值
+     * 来隐藏延迟），于是低电平期只剩 1 条 store（~20 ns）、高电平期塞进 5 条 ALU
+     * （~140 ns），占空比 1:7。试过 __attribute__((optimize("O2",
+     * "no-schedule-insns","no-schedule-insns2")))，没有任何变化 —— 重排来自
+     * GCC「算值尽早」的通用策略，不是调度器 pass。所以只能用汇编钉住顺序。
+     *
+     * 每 bit 7 条指令，排布与 SWD_FastWriteData 完全一致（波形也一致）：
+     *   ① sw t0 : 清 SWCLK + 按位设/清 SWDIO  （下降沿；t0 上一拍已算好）
+     *   -- 低电平期：2 条 ALU（slli + andi）--
+     *   ② sw t4 : 置 SWCLK                     （上升沿，t4 = 4）
+     *   -- 高电平期：2 条 ALU（srl + or）+ 1 个 nop --
+     *
+     * 为什么是「低 2 条 / 高 3 条」而不是「低 2 / 高 2」，也就是为什么
+     * 低电平 N_low 条、高电平 N_high 条时实测是：
+     *     低 clk = N_low + 2      高 clk = N_high + 1     周期 = N_low + N_high + 3
+     * 因为两条外设 store 的退休延迟不对称：下降沿那条在低电平期**开头**又被
+     * 计一次，上升沿那条在高电平期只计一次。两条实测都吻合：
+     *   本次 4+0+1nop (N_low=4,N_high=1) -> 低 6 / 高 2（用户实测）✓
+     *   数据相位 2+2+1nop (N_low=2,N_high=3) -> 低 4 / 高 4（用户实测「完美」）✓
+     * 所以要 4/4 就得 N_low=2、N_high=3 —— 两半的**指令数不相等**，差 1。这就是
+     * 之前我按「2+2 各半」算会得到 高 4 / 低 3 的原因：忽略了那条不对称延迟。
+     * 总拍数 N_low+N_high=5 固定（4 条 ALU + 1 个 nop），所以重新分配不改变周期。
+     *
+     * 位序：start=1, APnDP=b0, RnW=b1, A2=b2, A3=b3, parity=四位异或, stop=0。
+     * 取位用「按位常量掩码」（slli 4-k 再 andi 16），省掉逐位推进 request；
+     * parity 在准备段一次性折叠出来。
+     * t2 = 0x00080000（清 SWDIO）  t3 = 0x00040000（清 SWCLK）
+     * A3/parity/stop 三拍没有 4 条 ALU 可填，用 nop 补齐到同样的 低2/高3，
+     * 这样整帧每一拍都是 8 个 clk，波形完全均匀。
      */
-    parity = 0U;
-    PIN_SWDIO_TMS_SET();          /* Start Bit 数据 = 1 */
-    PIN_SWCLK_CLR();
-    bit = request >> 0;
-    PIN_SWCLK_SET();  /* Start Bit */
-    parity += bit;
-    bit1 = (bit & 1U) << 4;
-    __asm__ volatile("" : "+r"(bit1) : : "memory");
-    PIN_SWCLK_CLR();
-    GPIOA->BSHR = (GPIO_Pin_3 << 16) >> bit1;
-    PIN_SWCLK_SET(); /* APnDP Bit */
-    bit = request >> 1;
-    parity += bit;
-    bit1 = (bit & 1U) << 4;
-    __asm__ volatile("" : "+r"(bit1) : : "memory");
-    PIN_SWCLK_CLR();
-    GPIOA->BSHR = (GPIO_Pin_3 << 16) >> bit1;
-    PIN_SWCLK_SET(); /* RnW Bit */
-    bit = request >> 2;
-    parity += bit;
-    bit1 = (bit & 1U) << 4;
-    __asm__ volatile("" : "+r"(bit1) : : "memory");
-    PIN_SWCLK_CLR();
-    GPIOA->BSHR = (GPIO_Pin_3 << 16) >> bit1;
-    PIN_SWCLK_SET(); /* A2 Bit */
-    bit = request >> 3;
-    bit1 = (bit & 1U) << 4;
-    __asm__ volatile("" : "+r"(bit1) : : "memory");
-    PIN_SWCLK_CLR();
-    GPIOA->BSHR = (GPIO_Pin_3 << 16) >> bit1;
-    PIN_SWCLK_SET(); /* A3 Bit */
-
-    parity += bit;
-    bit1 = (parity & 1U) << 4;
-    __asm__ volatile("" : "+r"(bit1) : : "memory");
-    PIN_SWCLK_CLR();
-    GPIOA->BSHR = (GPIO_Pin_3 << 16) >> bit1;
-    PIN_SWCLK_SET();
-    PIN_DELAY_FAST(); /* Parity Bit */
-
-    PIN_SWDIO_TMS_CLR();
-    PIN_SWCLK_CLR();
-    PIN_DELAY_FAST();
-    PIN_SWCLK_SET();
-    PIN_DELAY_FAST(); /* Stop Bit */
-
-    PIN_SWDIO_TMS_SET();
-    PIN_SWCLK_CLR();
-    GPIOA->CFGLR = swdio_cfglr_input;
+    volatile uint32_t *const pa = &PIN_SWD_PORT->BSHR;
+    __asm__ volatile(
+        /* --- 准备 --- */
+        "lui  t2, 0x80\n\t"       /* t2 = 0x00080000 : 清 SWDIO        */
+        "lui  t3, 0x40\n\t"       /* t3 = 0x00040000 : 清 SWCLK        */
+        "li   t4, 4\n\t"          /* t4 = 4          : 置 SWCLK        */
+        "srli t5, %[req], 2\n\t"  /* t5 = request[3:0] 的异或，再 <<4  */
+        "xor  t5, t5, %[req]\n\t"
+        "srli t1, t5, 1\n\t"
+        "xor  t5, t5, t1\n\t"
+        "andi t5, t5, 1\n\t"
+        "slli t5, t5, 4\n\t"
+        "srli t0, t2, 16\n\t"     /* t0 = start 位(恒 1) 的值 0x40008  */
+        "or   t0, t0, t3\n\t"
+        /* --- start 位：低电平期算 APnDP（低 2 / 高 3，与数据相位同构） --- */
+        "sw   t0, 0(%[pa])\n\t"
+        "slli t0, %[req], 4\n\t"
+        "andi t0, t0, 16\n\t"
+        "sw   t4, 0(%[pa])\n\t"
+        "srl  t0, t2, t0\n\t"
+        "or   t0, t0, t3\n\t"
+        "nop\n\t"
+        /* --- APnDP 位：低电平期算 RnW --- */
+        "sw   t0, 0(%[pa])\n\t"
+        "slli t0, %[req], 3\n\t"
+        "andi t0, t0, 16\n\t"
+        "sw   t4, 0(%[pa])\n\t"
+        "srl  t0, t2, t0\n\t"
+        "or   t0, t0, t3\n\t"
+        "nop\n\t"
+        /* --- RnW 位：低电平期算 A2 --- */
+        "sw   t0, 0(%[pa])\n\t"
+        "slli t0, %[req], 2\n\t"
+        "andi t0, t0, 16\n\t"
+        "sw   t4, 0(%[pa])\n\t"
+        "srl  t0, t2, t0\n\t"
+        "or   t0, t0, t3\n\t"
+        /* --- A2 位：低电平期算 A3 --- */
+        "sw   t0, 0(%[pa])\n\t"
+        "slli t0, %[req], 1\n\t"
+        "andi t0, t0, 16\n\t"
+        "sw   t4, 0(%[pa])\n\t"
+        "srl  t0, t2, t0\n\t"
+        "or   t0, t0, t3\n\t"
+        "nop\n\t"
+        /* --- A3 位：低电平期算 parity（t5 已折好，只有 2 条 ALU，高电平期补 nop） --- */
+        "sw   t0, 0(%[pa])\n\t"
+        "srl  t0, t2, t5\n\t"
+        "or   t0, t0, t3\n\t"
+        "sw   t4, 0(%[pa])\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        /* --- parity 位：低电平期算 stop（恒 0，只有 1 条 ALU，补 nop 凑 2） --- */
+        "sw   t0, 0(%[pa])\n\t"
+        "lui  t0, 0xc0\n\t"
+        "nop\n\t"
+        "sw   t4, 0(%[pa])\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        /* --- stop 位：没有数据要算，补 nop 保持每拍 8 个 clk --- */
+        "sw   t0, 0(%[pa])\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "sw   t4, 0(%[pa])\n\t"
+        :
+        : [req] "r"(request), [pa] "r"(pa)
+        : "t0", "t1", "t2", "t3", "t4", "t5", "memory");
+    PIN_SWCLK_CLR_SWDIO_OUT(1U);
+    PIN_SWDIO_INPUT();  //  Turnaround
     PIN_SWCLK_SET(); /* Park Bit */
 
     /* Turnaround */
@@ -284,6 +362,7 @@ DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFast(
     PIN_SWCLK_CLR();
     PIN_DELAY_FAST();
     PIN_SWCLK_SET();
+    PIN_DELAY_FAST();
 
     /* Acknowledge response */
 #if 0
@@ -304,22 +383,21 @@ DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFast(
     PIN_SWCLK_CLR();
     PIN_DELAY_FAST();
     bit = PIN_SWDIO_IN();
-    PIN_SWCLK_SET();
+    PIN_SWCLK_SET();        // 上升沿采样
     PIN_DELAY_FAST();
     PIN_DELAY_FAST();
     ack = bit << 0;
     PIN_SWCLK_CLR();
     PIN_DELAY_FAST();
     bit = PIN_SWDIO_IN();
-    PIN_SWCLK_SET();
+    PIN_SWCLK_SET();        // 上升沿采样
     PIN_DELAY_FAST();
     PIN_DELAY_FAST();
     ack |= bit << 1;
     PIN_SWCLK_CLR();
-    PIN_DELAY_FAST();
     bit = PIN_SWDIO_IN();
-    PIN_SWCLK_SET();
     ack |= bit << 2;
+    PIN_SWCLK_SET();        // 上升沿采样
 #endif
 
     if (ack == DAP_TRANSFER_OK) { /* OK response */
@@ -329,19 +407,19 @@ DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFast(
             val = 0U;
             for (n = 8U; n; n--) {
                 SWD_FAST_READ_LOW(bit);
-                packed = (bit >> 3) & 0x01U;
+                packed = (bit >> PIN_SWDIO_SHIFT) & 1U;
                 SWD_FAST_PACK_BARRIER();
                 SWD_FAST_READ_HIGH();
                 SWD_FAST_READ_LOW(bit);
-                packed |= ((bit >> 3) & 0x01U) << 1;
+                packed |= ((bit >> PIN_SWDIO_SHIFT) & 1U) << 1;
                 SWD_FAST_PACK_BARRIER();
                 SWD_FAST_READ_HIGH();
                 SWD_FAST_READ_LOW(bit);
-                packed |= ((bit >> 3) & 0x01U) << 2;
+                packed |= ((bit >> PIN_SWDIO_SHIFT) & 1U) << 2;
                 SWD_FAST_PACK_BARRIER();
                 SWD_FAST_READ_HIGH();
                 SWD_FAST_READ_LOW(bit);
-                packed |= ((bit >> 3) & 0x01U) << 3;
+                packed |= ((bit >> PIN_SWDIO_SHIFT) & 1U) << 3;
                 SWD_FAST_PACK_BARRIER();
                 val >>= 4;
                 SWD_FAST_READ_HIGH();
@@ -360,11 +438,11 @@ DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFast(
                 *data = val;
             }
             PIN_SWCLK_SET();
-            GPIOA->CFGLR = swdio_cfglr_output;
+            PIN_SWDIO_OUTPUT(); // turnaround
         } else {
             /* Turnaround */
             PIN_SWCLK_CLR();
-            GPIOA->CFGLR = swdio_cfglr_output;
+            PIN_SWDIO_OUTPUT(); // turnaround
             PIN_SWCLK_SET();
 
             /* Write data */
@@ -405,7 +483,7 @@ DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFast(
             PIN_DELAY_FAST();
             PIN_SWCLK_SET();
         }
-        GPIOA->CFGLR = swdio_cfglr_output;
+        PIN_SWDIO_OUTPUT(); // turnaround
         if (DAP_Data.swd_conf.data_phase && ((request & DAP_TRANSFER_RnW) == 0U)) {
             PIN_SWDIO_OUT(0U);
             for (n = 32U + 1U; n; n--) {
@@ -424,17 +502,15 @@ DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFast(
         PIN_DELAY_FAST();
         PIN_SWCLK_SET();/* Back off data phase */
     }
-    GPIOA->CFGLR = swdio_cfglr_output;
+    PIN_SWDIO_OUTPUT(); // Back off data phase
     PIN_SWDIO_TMS_SET();
     return ((uint8_t)ack);
 }
 
 // 注意：上面两个 undef 对应下面用到的两个宏，名字改了要同步
-#undef SWD_FAST_READ_DATA_BIT
 #undef SWD_FAST_READ_LOW
 #undef SWD_FAST_READ_HIGH
 #undef SWD_FAST_PACK_BARRIER
-#undef SWD_FAST_WRITE_DATA_BIT
 
 // 慢路径不补占空比额外延时。
 //
@@ -464,51 +540,43 @@ __attribute__((noinline)) static uint8_t SWD_TransferSlow(
 
     /* Packet Request */
     parity = 0U;
-    PIN_SWDIO_OUT(1U);
-    PIN_SWCLK_CLR();
+    PIN_SWCLK_CLR_SWDIO_OUT(1U);
     PIN_DELAY_SLOW(DAP_Data.clock_delay);
     PIN_SWCLK_SET();
     PIN_DELAY_SLOW(DAP_Data.clock_delay); /* Start Bit */
     bit = request >> 0;
-    PIN_SWDIO_OUT(bit);
-    PIN_SWCLK_CLR();
+    PIN_SWCLK_CLR_SWDIO_OUT(bit);
     PIN_DELAY_SLOW(DAP_Data.clock_delay);
     PIN_SWCLK_SET();
     PIN_DELAY_SLOW(DAP_Data.clock_delay); /* APnDP Bit */
     parity += bit;
     bit = request >> 1;
-    PIN_SWDIO_OUT(bit);
-    PIN_SWCLK_CLR();
+    PIN_SWCLK_CLR_SWDIO_OUT(bit);
     PIN_DELAY_SLOW(DAP_Data.clock_delay);
     PIN_SWCLK_SET();
     PIN_DELAY_SLOW(DAP_Data.clock_delay); /* RnW Bit */
     parity += bit;
     bit = request >> 2;
-    PIN_SWDIO_OUT(bit);
-    PIN_SWCLK_CLR();
+    PIN_SWCLK_CLR_SWDIO_OUT(bit);
     PIN_DELAY_SLOW(DAP_Data.clock_delay);
     PIN_SWCLK_SET();
     PIN_DELAY_SLOW(DAP_Data.clock_delay); /* A2 Bit */
     parity += bit;
     bit = request >> 3;
-    PIN_SWDIO_OUT(bit);
-    PIN_SWCLK_CLR();
+    PIN_SWCLK_CLR_SWDIO_OUT(bit);
     PIN_DELAY_SLOW(DAP_Data.clock_delay);
     PIN_SWCLK_SET();
     PIN_DELAY_SLOW(DAP_Data.clock_delay); /* A3 Bit */
     parity += bit;
-    PIN_SWDIO_OUT(parity);
-    PIN_SWCLK_CLR();
+    PIN_SWCLK_CLR_SWDIO_OUT(parity);
     PIN_DELAY_SLOW(DAP_Data.clock_delay);
     PIN_SWCLK_SET();
     PIN_DELAY_SLOW(DAP_Data.clock_delay); /* Parity Bit */
-    PIN_SWDIO_OUT(0U);
-    PIN_SWCLK_CLR();
+    PIN_SWCLK_CLR_SWDIO_OUT(0U);
     PIN_DELAY_SLOW(DAP_Data.clock_delay);
     PIN_SWCLK_SET();
     PIN_DELAY_SLOW(DAP_Data.clock_delay); /* Stop Bit */
-    PIN_SWDIO_OUT(1U);
-    PIN_SWCLK_CLR();
+    PIN_SWCLK_CLR_SWDIO_OUT(1U);
     PIN_DELAY_SLOW(DAP_Data.clock_delay);
     PIN_SWCLK_SET();
     PIN_DELAY_SLOW(DAP_Data.clock_delay); /* Park Bit */
@@ -590,16 +658,14 @@ __attribute__((noinline)) static uint8_t SWD_TransferSlow(
             val = *data;
             parity = 0U;
             for (n = 32U; n; n--) {
-                PIN_SWDIO_OUT(val);
-                PIN_SWCLK_CLR();
+                PIN_SWCLK_CLR_SWDIO_OUT(val);
                 PIN_DELAY_SLOW(DAP_Data.clock_delay);
                 PIN_SWCLK_SET();
                 PIN_DELAY_SLOW(DAP_Data.clock_delay); /* Write WDATA[0:31] */
                 parity += val;
                 val >>= 1;
             }
-            PIN_SWDIO_OUT(parity);
-            PIN_SWCLK_CLR();
+            PIN_SWCLK_CLR_SWDIO_OUT(parity);
             PIN_DELAY_SLOW(DAP_Data.clock_delay);
             PIN_SWCLK_SET();
             PIN_DELAY_SLOW(DAP_Data.clock_delay); /* Write Parity Bit */

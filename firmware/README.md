@@ -108,8 +108,8 @@ RAM（overlay），这是两套代码能同时装进 20 KiB RAM 的原因。
 
 | 配置 | Flash | RAM |
 | --- | --- | --- |
-| 默认（序列号固定 `DEADBEEF`） | 58.53 KiB | 17.23 KiB |
-| `-EsigSn y`（序列号用芯片 ESIG UID） | 58.67 KiB | 17.23 KiB |
+| 默认（`-EsigSn y`，序列号用芯片 ESIG UID） | 58.67 KiB | 17.23 KiB |
+| `-EsigSn n`（序列号固定 `DEADBEEF`） | 58.53 KiB | 17.23 KiB |
 
 上限：Flash 63232 B（`62K - 256`，末尾 256 B 留给 NV 配置），RAM 20480 B。
 Flash 余量约 3.2 KiB，RAM 余量约 2.8 KiB。
@@ -136,15 +136,15 @@ Flash 余量约 3.2 KiB，RAM 余量约 2.8 KiB。
 
 ### 序列号：固定值 / 芯片 ESIG UID
 
-默认所有板子的 USB 序列号都是固定的 `DEADBEEF` —— 多块板子同时插在一台机器上时
-无法区分（VID:PID 也相同）。`option("esig_sn")` 打开后改用芯片 ESIG 区的
-**96 位出厂 UID**（出厂烧录、只读、每颗芯片唯一），转成 24 个大写十六进制字符：
+**默认**取芯片 ESIG 区的 **96 位出厂 UID**（出厂烧录、只读、每颗芯片唯一）作 USB
+序列号，转成 24 个大写十六进制字符 —— 多块板子同时插在一台机器上时才能区分。
+`-EsigSn n` 退回所有板子相同的固定串 `DEADBEEF`（VID:PID 也相同，无法区分）：
 
 ```powershell
-.\build.ps1 -EsigSn y     # 便捷脚本：用芯片 UID
-.\build.ps1               # 默认：固定 DEADBEEF（-EsigSn n）
+.\build.ps1               # 默认：序列号 = 芯片 UID（-EsigSn y）
+.\build.ps1 -EsigSn n     # 退回固定 DEADBEEF
 
-xmake f -m release --esig_sn=y -y
+xmake f -m release -y     # xmake 侧默认同样是 esig_sn
 ```
 
 **寄存器定义**（代码在 `src/dap/dap_main.c`，见 CH32X035 应用手册第 19 章
@@ -368,30 +368,46 @@ RDPR/USER/WRPR 全部原样保留。模式枚举 `firmware_mode_t` 定义在
 ### RAM overlay：两种模式复用同一段 RAM
 
 两套代码全编进来时 Flash 够用，但 RAM 需要约 25.3 KiB 而只有 20 KiB。解决办法是把
-**只有某一个模式用得到**的代码与数据放进同一段 RAM 地址（它们不同时运行），用
+**只有某一个模式用得到**的私有**数据**放进同一段 RAM 地址（它们不同时运行），用
 ld 的 `OVERLAY` 命令实现（见 `sdk/Ld/Link_highcode_nv_256B_dual.ld`）：
 
-| 段 | 内容 | 实测大小 |
-| --- | --- | --- |
-| `.highcode` | **共用**：USB 端口层热路径 | 约 3.1 KiB |
-| `dap_overlay` | 仅 CMSIS-DAP：`sw_dp.c`/`dap_main.c` 热路径 + `DAP_ProcessCommand` + USB 收发缓冲 | 约 4.4 KiB |
-| `wchlink_overlay` | 仅 WCH-Link：`rvswd_phy_gpio.c` 位翻转 + 会话/大缓冲 | 约 7.9 KiB |
-| `.bss` | 共用：USB 核心、端口状态、UART FIFO 等 | 约 4.9 KiB |
+| 段 | 内容 | 实测大小 | 位置 |
+| --- | --- | --- | --- |
+| `.highcode` | **共用**：USB 端口层热路径 | 约 3.1 KiB | RAM（启动时拷入）|
+| `.highcode.dap` | 仅 CMSIS-DAP：`sw_dp.c`/`dap_main.c` 热路径 | 约 2.4 KiB | RAM（并进 `.highcode`）|
+| `.overlay.dap` | 仅 CMSIS-DAP：USB 收发缓冲 | 约 1.6 KiB | RAM，overlay |
+| `.text` 里的 `.highcode.wchlink` | 仅 WCH-Link：`rvswd_phy_gpio.c` 位翻转 | 约 2.0 KiB | **Flash（XIP）** |
+| `.overlay.wchlink` | 仅 WCH-Link：会话/传输状态与大缓冲 | 约 6.0 KiB | RAM，overlay |
+| `.bss` | 共用：USB 核心、端口状态、UART FIFO 等 | 约 4.9 KiB | RAM |
 
-两个 overlay 段的 VMA **相同**（实测都是 `0x20000d9c`），窗口取较大的那个（约 7.9 KiB）。
-`main()` 在进入各自模式前调用 `dap_overlay_init()` / `wchlink_overlay_init()`：
-把该模式的代码段从 Flash（`__load_start_xxx_overlay`）拷进 overlay，并清零它的 BSS。
+**只有数据还参与 overlay**：两个数据段的 VMA **相同**（取较大的 6.0 KiB 作窗口），
+因为数据不能放 Flash（要写），而两模式的数据又互斥 —— 重叠才省 RAM。
+
+代码不再要求运行期拷贝：
+
+- CMSIS-DAP 的热路径（`.highcode.dap`）并进常驻 `.highcode`，由
+  `startup_ch32x035_highcode.S` 在**启动时**拷一次；
+- WCH-Link 的热路径（`.highcode.wchlink`）直接编在 Flash 上执行（XIP）；
+- 于是 `main()` 进模式时**只剩清零数据段**（`_xxx_overlay_bss_*`），没有代码拷贝。
+
+> ⚠️ 代价：WCH-Link 的位翻转代码在 Flash 上执行，而 48 MHz 下 Flash 需要
+> **2 个等待周期**（`FLASH_ACTLR_LATENCY_2`，见 `src/system_ch32x035.c` 的
+> `SetSysClockTo48_HSI`），所以 RVSWD 的时钟会比放在 RAM 时低。这是刻意的取舍 ——
+> 换来省掉运行期代码拷贝、并让 RAM 完全用不着为 WCH-Link 的代码留窗口。
 
 注意事项（改代码时要留意）：
 
-- overlay 的初始化**必须由 `main()` 完成**，不能放进 `cherrydap_process()` 之类的
-  函数里 —— 那个函数自己就在 overlay 段内，调用即等于跳进未初始化的地址。
-- 模式退出时先返回 `main()`（并在那里 `usbd_deinitialize`），确认不再执行 overlay
-  里的代码后，才允许覆盖那段 RAM。
+- 数据段的清零**必须由 `main()` 完成**，不能放进 `cherrydap_process()` 之类的
+  函数里 —— 那个函数自己就在被覆盖的地址范围内，调用即等于跳进未初始化的地址。
+- 模式退出时先返回 `main()`（并在那里 `usbd_deinitialize`），确认不再执行该段里的
+  代码后，才允许覆盖那段 RAM。
 - 往任一模式里新加**较大的静态缓冲**时，如果想让它也参与复用，需要给它加上
   `DAP_PRIVATE_SECTION` / `WCHLINK_PRIVATE_SECTION`（见 `src/mode_overlay.h`）。
   不加也能工作，只是不省 RAM。
 - `.highcode` 里新增共用热路径代码会同时占用两种模式的 RAM（这是应该的 —— 它被共用）。
+- **不要把 `.text.DAP_ProcessCommand`（约 2.9 KiB）收进 `.highcode`**：它的名字会被
+  `.text` 的 `*(.text.*)` 收走而留在 Flash。收进 RAM 会把 RAM 顶到 20.5 KiB
+  （> 20 KiB 上限），并且 `.bss` 会压到 `.stack` 上。
 
 本工程**只有这一种构建**：`sdk/Ld/Link_highcode_nv_256B_dual.ld` 是本目录下唯一的
 工程链接脚本（`mode_overlay.h` 的段宏也没有「退化成 `.highcode`」的分支）。
@@ -418,18 +434,18 @@ git submodule update --init
 ```powershell
 # 便捷脚本（release）。产物固定是 CMSIS-DAP + WCH-Link 双模式固件
 .\build.ps1
-.\build.ps1 -EsigSn y       # 用芯片 ESIG UID 作序列号（每颗芯片唯一）
+.\build.ps1 -EsigSn n       # 退回固定串 DEADBEEF（默认：芯片 ESIG UID，每颗唯一）
 .\build.ps1 -Clean          # 先清理
 .\build.ps1 -Mode debug     # debug 构建
 .\build.ps1 -Reconfigure    # 工具链路径变化后强制重新配置
 
 # 或直接用 xmake
-$env:WCH_TOOLCHAIN_ROOT = "D:/program/wch/MounRiver_Studio2/resources/app/resources/win32/components/WCH/Toolchain/RISC-V Embedded GCC12"
+$env:WCH_TOOLCHAIN_ROOT = "C:/MounRiver/MounRiver_Studio2/resources/app/resources/win32/components/WCH/Toolchain/RISC-V Embedded GCC12"
 xmake f -m release -y
 xmake -r
 
-# 用芯片 UID 作序列号
-xmake f -m release --esig_sn=y -y
+# 用固定串 DEADBEEF 作序列号（xmake 默认也是 esig_sn）
+xmake f -m release --esig_sn=n -y
 xmake -r
 ```
 
@@ -504,8 +520,8 @@ probe-rs list
 probe-rs info --chip <目标型号> --probe <CMSIS-DAP探针序列号>
 ```
 
-USB 描述符沿用 CherryDAP 示例的 VID/PID `0d28:0204`。序列号默认固定为 `DEADBEEF`，
-可用 `--esig_sn=y` 改成芯片出厂 UID（见上方「序列号」一节）。
+USB 描述符沿用 CherryDAP 示例的 VID/PID `0d28:0204`。序列号默认取芯片出厂 UID，
+可用 `--esig_sn=n` 退回固定的 `DEADBEEF`（见上方「序列号」一节）。
 
 本工程自带 `tools/` 下的测速与串口测试脚本（与参考工程一致）：
 

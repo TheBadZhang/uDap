@@ -71,11 +71,12 @@ end
 -- USB 本身同样不可关：本芯片必然用到 USB。
 
 -- 用芯片出厂 UID（ESIG 区，96 位、每颗唯一）作为 CMSIS-DAP 的 USB 序列号。
--- 关闭时用固定的 "DEADBEEF" —— 多块板子同时插在一台机器上时无法区分。
+-- **默认开启**：只有每颗芯片唯一，多块板子同时插在一台机器上才能区分。
+-- 传 --esig_sn=n 退回固定的 "DEADBEEF"（所有板子相同，无法区分）。
 -- 寄存器定义见 CH32X035 应用手册第 19 章「电子签名（ESIG）」。
 -- 序列号在 src/dap/dap_main.c 里设置。
 option("esig_sn")
-    set_default(false)
+    set_default(true)
     set_showmenu(true)
     set_description("Use the chip ESIG UID (96-bit, unique per chip) as the USB serial number")
 option_end()
