@@ -539,8 +539,35 @@ python .\tools\com_loopback_paced.py --baud 2000000 --chunk 4096 --total 262144
 python .\tools\com_loopback_matrix.py --baud 2000000,3000000 --chunk 192,4096
 ```
 
+同一台目标、同一块固件、同一会话下横向对比三个主机工具（64 KiB 块、6 MHz）：
+**pyocd 明显最快，「命令间空转」几乎为零，最接近固件的真实天花板** ——
+所以判断固件还剩多少余量要看 pyocd 那两列。
+
+| 主 机 工 具 | 版本 | 写 KiB/s | 读 KiB/s | 写 µs/字 |
+| --- | --- | --- | --- | --- |
+| **pyocd**（`tools/pyocd_speed.py`） | 0.45.1 | **252.2** | **202.9** | **15.49** |
+| probe-rs（`probe-rs benchmark`） | 0.32.0 | 155.1 | 140.0 | 25.19 |
+| OpenOCD（`tools/speed.ps1`） | 0.12.0 | 139.0 | 129.0 | 28.11 |
+
+```powershell
+# pyocd 测速（与 speed.ps1 同地址 / 同块大小 / 同 pattern / 同回读校验，可直接比数）
+python .\tools\pyocd_speed.py --frequency 6000000 --bytes 65536 --rounds 10
+```
+
+用 pyocd 前要先装 F411 的 Keil pack（pyocd 内置目标表**没有** stm32f411）：
+
+```powershell
+pyocd pack -i stm32f411
+```
+
+命令级空转的差别很大：OpenOCD 在 `init` 时打印
+`Allocating FIFO for 3 pending packets`，因为它把在飞命令数夹在写死的常量
+`MAX_PENDING_REQUESTS = 3` 上（`cmsis_dap.c`），尽管固件通过 `DAP_Info`
+advertise 了 `DAP_PACKET_COUNT = 8`。probe-rs 也低于 pyocd。
+
 实测基线（STM32F411 目标，OpenOCD + `tools/openocd_speed_test.tcl`，2026-09-26，
 16 KiB 块、预热 1 轮 + 5 轮平均）：
+（块大小与上表不同 —— 这里是 16 KiB，上表是 64 KiB，所以数值偏低，别混着比）
 
 | SWCLK | 写 KiB/s | 读 KiB/s | 路径 |
 | --- | --- | --- | --- |
