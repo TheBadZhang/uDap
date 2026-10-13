@@ -1,5 +1,10 @@
 .vscode
 
+# xmake 的本地缓存/锁（根目录也有 xmake.lua，所以根目录同样会生成）
+.xmake
+
+__pycache__
+
 firmware/tools/__pycache__
 
 firmware/.vscode
