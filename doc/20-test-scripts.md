@@ -14,7 +14,7 @@
 | `firmware/tools/dap_probe_check.py` | 探针基本信息检查 |
 | `firmware/tools/pyocd_speed.py` | **pyocd 测速**：与 `speed.ps1` 同地址 / 同块大小 / 同 pattern / 同回读校验，数字可直接横向比较；最接近固件真实天花板（实测 262 写 / 232 读 KiB/s） |
 | `firmware/tools/cycle.ps1` | **一条命令跑完「编译 → 烧录 → 测速」**：用 RVLink + WCH OpenOCD 刷 uDap，再轮询 USB 重新枚举，最后调 `speed.ps1` |
-| `firmware/tools/probe_swd_sweep.py` | **对照探针扫描**：对第三方 CMSIS-DAP 探针做「1~15 MHz × 1/4/16/64 KiB × 重复次数」的读写吞吐扫描，pyocd 与 OpenOCD 两个工具都支持，输出 CSV + 汇总表（见「对照探针：测试方法与横向对比」） |
+| `firmware/tools/probe_swd_sweep.py` | **对照探针扫描**：对第三方 CMSIS-DAP 探针做「1/3/6/9/12/15 MHz × 1/4/16/64 KiB × 重复次数」的读写吞吐扫描，pyocd 与 OpenOCD 两个工具都支持，输出 CSV + 汇总表（见「对照探针：测试方法与横向对比」） |
 | `firmware/tools/openocd.cfg` | 独立的 100 × 64 KiB 读写压测配置（`adapter speed 40000`） |
 
 复现本文数据：
