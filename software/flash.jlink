@@ -1,0 +1,13 @@
+exec SetAllowCMSISDAP=1
+conn
+si SWD
+speed 6000
+device STM32F411CE
+r
+h
+erase
+loadbin firmware.bin 0x08000000
+verifybin firmware.bin 0x08000000
+r
+g
+qc
