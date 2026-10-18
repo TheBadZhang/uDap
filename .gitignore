@@ -5,7 +5,9 @@
 
 __pycache__
 
-firmware/ch32x035/tools/__pycache__
+firmware/ch552
+
+firmware/tools/__pycache__
 
 firmware/ch32x035/.vscode
 firmware/ch32x035/.xmake
