@@ -5,16 +5,19 @@
 
 __pycache__
 
-firmware/tools/__pycache__
+firmware/ch32x035/tools/__pycache__
 
-firmware/.vscode
-firmware/.xmake
-firmware/build
+firmware/ch32x035/.vscode
+firmware/ch32x035/.xmake
+firmware/ch32x035/build
 
-firmware/sdk/EXAM
+firmware/ch32x035/sdk/EXAM
 
+production
+fp-lib-table
+*.copper_thief.json
+fabrication-toolkit-options.json
+*.round-tracks-config
 
-
-
-hardware/uDap-backups
-hardware/fp-info-cache
+*-backups
+fp-info-cache
