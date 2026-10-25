@@ -163,4 +163,11 @@ SECTIONS
         . = . + __stack_size;
         PROVIDE(_eusrstack = .);
     } > RAM
+
+    /* 数据区（含 overlay 窗口）不能顶到栈：栈的 VMA 是写死的
+     * ORIGIN(RAM)+LENGTH(RAM)-__stack_size，而 ld 只检查「段是否超出 RAM 区域」，
+     * **不检查段与段是否重叠**。所以这里显式断言，把「改大缓冲把栈覆盖掉」
+     * 变成链接错误，而不是运行期随机跑飞。 */
+    ASSERT(_ebss <= _susrstack,
+           ".bss/overlay overflow: data area reaches into the reserved stack")
 }

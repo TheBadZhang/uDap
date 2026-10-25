@@ -1,10 +1,13 @@
 # 构建 ch32x035f8u-dap (uDap) 固件
 #
-# 固件固定为**双模式**：CMSIS-DAP 与 WCH-Link 两套调试器代码都编入同一份固件，
-# 运行期用模式切换按键（PA4 接地）切换。没有「只编其中一个」的构建。
+# 调试器模式：
+#   CMSIS-DAP            固定编入
+#   WCH-Link（RVSWD）    默认**不编入**（省 Flash 与约 6 KiB RAM）；
+#                        传 -Wchlink y 编成双模式固件，上电时按住 PB3 切换。
 #
 # 用法:
 #   .\build.ps1               # release 构建（默认用芯片 ESIG UID 作序列号）
+#   .\build.ps1 -Wchlink y    # 把 WCH-Link（RVSWD）也编进去（双模式）
 #   .\build.ps1 -EsigSn n     # 退回固定串 DEADBEEF（所有板子相同）
 #   .\build.ps1 -Clean        # 先清理再构建
 #   .\build.ps1 -Mode debug   # debug 构建
@@ -30,6 +33,13 @@ param(
     [ValidateSet('y', 'n')]
     [string]$EsigSn = 'y',
 
+    # 是否把 WCH-Link（RVSWD）调试器也编进固件，对应 xmake.lua 的
+    # option("wchlink")。**默认 n**：它的代码/数据占数 KiB Flash 与约 6 KiB RAM，
+    # 平时用不到；双串口等功能要在 20 KiB SRAM 里放得下，离不开这份空间。
+    # 同样每次都显式传，避免 xmake 记住上一次的选项。
+    [ValidateSet('y', 'n')]
+    [string]$Wchlink = 'n',
+
     [switch]$Clean,
     [switch]$Reconfigure
 )
@@ -38,31 +48,40 @@ $ErrorActionPreference = 'Stop'
 
 # WCH RISC-V 工具链（MounRiver Studio 2 自带）
 # toolchains/wch-riscv/xmake.lua 只会自动探测 C:/MounRiver/MounRiver_Studio2/...，
-# 本机装在 D:\program\wch 下，所以必须显式指定，否则报
-# "WCH toolchain not found; set WCH_TOOLCHAIN_ROOT ..."
-$env:WCH_TOOLCHAIN_ROOT = 'D:\program\wch\MounRiver_Studio2\resources\app\resources\win32\components\WCH\Toolchain\RISC-V Embedded GCC12'
+# 这里再显式指定常见安装位置，找不到时交给 xmake 默认探测。
+foreach ($candidate in @(
+        'D:\program\wch\MounRiver_Studio2\resources\app\resources\win32\components\WCH\Toolchain\RISC-V Embedded GCC12',
+        'C:\MounRiver\MounRiver_Studio2\resources\app\resources\win32\components\WCH\Toolchain\RISC-V Embedded GCC12')) {
+    if (Test-Path $candidate) {
+        $env:WCH_TOOLCHAIN_ROOT = $candidate
+        break
+    }
+}
 
 Push-Location $PSScriptRoot
 try {
     $snLabel = if ($EsigSn -eq 'y') { '芯片 ESIG UID（每颗唯一）' } else { '固定 DEADBEEF' }
+    $dbgLabel = if ($Wchlink -eq 'y') { '双模式（CMSIS-DAP + WCH-Link，上电按住 PB3 切换）' } else { 'CMSIS-DAP only（-Wchlink y 可加编 WCH-Link）' }
     Write-Host "工具链   : $env:WCH_TOOLCHAIN_ROOT" -ForegroundColor DarkGray
-    Write-Host "模式     : 双模式（CMSIS-DAP + WCH-Link 都编入，运行期按键切换）" -ForegroundColor Yellow
+    Write-Host "调试器   : $dbgLabel" -ForegroundColor Yellow
     Write-Host "序列号   : $snLabel (-EsigSn $EsigSn)" -ForegroundColor DarkGray
 
     if ($Clean) {
         Write-Host '==> xmake clean --all' -ForegroundColor Cyan
-        xmake clean --all
+        xmake clean --all -P $PSScriptRoot
         if ($LASTEXITCODE -ne 0) { throw 'xmake clean 失败' }
     }
 
-    $configArgs = @('f', '-m', $Mode, "--esig_sn=$EsigSn", '-y')
+    # -P 指定本目录为工程根：仓库根目录也有一个只含 task 的 xmake.lua，
+    # 不指定时 xmake 会向上找到它，导致找不到 --esig_sn 等本工程选项。
+    $configArgs = @('f', '-P', $PSScriptRoot, '-m', $Mode, "--esig_sn=$EsigSn", "--wchlink=$Wchlink", '-y')
     if ($Reconfigure) { $configArgs += '-c' }
     Write-Host "==> xmake $($configArgs -join ' ')" -ForegroundColor Cyan
     & xmake @configArgs
     if ($LASTEXITCODE -ne 0) { throw 'xmake 配置失败' }
 
     Write-Host '==> xmake -r' -ForegroundColor Cyan
-    xmake -r
+    xmake -r -P $PSScriptRoot
     if ($LASTEXITCODE -ne 0) { throw 'xmake 构建失败' }
 
     Write-Host ''

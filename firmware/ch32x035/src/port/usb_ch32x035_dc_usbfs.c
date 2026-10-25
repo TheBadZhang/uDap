@@ -268,8 +268,15 @@ static void x035_usb_restore_dma(uint8_t ep_idx) {
     x035_usb_dma_fence();
 }
 
+// EP0 与 EP4 **共用** UEP0_DMA 这一个起始地址（手册表 18-2「端点 0 和 4 缓冲区
+// 模式」）：EP4 的 OUT 缓冲区固定在 base+64、IN 缓冲区在 base+128。
+//
+// 所以这里必须把基址固定在 ep0_4_buffer，**不能**为了省一次拷贝把它指到
+// &s_dcd.setup —— 那样 EP4 的收发缓冲会整体漂到 s_dcd 内部，主机一发数据就把
+// USB 驱动自己的状态踩坏（表现为「给 COM2 发数据，设备直接掉线」）。
+// SETUP 阶段收到的 8 字节仍在 base+0，由 x035_usb_handle_setup() 拷进 s_dcd.setup。
 static void x035_usb_restore_setup_dma(void) {
-    *x035_usb_dma_reg(0u) = (uint32_t)(uintptr_t)&s_dcd.setup;
+    *x035_usb_dma_reg(0u) = (uint32_t)(uintptr_t)s_dcd.ep0_4_buffer;
     x035_usb_dma_fence();
 }
 
@@ -366,7 +373,9 @@ static void x035_usb_load_in_packet(uint8_t ep_idx) X035_USBFS_HIGHCODE_ATTR __a
 static void x035_usb_load_in_packet(uint8_t ep_idx) {
     x035_usb_ep_state_t *state = &s_dcd.in_ep[ep_idx];
     uint32_t count = x035_usb_min(state->remaining, state->mps);
-    bool direct = ep_idx != 4u && count != 0u && !x035_usb_mode_enabled(ep_idx, false) &&
+    // EP0 **不能**走零拷贝：它的 UEP0_DMA 与 EP4 共用（手册表 18-2），把基址指到
+    // 任意缓冲区会让 EP4 的收发缓冲整体漂移。EP4 同理，永远走拷贝。
+    bool direct = ep_idx != 0u && ep_idx != 4u && count != 0u && !x035_usb_mode_enabled(ep_idx, false) &&
                   (((uintptr_t)state->buffer & 3u) == 0u) && x035_usb_sram_range(state->buffer, count);
 
     state->packet_len = (uint16_t)count;
@@ -564,6 +573,10 @@ static void x035_usb_handle_setup(uint8_t busid) {
     x035_usb_set_rx_ctrl(0u, USBFS_UEP_R_TOG | USBFS_UEP_R_RES_NAK);
     s_dcd.ep0_rx_toggle = true;
     s_dcd.ep0_tx_toggle = true;
+    // SETUP 包由硬件写在 UEP0_DMA 基址 +0（即 ep0_4_buffer 开头），
+    // 基址不能为了零拷贝指向 &s_dcd.setup（见 x035_usb_restore_setup_dma 的说明），
+    // 所以这里拷 8 字节。
+    memcpy(&s_dcd.setup, s_dcd.ep0_4_buffer, sizeof(s_dcd.setup));
     usbd_event_ep0_setup_complete_handler(busid, (uint8_t *)&s_dcd.setup);
 }
 

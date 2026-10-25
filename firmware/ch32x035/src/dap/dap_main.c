@@ -41,12 +41,59 @@
                                USBD_WEBUSB_DESC_LEN * USBD_WEBUSB_ENABLE + \
                                USBD_WINUSB_DESC_LEN * USBD_WINUSB_ENABLE)
 
-#define USB_CONFIG_SIZE (9 + CMSIS_DAP_INTERFACE_SIZE + CDC_ACM_DESCRIPTOR_LEN + \
-                         CONFIG_CHERRYDAP_USE_CUSTOM_HID * CUSTOM_HID_LEN +      \
-                         CONFIG_CHERRYDAP_USE_MSC * MSC_DESCRIPTOR_LEN + USBD_WEBUSB_ENABLE * 9)
+// ---------------------------------------------------------------------------
+// 第二个 CDC 端口（双串口模式的 COM2 <-> USART2）
+// ---------------------------------------------------------------------------
+// 与 CherryUSB 的 CDC_ACM_DESCRIPTOR_INIT 相比只差两处：
+//   1. 控制接口 bNumEndpoints = 0（没有通知端点）
+//   2. 少了那 7 字节的通知端点描述符
+// 其余（IAD / Header / Call Management / ACM / Union）与标准 CDC-ACM 一致。
+// 原因见 dap_main.h 的端点分配说明：8 个端点已经用满。
+#define CDC_ACM_DESCRIPTOR_LEN_NO_NOTIFY (8 + 9 + 5 + 5 + 4 + 5 + 9 + 7 + 7)
 
-#define INTF_NUM (1 + 2 + CONFIG_CHERRYDAP_USE_CUSTOM_HID + CONFIG_CHERRYDAP_USE_MSC + USBD_WEBUSB_ENABLE)
+// clang-format off
+#define CDC_ACM_DESCRIPTOR_INIT_NO_NOTIFY(bFirstInterface, out_ep, in_ep, wMaxPacketSize, str_idx) \
+    /* Interface Association */                                                                \
+    0x08, USB_DESCRIPTOR_TYPE_INTERFACE_ASSOCIATION, bFirstInterface, 0x02,                    \
+    USB_DEVICE_CLASS_CDC, CDC_ABSTRACT_CONTROL_MODEL, CDC_COMMON_PROTOCOL_NONE, 0x00,          \
+    /* 控制接口：0 个端点（没有通知端点） */                                                    \
+    0x09, USB_DESCRIPTOR_TYPE_INTERFACE, bFirstInterface, 0x00, 0x00,                          \
+    USB_DEVICE_CLASS_CDC, CDC_ABSTRACT_CONTROL_MODEL, CDC_COMMON_PROTOCOL_NONE, str_idx,       \
+    /* Header functional */                                                                    \
+    0x05, CDC_CS_INTERFACE, CDC_FUNC_DESC_HEADER, WBVAL(CDC_V1_10),                            \
+    /* Call Management functional */                                                           \
+    0x05, CDC_CS_INTERFACE, CDC_FUNC_DESC_CALL_MANAGEMENT, 0x00, (uint8_t)(bFirstInterface + 1), \
+    /* Abstract Control Management functional */                                               \
+    0x04, CDC_CS_INTERFACE, CDC_FUNC_DESC_ABSTRACT_CONTROL_MANAGEMENT, 0x02,                   \
+    /* Union functional */                                                                     \
+    0x05, CDC_CS_INTERFACE, CDC_FUNC_DESC_UNION, bFirstInterface, (uint8_t)(bFirstInterface + 1), \
+    /* 数据接口 */                                                                              \
+    0x09, USB_DESCRIPTOR_TYPE_INTERFACE, (uint8_t)(bFirstInterface + 1), 0x00, 0x02,           \
+    CDC_DATA_INTERFACE_CLASS, 0x00, 0x00, 0x00,                                                \
+    /* OUT 端点 */                                                                              \
+    0x07, USB_DESCRIPTOR_TYPE_ENDPOINT, out_ep, 0x02, WBVAL(wMaxPacketSize), 0x00,             \
+    /* IN 端点 */                                                                               \
+    0x07, USB_DESCRIPTOR_TYPE_ENDPOINT, in_ep, 0x02, WBVAL(wMaxPacketSize), 0x00
+// clang-format on
 
+// 两套配置描述符：串口模式决定 USB 里有几个 CDC 接口。
+//   single —— 「串口 1 + DTR/RTS 流控」：只有 COM1，主机只看到一个串口
+//   dual   —— 「双串口」：COM1 + COM2
+// 两者只差末尾那一块 CDC2，所以用宏拼公共部分，避免两处字节不同步。
+// 切换模式必须重新枚举（usbd_deinitialize -> usbd_desc_register -> usbd_initialize）。
+#define USB_CONFIG_COMMON_LEN (9 + CMSIS_DAP_INTERFACE_SIZE + CDC_ACM_DESCRIPTOR_LEN +       \
+                               CONFIG_CHERRYDAP_USE_CUSTOM_HID * CUSTOM_HID_LEN +            \
+                               CONFIG_CHERRYDAP_USE_MSC * MSC_DESCRIPTOR_LEN + USBD_WEBUSB_ENABLE * 9)
+
+#define USB_CONFIG_SIZE_SINGLE (USB_CONFIG_COMMON_LEN)
+#define USB_CONFIG_SIZE_DUAL   (USB_CONFIG_COMMON_LEN + CDC_ACM_DESCRIPTOR_LEN_NO_NOTIFY)
+
+#define INTF_NUM_SINGLE (1 + 2 + CONFIG_CHERRYDAP_USE_CUSTOM_HID + CONFIG_CHERRYDAP_USE_MSC + USBD_WEBUSB_ENABLE)
+#define INTF_NUM_DUAL   (INTF_NUM_SINGLE + 2)
+
+// HID / MSC / USB-WebUSB 在本工程里全部关闭。若要打开，注意它们的接口号是按
+// 「DAP + CDC1」算的（3 起），会和双串口模式的 CDC2（接口 3/4、端点 4/7）冲突，
+// 而且 HID 用的 EP8/EP9 在 CH32X035 上并不存在（只有 EP0..EP7）。
 #define MSC_INTF_NUM (3 + CONFIG_CHERRYDAP_USE_CUSTOM_HID)
 
 #define WEBUSB_INTF_NUM (3 + CONFIG_CHERRYDAP_USE_CUSTOM_HID + CONFIG_CHERRYDAP_USE_MSC)
@@ -223,15 +270,22 @@ static const uint8_t device_descriptor[] = {
     USB_DEVICE_DESCRIPTOR_INIT(USB_2_1, 0xEF, 0x02, 0x01, USBD_VID, USBD_PID, 0x0100, 0x01),
 };
 
-static const uint8_t config_descriptor[] = {
-    USB_CONFIG_DESCRIPTOR_INIT(USB_CONFIG_SIZE, INTF_NUM, 0x01, USB_CONFIG_BUS_POWERED, USBD_MAX_POWER),
-    /* Interface 0 */
-    USB_INTERFACE_DESCRIPTOR_INIT(0x00, 0x00, 0x02, 0xFF, 0x00, 0x00, 0x02),
-    /* Endpoint OUT 2 */
-    USB_ENDPOINT_DESCRIPTOR_INIT(DAP_OUT_EP, USB_ENDPOINT_TYPE_BULK, DAP_PACKET_SIZE, 0x00),
-    /* Endpoint IN 1 */
-    USB_ENDPOINT_DESCRIPTOR_INIT(DAP_IN_EP, USB_ENDPOINT_TYPE_BULK, DAP_PACKET_SIZE, 0x00),
-    CDC_ACM_DESCRIPTOR_INIT(0x01, CDC_INT_EP, CDC_OUT_EP, CDC_IN_EP, DAP_PACKET_SIZE, 0x00),
+/* 两套描述符共用的部分：DAP 接口 + 串口 1（CDC1） */
+#define USB_CONFIG_BODY_COMMON                                                                                     \
+    /* Interface 0：CMSIS-DAP vendor bulk */                                                                       \
+    USB_INTERFACE_DESCRIPTOR_INIT(0x00, 0x00, 0x02, 0xFF, 0x00, 0x00, 0x02),                                      \
+    USB_ENDPOINT_DESCRIPTOR_INIT(DAP_OUT_EP, USB_ENDPOINT_TYPE_BULK, DAP_PACKET_SIZE, 0x00),                       \
+    USB_ENDPOINT_DESCRIPTOR_INIT(DAP_IN_EP, USB_ENDPOINT_TYPE_BULK, DAP_PACKET_SIZE, 0x00),                        \
+    /* 串口 1：CDC1 <-> USART4（PB0/PB1） */                                                                       \
+    CDC_ACM_DESCRIPTOR_INIT(0x01, CDC_INT_EP, CDC_OUT_EP, CDC_IN_EP, DAP_PACKET_SIZE, 0x00)
+
+/* 只有双串口模式才追加的部分：串口 2（CDC2）<-> USART2（PA2/PA3） */
+#define USB_CONFIG_BODY_CDC2                                                                                       \
+    CDC_ACM_DESCRIPTOR_INIT_NO_NOTIFY(0x03, CDC2_OUT_EP, CDC2_IN_EP, DAP_PACKET_SIZE, 0x00)
+
+static const uint8_t config_descriptor_single[] = {
+    USB_CONFIG_DESCRIPTOR_INIT(USB_CONFIG_SIZE_SINGLE, INTF_NUM_SINGLE, 0x01, USB_CONFIG_BUS_POWERED, USBD_MAX_POWER),
+    USB_CONFIG_BODY_COMMON,
 #if CONFIG_CHERRYDAP_USE_CUSTOM_HID
     HID_DESC(),
 #endif
@@ -243,25 +297,61 @@ static const uint8_t config_descriptor[] = {
 #endif
 };
 
-static const uint8_t other_speed_config_descriptor[] = {
-    USB_CONFIG_DESCRIPTOR_INIT(USB_CONFIG_SIZE, INTF_NUM, 0x01, USB_CONFIG_BUS_POWERED, USBD_MAX_POWER),
-    /* Interface 0 */
-    USB_INTERFACE_DESCRIPTOR_INIT(0x00, 0x00, 0x02, 0xFF, 0x00, 0x00, 0x02),
-    /* Endpoint OUT 2 */
-    USB_ENDPOINT_DESCRIPTOR_INIT(DAP_OUT_EP, USB_ENDPOINT_TYPE_BULK, DAP_PACKET_SIZE, 0x00),
-    /* Endpoint IN 1 */
-    USB_ENDPOINT_DESCRIPTOR_INIT(DAP_IN_EP, USB_ENDPOINT_TYPE_BULK, DAP_PACKET_SIZE, 0x00),
-    CDC_ACM_DESCRIPTOR_INIT(0x01, CDC_INT_EP, CDC_OUT_EP, CDC_IN_EP, DAP_PACKET_SIZE, 0x00),
+static const uint8_t config_descriptor_dual[] = {
+    USB_CONFIG_DESCRIPTOR_INIT(USB_CONFIG_SIZE_DUAL, INTF_NUM_DUAL, 0x01, USB_CONFIG_BUS_POWERED, USBD_MAX_POWER),
+    USB_CONFIG_BODY_COMMON,
+    USB_CONFIG_BODY_CDC2,
 #if CONFIG_CHERRYDAP_USE_CUSTOM_HID
     HID_DESC(),
 #endif
 #if CONFIG_CHERRYDAP_USE_MSC
-    MSC_DESCRIPTOR_INIT(0x04, MSC_OUT_EP, MSC_IN_EP, DAP_PACKET_SIZE, 0x00),
+    MSC_DESCRIPTOR_INIT(MSC_INTF_NUM, MSC_OUT_EP, MSC_IN_EP, DAP_PACKET_SIZE, 0x00),
 #endif
 #if USBD_WEBUSB_ENABLE
     USB_INTERFACE_DESCRIPTOR_INIT(WEBUSB_INTF_NUM, 0x00, 0x00, 0xff, 0x00, 0x00, 0x04),
 #endif
 };
+
+static const uint8_t other_speed_config_descriptor_single[] = {
+    USB_CONFIG_DESCRIPTOR_INIT(USB_CONFIG_SIZE_SINGLE, INTF_NUM_SINGLE, 0x01, USB_CONFIG_BUS_POWERED, USBD_MAX_POWER),
+    USB_CONFIG_BODY_COMMON,
+#if CONFIG_CHERRYDAP_USE_CUSTOM_HID
+    HID_DESC(),
+#endif
+#if CONFIG_CHERRYDAP_USE_MSC
+    MSC_DESCRIPTOR_INIT(MSC_INTF_NUM, MSC_OUT_EP, MSC_IN_EP, DAP_PACKET_SIZE, 0x00),
+#endif
+#if USBD_WEBUSB_ENABLE
+    USB_INTERFACE_DESCRIPTOR_INIT(WEBUSB_INTF_NUM, 0x00, 0x00, 0xff, 0x00, 0x00, 0x04),
+#endif
+};
+
+static const uint8_t other_speed_config_descriptor_dual[] = {
+    USB_CONFIG_DESCRIPTOR_INIT(USB_CONFIG_SIZE_DUAL, INTF_NUM_DUAL, 0x01, USB_CONFIG_BUS_POWERED, USBD_MAX_POWER),
+    USB_CONFIG_BODY_COMMON,
+    USB_CONFIG_BODY_CDC2,
+#if CONFIG_CHERRYDAP_USE_CUSTOM_HID
+    HID_DESC(),
+#endif
+#if CONFIG_CHERRYDAP_USE_MSC
+    MSC_DESCRIPTOR_INIT(MSC_INTF_NUM, MSC_OUT_EP, MSC_IN_EP, DAP_PACKET_SIZE, 0x00),
+#endif
+#if USBD_WEBUSB_ENABLE
+    USB_INTERFACE_DESCRIPTOR_INIT(WEBUSB_INTF_NUM, 0x00, 0x00, 0xff, 0x00, 0x00, 0x04),
+#endif
+};
+
+/* 描述符是手写字节、长度由宏算出，两者一旦不同步，主机枚举就会读到错位的接口
+ * 列表（表现为"设备能打开但串口/端点不对"，很难查）。这里加编译期校验：
+ * 改动描述符却忘了同步长度宏会直接编译失败。 */
+_Static_assert(sizeof(config_descriptor_single) == USB_CONFIG_SIZE_SINGLE,
+               "config_descriptor_single size does not match USB_CONFIG_SIZE_SINGLE");
+_Static_assert(sizeof(config_descriptor_dual) == USB_CONFIG_SIZE_DUAL,
+               "config_descriptor_dual size does not match USB_CONFIG_SIZE_DUAL");
+_Static_assert(sizeof(other_speed_config_descriptor_single) == USB_CONFIG_SIZE_SINGLE,
+               "other_speed_config_descriptor_single size mismatch");
+_Static_assert(sizeof(other_speed_config_descriptor_dual) == USB_CONFIG_SIZE_DUAL,
+               "other_speed_config_descriptor_dual size mismatch");
 
 /*!< custom hid report descriptor */
 const uint8_t hid_custom_report_desc[HID_CUSTOM_REPORT_DESC_SIZE] = {
@@ -394,9 +484,11 @@ __WEAK const uint8_t *device_descriptor_callback(uint8_t speed) {
     return device_descriptor;
 }
 
+// 枚举时按当前串口模式挑描述符：串口 1 + 流控 -> 只有 COM1；双串口 -> COM1 + COM2。
+// 运行期双击切换模式后必须重新枚举，否则主机看到的还是旧布局。
 __WEAK const uint8_t *config_descriptor_callback(uint8_t speed) {
     (void)speed;
-    return config_descriptor;
+    return drv_uart_mode_is_dual() ? config_descriptor_dual : config_descriptor_single;
 }
 
 __WEAK const uint8_t *device_quality_descriptor_callback(uint8_t speed) {
@@ -406,7 +498,8 @@ __WEAK const uint8_t *device_quality_descriptor_callback(uint8_t speed) {
 
 __WEAK const uint8_t *other_speed_config_descriptor_callback(uint8_t speed) {
     (void)speed;
-    return other_speed_config_descriptor;
+    return drv_uart_mode_is_dual() ? other_speed_config_descriptor_dual
+                                   : other_speed_config_descriptor_single;
 }
 
 __WEAK const char *string_descriptor_callback(uint8_t speed, uint8_t index) {
@@ -459,6 +552,12 @@ static volatile uint8_t cdc_tx_busy;
 // 排空到能再容一整包后，由 chry_dap_cdc_bridge() 重新挂起。
 static volatile uint8_t cdc_out_stalled;
 
+// 第二个 CDC（COM2 <-> USART2，仅双串口模式枚举出来）用完全相同的一套缓冲与背压策略
+static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t cdc2_out_buffer[CDC_OUT_BUFFER_SIZE] DAP_PRIVATE_SECTION;
+static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t cdc2_in_buffer[CDC_IN_BUFFER_SIZE] DAP_PRIVATE_SECTION;
+static volatile uint8_t cdc2_tx_busy;
+static volatile uint8_t cdc2_out_stalled;
+
 // ---------------------------------------------------------------------------
 // 关于 COM 口波特率：不再设上限
 // ---------------------------------------------------------------------------
@@ -495,7 +594,8 @@ static volatile uint8_t cdc_out_stalled;
 // 端点既然没挂就永远不会再有中断，「FIFO 已排空」只能在主循环里察觉 ——
 // 少了这一半，背压会把 OUT 端点永久停摆（比丢字节更糟）。
 // IN 那一支不能在 UART 中断里做，因为 usbd_ep_start_write 不是中断安全的。
-void chry_dap_cdc_bridge(void) {
+// COM1 <-> USART4 的两个方向
+static void cdc1_bridge(void) {
     uint32_t length;
 
     // ---- OUT 方向：背压恢复 ----
@@ -528,12 +628,47 @@ void chry_dap_cdc_bridge(void) {
     }
 }
 
+// COM2 <-> USART2 的两个方向（仅双串口模式存在这个 CDC）
+static void cdc2_bridge(void) {
+    uint32_t length;
+
+    // 单串口 + 流控模式：COM2 根本没有枚举出来，端点也不存在，什么都不用做
+    if (!drv_uart_mode_is_dual()) {
+        return;
+    }
+
+    if (cdc2_out_stalled != 0U && drv_uart2_tx_free() >= CDC_OUT_BUFFER_SIZE) {
+        cdc2_out_stalled = 0U;
+        usbd_ep_start_read(0, CDC2_OUT_EP, cdc2_out_buffer, sizeof(cdc2_out_buffer));
+    }
+
+    if (cdc2_tx_busy) {
+        return;
+    }
+
+    length = drv_uart2_read(cdc2_in_buffer, sizeof(cdc2_in_buffer));
+    if (length == 0U) {
+        return;
+    }
+
+    cdc2_tx_busy = 1U;
+    if (usbd_ep_start_write(0, CDC2_IN_EP, cdc2_in_buffer, length) < 0) {
+        cdc2_tx_busy = 0U;
+    }
+}
+
+void chry_dap_cdc_bridge(void) {
+    cdc1_bridge();
+    cdc2_bridge();
+}
+
 void usbd_event_handler(uint8_t busid, uint8_t event) {
     (void)busid;
     switch (event) {
         case USBD_EVENT_RESET:
             // 复位后端点重新枚举，发送状态一并清零
             cdc_tx_busy = 0U;
+            cdc2_tx_busy = 0U;
             break;
         case USBD_EVENT_CONNECTED:
             break;
@@ -548,9 +683,14 @@ void usbd_event_handler(uint8_t busid, uint8_t event) {
             USB_RequestIdle = 0U;
             cdc_tx_busy = 0U;
             cdc_out_stalled = 0U;
+            cdc2_tx_busy = 0U;
+            cdc2_out_stalled = 0U;
 
             usbd_ep_start_read(0, DAP_OUT_EP, USB_Request[0], DAP_PACKET_SIZE);
             usbd_ep_start_read(0, CDC_OUT_EP, cdc_out_buffer, sizeof(cdc_out_buffer));
+            if (drv_uart_mode_is_dual()) {
+                usbd_ep_start_read(0, CDC2_OUT_EP, cdc2_out_buffer, sizeof(cdc2_out_buffer));
+            }
 
             break;
         case USBD_EVENT_SET_REMOTE_WAKEUP:
@@ -635,6 +775,37 @@ void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes) {
     cdc_tx_busy = 0U;
 }
 
+// ---- 第二个 CDC（COM2 <-> USART2）----
+// 策略与 COM1 相同（见 usbd_cdc_acm_bulk_out 的说明），唯一区别是：
+// 没进双串口模式时 COM2 没有对应串口，收到的数据直接丢弃并立刻重挂端点。
+void usbd_cdc_acm2_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes) DAP_HIGHCODE_SECTION __attribute__((noinline));
+void usbd_cdc_acm2_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes) {
+    (void)busid;
+    (void)ep;
+
+    if (!drv_uart2_ready()) {
+        // 不可能是其它情况：CDC2 只会在双串口模式下注册，而那时 USART2 一定已初始化
+        return;
+    }
+
+    drv_uart2_write(cdc2_out_buffer, nbytes);
+
+    if (drv_uart2_tx_free() >= CDC_OUT_BUFFER_SIZE) {
+        usbd_ep_start_read(0, CDC2_OUT_EP, cdc2_out_buffer, sizeof(cdc2_out_buffer));
+    } else {
+        cdc2_out_stalled = 1U;
+    }
+}
+
+void usbd_cdc_acm2_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes) DAP_HIGHCODE_SECTION __attribute__((noinline));
+void usbd_cdc_acm2_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes) {
+    (void)busid;
+    (void)ep;
+    (void)nbytes;
+
+    cdc2_tx_busy = 0U;
+}
+
 struct usbd_endpoint dap_out_ep = {
     .ep_addr = DAP_OUT_EP,
     .ep_cb = dap_out_callback};
@@ -651,6 +822,14 @@ struct usbd_endpoint cdc_in_ep = {
     .ep_addr = CDC_IN_EP,
     .ep_cb = usbd_cdc_acm_bulk_in};
 
+struct usbd_endpoint cdc2_out_ep = {
+    .ep_addr = CDC2_OUT_EP,
+    .ep_cb = usbd_cdc_acm2_bulk_out};
+
+struct usbd_endpoint cdc2_in_ep = {
+    .ep_addr = CDC2_IN_EP,
+    .ep_cb = usbd_cdc_acm2_bulk_in};
+
 #if CONFIG_CHERRYDAP_USE_CUSTOM_HID
 struct usbd_endpoint hid_custom_in_ep = {
     .ep_addr = HID_IN_EP,
@@ -666,6 +845,9 @@ struct usbd_endpoint hid_custom_out_ep = {
 struct usbd_interface dap_intf;
 struct usbd_interface intf1;
 struct usbd_interface intf2;
+// 第二个 CDC（COM2，双串口模式）的控制接口与数据接口
+struct usbd_interface cdc2_ctrl_intf;
+struct usbd_interface cdc2_data_intf;
 #if CONFIG_CHERRYDAP_USE_CUSTOM_HID
 struct usbd_interface hid_intf;
 #endif
@@ -699,14 +881,11 @@ const struct usb_descriptor cmsisdap_descriptor = {
     .msosv2_descriptor = &msosv2_desc,
     .webusb_url_descriptor = &webusb_url_desc};
 
-void chry_dap_init(uint8_t busid, uint32_t reg_base) {
-    DAP_Setup();
-
-#if ESIG_SN
-    // 必须在 usbd_initialize() 之前：主机在枚举阶段就会索要序列号字符串描述符
-    esig_sn_apply();
-#endif
-
+// 按当前串口模式注册描述符、接口与端点，然后启动 USB。
+// 可以反复调用（切换串口模式时先 usbd_deinitialize() 再调本函数）：
+// usbd_desc_register 会重置整个 g_usbd_core（含 intf / endpoint 计数），
+// 不会累积上一次的模式。
+void chry_dap_usb_start(void) {
     usbd_desc_register(0, &cmsisdap_descriptor);
 
     /*!< winusb */
@@ -714,11 +893,20 @@ void chry_dap_init(uint8_t busid, uint32_t reg_base) {
     usbd_add_endpoint(0, &dap_out_ep);
     usbd_add_endpoint(0, &dap_in_ep);
 
-    /*!< cdc acm */
+    /*!< cdc acm：串口 1 <-> USART4 */
     usbd_add_interface(0, usbd_cdc_acm_init_intf(0, &intf1));
     usbd_add_interface(0, usbd_cdc_acm_init_intf(0, &intf2));
     usbd_add_endpoint(0, &cdc_out_ep);
     usbd_add_endpoint(0, &cdc_in_ep);
+
+    // 第二个 CDC 只在双串口模式存在：单串口 + 流控模式下不注册，
+    // 描述符里也没有它（见 config_descriptor_single），主机只会看到一个串口。
+    if (drv_uart_mode_is_dual()) {
+        usbd_add_interface(0, usbd_cdc_acm_init_intf(0, &cdc2_ctrl_intf));
+        usbd_add_interface(0, usbd_cdc_acm_init_intf(0, &cdc2_data_intf));
+        usbd_add_endpoint(0, &cdc2_out_ep);
+        usbd_add_endpoint(0, &cdc2_in_ep);
+    }
 
 #if CONFIG_CHERRYDAP_USE_CUSTOM_HID
     /*!< hid */
@@ -731,7 +919,24 @@ void chry_dap_init(uint8_t busid, uint32_t reg_base) {
 #if CONFIG_CHERRYDAP_USE_MSC
     usbd_add_interface(0, usbd_msc_init_intf(0, &intf3, MSC_OUT_EP, MSC_IN_EP));
 #endif
-    usbd_initialize(busid, reg_base, usbd_event_handler);
+    usbd_initialize(0, 0, usbd_event_handler);
+}
+
+// 只调一次、且不热：用 noinline 把它钉在 Flash 里。
+// 否则 LTO 会把它（连同 esig_sn_apply）内联进 .highcode 里的 cherrydap_process，
+// 白占约 200 B RAM。
+__attribute__((noinline)) void chry_dap_init(uint8_t busid, uint32_t reg_base) {
+    (void)busid;
+    (void)reg_base;
+
+    DAP_Setup();
+
+#if ESIG_SN
+    // 必须在 usbd_initialize() 之前：主机在枚举阶段就会索要序列号字符串描述符
+    esig_sn_apply();
+#endif
+
+    chry_dap_usb_start();
 }
 
 void chry_dap_handle(void) {

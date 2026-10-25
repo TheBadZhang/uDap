@@ -50,7 +50,28 @@
  *
  * 两个 PRIVATE 段共用同一段 VMA（ld OVERLAY），因为它们不同时存在。
  */
+#ifndef WCHLINK_ENABLE
+#define WCHLINK_ENABLE 0
+#endif
+
+/* .highcode.dap 在两种链接脚本里都被并进常驻 RAM 的 .highcode
+ * （单模式脚本用 *(.highcode.*) 收集），所以它的定义与模式无关。 */
 #define DAP_HIGHCODE_SECTION     __attribute__((section(".highcode.dap")))
-#define DAP_PRIVATE_SECTION      __attribute__((section(".overlay.dap")))
+
+#if WCHLINK_ENABLE
+/* 双模式：私有**数据**进 overlay 段（两种模式共用同一段 RAM 地址）。
+ *
+ * 段名必须带 `.bss.` 前缀：这样 GCC 生成的是 **SHT_NOBITS** 段（同 .bss，
+ * 没有初值、不占 Flash）。否则零初始化的变量会变成 SHT_PROGBITS，虽然内容
+ * 全是 0，链接器仍会为它在 Flash 里排一段 LMA —— 双模式固件的 .bin 因此
+ * 白涨 8.2 KiB 并超出 62 KiB。 */
+#define DAP_PRIVATE_SECTION      __attribute__((section(".bss.overlay.dap")))
 #define WCHLINK_HIGHCODE_SECTION __attribute__((section(".highcode.wchlink")))
-#define WCHLINK_PRIVATE_SECTION  __attribute__((section(".overlay.wchlink")))
+#define WCHLINK_PRIVATE_SECTION  __attribute__((section(".bss.overlay.wchlink")))
+#else
+/* 单模式（只编 CMSIS-DAP）：链接脚本里没有 overlay 段，
+ * 私有数据就是普通 .bss（属性留空）。 */
+#define DAP_PRIVATE_SECTION
+#define WCHLINK_HIGHCODE_SECTION
+#define WCHLINK_PRIVATE_SECTION
+#endif

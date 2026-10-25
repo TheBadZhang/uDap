@@ -3,54 +3,157 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// USB CDC <-> USART 双向桥的底层串口驱动。
-//
-// 引脚：USART4 的 PB0 (TX) / PB1 (RX)。
-// PA2/PA3 是 SWCLK/SWDIO，已给 CMSIS-DAP 用了；PB0/PB1 是硬件留出的另一组
-// USART4 引脚（原理图网络名 PB0_USART4_TX / PB1_USART4_RX）。
-//
-// 收发各一个 FIFO（CherryRB），两个方向都是「中断生产、中断/主循环消费」：
-//   TX FIFO: 生产者 = USB 中断（CDC OUT 回调），消费者 = USART4 中断
-//   RX FIFO: 生产者 = USART4 中断，                 消费者 = 主循环
-// 两级缓冲解耦了 USB 的突发速度与 UART 的波特率速度。
+/*
+ * 串口驱动（两路 UART + 流控脚 + 串口模式 + CDC 回调）——**单一入口**。
+ *
+ * 这一对文件（drv_uart.h / drv_uart.c）取代了原来的 6 个模块：
+ *
+ *   drv_uart_dma      RX 的 DMA 环形引擎（两路共用，现已 internal）
+ *   drv_flow_pins     PA2 = DTR / PA3 = RTS（低有效输出）
+ *   drv_uart          COM1：USART4（PB0 = TX / PB1 = RX）
+ *   drv_uart2         COM2：USART2（PA2 = TX2 / PA3 = RX2，仅双串口模式）
+ *   drv_uart_mode     串口模式切换 + PB12 指示灯 + 选项字持久化
+ *   drv_cdc_line      CDC ACM 行编码 / DTR / RTS 回调（两种调试器模式共用）
+ *
+ * 合并的理由：这几块共用同一组引脚（PA2/PA3）、同一套 DMA 引擎、同一份
+ * 「谁在占用引脚」的约定（drv_uart_mode），拆开时改一处往往要同步改三四处。
+ *
+ * ---------------------------------------------------------------------------
+ * 引脚与模式（详见 src/board_pin_map.h 与下方 drv_uart_mode_*）
+ * ---------------------------------------------------------------------------
+ *   COM1   USART4  PB0 = TX / PB1 = RX                    两模式都可用
+ *   COM2   USART2  PA2 = TX2 / PA3 = RX2                  仅双串口模式
+ *   PA2/PA3 复用：单串口模式下它们是 DTR / RTS（低有效输出）
+ *
+ * ---------------------------------------------------------------------------
+ * 收发实现
+ * ---------------------------------------------------------------------------
+ *   两路 RX 都走 DMA 环形缓冲（USART4_RX = Ch8，USART2_RX = Ch6，各 1 KB，
+ *   零拷贝）：逐字节 RXNE 中断在高波特率下会因 ISR 延迟来不及读 DATAR，硬件置
+ *   ORE 直接丢字节；改成 DMA 后只剩「每半个缓冲一次」的中断。
+ *
+ *   两路 TX 都用逐字节 TXE 中断 + CherryRB 环形 FIFO。TX 挂 DMA 在本芯片上实测
+ *   会让串口卡死（原因未定位），所以保持中断。
+ *
+ *   USB 侧的背压语义：drv_uart_tx_free() / drv_uart2_tx_free() 是 CDC OUT 端点
+ *   是否重挂的判据（余量不足就不重挂，主机被 NAK 挡住自然降速）。
+ */
 
-// 初始化 USART4。baudrate 传 0 时用默认 115200。
+/* ===========================================================================
+ * COM1：USART4（PB0 = TX / PB1 = RX）
+ * =========================================================================== */
+
+/* 初始化 USART4 与引脚，并启动 RX 的 DMA。baudrate 传 0 用默认 115200。 */
 void drv_uart_init(uint32_t baudrate);
 
-// 运行时改波特率（主机设置 CDC 行编码时调用）
+/* 运行时改波特率（主机设置 CDC 行编码时调用） */
 void drv_uart_set_baudrate(uint32_t baudrate);
 uint32_t drv_uart_baudrate(void);
 
-// 非阻塞发送：写入 TX FIFO，返回实际入队的字节数（FIFO 满时可能少于 length）
-//
-// 注意：本函数在 USB 中断上下文（CDC OUT 回调）里被调用，**不能阻塞**。
-// 防止丢字节靠调用方做背压：先查 drv_uart_tx_free() 确认放得下整包，
-// 再重挂端点。详见 drv_uart_tx_free() 与本工程 dap_main.c 的
-// chry_dap_cdc_bridge()。
+/* 非阻塞发送：写入 TX FIFO，返回实际入队的字节数（FIFO 满时可能少于 length）
+ *
+ * 注意：本函数在 USB 中断上下文（CDC OUT 回调）里被调用，**不能阻塞**。
+ * 防止丢字节靠调用方做背压：先查 drv_uart_tx_free() 确认放得下整包再重挂端点。 */
 uint32_t drv_uart_write(const uint8_t *data, uint32_t length);
 
-// 从 RX FIFO 取数据，返回实际取出的字节数
+/* 从 RX 环形缓冲取数据，返回实际取出的字节数 */
 uint32_t drv_uart_read(uint8_t *data, uint32_t length);
 
-// RX FIFO 中可读字节数
+/* RX 环形缓冲里可读字节数 */
 uint32_t drv_uart_rx_available(void);
 
-// TX FIFO 剩余可写空间。
-//
-// 这是 USB 侧做背压的依据：CDC OUT 回调在重挂端点前先看这个值。
-// USB bulk OUT 天然带流控 —— 端点不重挂，主机就只会收到 NAK，它的
-// write() 会自然阻塞在串口波特率上，一个字节都不会丢。反过来若无条件
-// 重挂，USB 会以 MB/s 级速度灌进来，超出的字节只能丢弃。
+/* TX FIFO 剩余可写空间（USB 侧背压依据） */
 uint32_t drv_uart_tx_free(void);
 
-// TX FIFO 是否已排空（含移位寄存器）
+/* TX 是否已排空（含移位寄存器） */
 bool drv_uart_tx_idle(void);
 
-// 丢数据计数。
-//   rx_overflow = 中断来不及搬（主循环取太慢），丢的是新到的字节
-//   tx_overflow = TX FIFO 满（USB 灌太快），丢的是新入队的字节
-//
-// 注意：CDC OUT 侧已做背压（FIFO 余量不足就不重挂端点），正常收发下
-// tx_overflow 应当恒为 0。它不再增长才是预期状态；一旦增长即表示背压失效。
+/* 丢数据计数：
+ *   rx_overflow = 软件来不及取、被 DMA 绕圈覆盖掉的字节数
+ *   tx_overflow = TX FIFO 满（USB 灌太快），正常路径下恒为 0 */
 uint32_t drv_uart_rx_overflow_count(void);
 uint32_t drv_uart_tx_overflow_count(void);
+
+/* 重新对齐 RX 的 DMA 环形计数。
+ * 擦写 Flash（写选项字）等长时间关中断之后必须调用一次，否则 DMA 在这段时间
+ * 绕圈覆盖会让生产者位置失真，读出来的数据位置会错。 */
+void drv_uart_rx_resync(void);
+
+/* ===========================================================================
+ * COM2：USART2（PA2 = TX2 / PA3 = RX2，仅双串口模式）
+ * =========================================================================== */
+
+/* 初始化 USART2 与引脚，并启动 RX 的 DMA。baudrate 传 0 用默认 115200。 */
+void drv_uart2_init(uint32_t baudrate);
+
+/* 停掉 USART2 并把 PA2/PA3 释放为浮空输入（随后由 drv_flow_pins_enable 接管） */
+void drv_uart2_deinit(void);
+
+/* 当前是否已初始化（双串口模式）。未初始化时写/读都是空操作。 */
+bool drv_uart2_ready(void);
+
+/* 清空 TX FIFO 与溢出计数（切换模式时调用，避免把上一模式的数据带过去） */
+void drv_uart2_reset(void);
+
+void drv_uart2_set_baudrate(uint32_t baudrate);
+uint32_t drv_uart2_baudrate(void);
+
+uint32_t drv_uart2_write(const uint8_t *data, uint32_t length);
+uint32_t drv_uart2_read(uint8_t *data, uint32_t length);
+uint32_t drv_uart2_rx_available(void);
+uint32_t drv_uart2_tx_free(void);
+uint32_t drv_uart2_rx_overflow_count(void);
+uint32_t drv_uart2_tx_overflow_count(void);
+
+/* 同 drv_uart_rx_resync()，作用于 COM2 */
+void drv_uart2_rx_resync(void);
+
+/* ===========================================================================
+ * PA2 / PA3 的 DTR、RTS（**有效 = 低电平**，FT232 的 DTR#/RTS# 习惯）
+ * ===========================================================================
+ * 主机通过 CDC 的 SET_CONTROL_LINE_STATE 下发；只在「串口 1 + DTR/RTS」模式下
+ * 有效 —— 双串口模式下这两脚已交给 USART2，set_* 自动变成空操作。 */
+
+void drv_flow_pins_release(void); /* 释放为浮空输入（交出引脚） */
+void drv_flow_pins_enable(void);  /* 推挽输出，并把已记录的状态重新打出去 */
+void drv_flow_pins_set_dtr(bool asserted);
+void drv_flow_pins_set_rts(bool asserted);
+
+/* 当前记录的状态（true = 已断言 = 输出低）。引脚已释放时返回 false。 */
+bool drv_flow_pins_dtr(void);
+bool drv_flow_pins_rts(void);
+
+/* ===========================================================================
+ * 串口工作模式（PA2/PA3 的用途）
+ * ===========================================================================
+ *   DRV_UART_MODE_FLOW  「串口 1 + DTR/RTS 流控」
+ *       COM1 <-> USART4（PB0/PB1）；PA2 = DTR、PA3 = RTS。
+ *       **USB 里只枚举 1 个 CDC**，USART2 与 COM2 完全不存在。
+ *   DRV_UART_MODE_DUAL  「双串口」
+ *       COM1 <-> USART4；COM2 <-> USART2（PA2 = TX2 / PA3 = RX2）。
+ *
+ * 模式由按键**双击**切换，并存进用户选择字 Data1（掉电保存）；切换会重新枚举
+ * USB（描述符里的接口数变了），主机侧看到一次插拔。
+ * 指示：PB12 亮 = 双串口模式，灭 = DTR/RTS 模式（低电平点亮）。 */
+
+typedef enum {
+    DRV_UART_MODE_FLOW = 0, /* 串口 1 + DTR/RTS（默认） */
+    DRV_UART_MODE_DUAL = 1, /* 双串口 */
+    DRV_UART_MODE_COUNT,
+} drv_uart_mode_t;
+
+/* 上电初始化：PB12 灯 + 从选项字恢复模式 + 按模式配置 PA2/PA3 */
+void drv_uart_mode_init(void);
+
+drv_uart_mode_t drv_uart_mode_get(void);
+bool drv_uart_mode_is_dual(void);
+
+/* 切换到另一个模式，并写入选项字持久化。由按键双击触发。 */
+void drv_uart_mode_toggle(void);
+
+/* ===========================================================================
+ * CDC ACM 行编码（两种调试器模式共用）
+ * =========================================================================== */
+
+/* 恢复默认行编码（115200 8N1）。两种模式各自初始化 USB 前调用。 */
+void drv_cdc_line_init(void);

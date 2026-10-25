@@ -4,6 +4,19 @@
 
 #include <ch32x035.h>
 
+// SWD 引脚映射（SWCLK/SWDIO 的引脚号、CFGLR 移位、nRESET 是否启用）。
+// 同一个头文件也被 src/wchlink/transport/rvswd_phy_gpio.c 使用 ——
+// CMSIS-DAP 与 WCH-Link 用的是板上同一对引脚。
+#include "swd_pin_map.h"
+
+// SWD 物理层接口（GPIO 描述 + 可替换的实现表）。
+// 本文件里的边沿级原语是编译期展开的；相位级操作（端口配置、三段位时序）
+// 走这里的函数表，换驱动只改绑定，不用改本文件。
+#include "swd_gpio.h"
+
+// 板级引脚（状态灯 PB11/PB12 等）
+#include "board_pin_map.h"
+
 #ifndef __STATIC_INLINE
 #define __STATIC_INLINE static inline
 #endif
@@ -128,24 +141,25 @@ __STATIC_INLINE uint8_t DAP_GetProductFirmwareVersionString(char *str) {
     return 0U;
 }
 
-// PA2 为 SWCLK，PA3 为 SWDIO，PA5 为 nRESET（低有效）
-// BSHR 低 16 位将输出置高，BCR 将输出拉低
-__STATIC_FORCEINLINE uint32_t PIN_SWCLK_TCK_IN(void) { return (GPIOA->INDR & GPIO_Pin_2) != 0U; }
-__STATIC_FORCEINLINE void PIN_SWCLK_TCK_SET(void) { GPIOA->BSHR = GPIO_Pin_2; }
-__STATIC_FORCEINLINE void PIN_SWCLK_TCK_CLR(void) { GPIOA->BCR = GPIO_Pin_2; }
-__STATIC_FORCEINLINE uint32_t PIN_SWDIO_TMS_IN(void) { return (GPIOA->INDR & GPIO_Pin_3) != 0U; }
-__STATIC_FORCEINLINE void PIN_SWDIO_TMS_SET(void) { GPIOA->BSHR = GPIO_Pin_3; }
-__STATIC_FORCEINLINE void PIN_SWDIO_TMS_CLR(void) { GPIOA->BCR = GPIO_Pin_3; }
-#define PIN_SWDIO_IN() ((GPIOA->INDR & GPIO_Pin_3) != 0U)
-// CFGLR 为 PA0 至 PA7 每个引脚分配 4 位，0x1 为推挽输出，0x4 为浮空输入
-__STATIC_FORCEINLINE void PIN_SWDIO_OUT_ENABLE(void) {
-    // PA3 的 12 至 15 位，从浮空输入切换为推挽输出
-    GPIOA->CFGLR = (GPIOA->CFGLR & ~(0xFU << 12)) | (0x1U << 12);
-}
-__STATIC_FORCEINLINE void PIN_SWDIO_OUT_DISABLE(void) {
-    // PA3 的 12 至 15 位，释放 SWDIO 供目标驱动
-    GPIOA->CFGLR = (GPIOA->CFGLR & ~(0xFU << 12)) | (0x4U << 12);
-}
+// SWCLK = PA5，SWDIO = PA6（引脚号见 src/swd_pin_map.h 的 SWD_PIN_VARIANT）
+//
+// ⚠️ 这一层是**每比特**调用的边沿级原语，必须是编译期展开的 inline：
+// 快路径的一个 SWCLK 周期就等于两条 store 之间的指令数，中间插一次间接调用
+// 会直接破坏标定好的占空比。所以它们**只做转发**，寄存器写法全部在板级层
+// src/swd_pin_map.h 的 board_swd_* 里（那里也是 always_inline，展开后指令相同）；
+// 这些名字本身是 CMSIS-DAP 的 DAP_config.h 契约 —— 第三方 DAP.c 直接引用，
+// 不能改名也不能搬离本文件（见 src/dap/swd_gpio.h 的三层说明）。
+__STATIC_FORCEINLINE uint32_t PIN_SWCLK_TCK_IN(void) { return board_swd_clk_level(); }
+__STATIC_FORCEINLINE void PIN_SWCLK_TCK_SET(void) { board_swd_clk_set(); }
+__STATIC_FORCEINLINE void PIN_SWCLK_TCK_CLR(void) { board_swd_clk_clr(); }
+__STATIC_FORCEINLINE uint32_t PIN_SWDIO_TMS_IN(void) { return board_swd_dio_level(); }
+__STATIC_FORCEINLINE void PIN_SWDIO_TMS_SET(void) { board_swd_dio_set(); }
+__STATIC_FORCEINLINE void PIN_SWDIO_TMS_CLR(void) { board_swd_dio_clr(); }
+#define PIN_SWDIO_IN() (board_swd_dio_level() != 0U)
+
+// DIO 方向切换：每次事务的 turnaround 一次，走接口表（可被别的实现替换）
+__STATIC_FORCEINLINE void PIN_SWDIO_OUT_ENABLE(void) { swd_gpio_if()->dio_out_enable(); }
+__STATIC_FORCEINLINE void PIN_SWDIO_OUT_DISABLE(void) { swd_gpio_if()->dio_out_disable(); }
 
 __STATIC_FORCEINLINE uint32_t PIN_TDI_IN(void) { return 0U; }
 __STATIC_FORCEINLINE void PIN_TDI_OUT(uint32_t bit) { (void)bit; }
@@ -153,9 +167,14 @@ __STATIC_FORCEINLINE uint32_t PIN_TDO_IN(void) { return 0U; }
 __STATIC_FORCEINLINE uint32_t PIN_nTRST_IN(void) { return 1U; }
 __STATIC_FORCEINLINE void PIN_nTRST_OUT(uint32_t bit) { (void)bit; }
 
-// PA5 为 nRESET，低电平有效。它在 CFGLR 中占第 20 至 23 位（每脚 4 位）
-#define PIN_nRESET_PIN   GPIO_Pin_5
-#define PIN_nRESET_SHIFT 20U
+// nRESET（目标复位，低有效）是否启用由 src/swd_pin_map.h 决定：
+// 本板 /NRST 没有连到 MCU，PA5 又让给了 SWCLK，所以 SWD_NRESET_ENABLE = 0，
+// 三个操作全部退化为空操作（详见该头文件的说明）。
+#if SWD_NRESET_ENABLE
+
+// nRESET 在 CFGLR 中占第 SWD_NRESET_CFGLR_SHIFT 起的 4 位（每脚 4 位）
+#define PIN_nRESET_PIN   SWD_NRESET_PIN
+#define PIN_nRESET_SHIFT SWD_NRESET_CFGLR_SHIFT
 
 // nRESET 采用「开漏模拟」，这是 CMSIS-DAP 推荐的接法：
 //   释放（bit=1）：切为输入 + 内部上拉（高阻）。电平交给目标板自己的上拉 /
@@ -164,33 +183,40 @@ __STATIC_FORCEINLINE void PIN_nTRST_OUT(uint32_t bit) { (void)bit; }
 //   复位（bit=0）：推挽输出拉低。
 // 两条路径都「先设好输出数据、再改 CFGLR」，避免切换瞬间输出旧电平产生毛刺。
 __STATIC_FORCEINLINE uint32_t PIN_nRESET_IN(void) {
-    return (GPIOA->INDR & PIN_nRESET_PIN) != 0U;
+    return (SWD_PORT->INDR & PIN_nRESET_PIN) != 0U;
 }
 
 __STATIC_FORCEINLINE void PIN_nRESET_OUT(uint32_t bit) {
     if (bit != 0U) {
-        GPIOA->BSHR = PIN_nRESET_PIN;  // ODR 置 1；下面选输入模式时即取上拉
-        GPIOA->CFGLR = (GPIOA->CFGLR & ~(0xFU << PIN_nRESET_SHIFT)) | (0x8U << PIN_nRESET_SHIFT);
+        SWD_PORT->BSHR = PIN_nRESET_PIN;  // ODR 置 1；下面选输入模式时即取上拉
+        SWD_PORT->CFGLR = (SWD_PORT->CFGLR & ~(0xFU << PIN_nRESET_SHIFT)) | (0x8U << PIN_nRESET_SHIFT);
     } else {
-        GPIOA->BCR = PIN_nRESET_PIN;   // 先让输出数据为低
-        GPIOA->CFGLR = (GPIOA->CFGLR & ~(0xFU << PIN_nRESET_SHIFT)) | (0x1U << PIN_nRESET_SHIFT);
+        SWD_PORT->BCR = PIN_nRESET_PIN;   // 先让输出数据为低
+        SWD_PORT->CFGLR = (SWD_PORT->CFGLR & ~(0xFU << PIN_nRESET_SHIFT)) | (0x1U << PIN_nRESET_SHIFT);
     }
 }
 
+#else /* !SWD_NRESET_ENABLE */
+
+// 没有 nRESET 引脚：读回恒为「未被拉低」，写操作忽略。
+__STATIC_FORCEINLINE uint32_t PIN_nRESET_IN(void) { return 1U; }
+__STATIC_FORCEINLINE void PIN_nRESET_OUT(uint32_t bit) { (void)bit; }
+
+#endif /* SWD_NRESET_ENABLE */
+
 __STATIC_INLINE void PORT_JTAG_SETUP(void) {}
 
+// 端口生命周期交给当前实现（默认芯片内置实现，见 src/dap/swd_gpio.h）。
+// 这两支只在 DAP 连接/断开时各调一次，走函数表不影响任何时序。
 __STATIC_INLINE void PORT_SWD_SETUP(void) {
-    // PA2 为 SWCLK 输出，PA3 为 SWDIO 输出（读时由传输函数切输入）
-    // 每个 PA0 至 PA7 的 CFGLR 字段占用 4 位，PA2 在 8 至 11 位，PA3 在 12 至 15 位
-    GPIOA->BSHR = GPIO_Pin_2 | GPIO_Pin_3;
-    GPIOA->CFGLR = (GPIOA->CFGLR & ~((0xFU << 8) | (0xFU << 12))) | (0x1U << 8) | (0x1U << 12);
-    // 连接时释放目标复位（CMSIS-DAP 规定 nRESET 初始为高）
+    swd_gpio_if()->port_setup();
+    // 连接时释放目标复位（CMSIS-DAP 规定 nRESET 初始为高；未接引脚时为空操作）
     PIN_nRESET_OUT(1U);
 }
 
 __STATIC_INLINE void PORT_OFF(void) {
-    // DAP 端口关闭时，将 PA2、PA3 释放为浮空输入
-    GPIOA->CFGLR = (GPIOA->CFGLR & ~((0xFU << 8) | (0xFU << 12))) | (0x4U << 8) | (0x4U << 12);
+    // DAP 端口关闭：两脚释放为浮空输入（由实现决定具体寄存器写法）
+    swd_gpio_if()->port_off();
     // 同时释放 nRESET：断开后不能把目标一直摁在复位里
     PIN_nRESET_OUT(1U);
 }
@@ -198,18 +224,21 @@ __STATIC_INLINE void PORT_OFF(void) {
 //**************************************************************************************************
 // 状态指示灯
 //
-// 本板只有一颗灯，接在 PB12，**高电平点亮**。
-// 它对应 CMSIS-DAP 的 Connect LED：主机（调试器软件）连接到 DAP 时点亮。
+// 本板有两颗灯，都是**低电平点亮**（引脚见 src/board_pin_map.h）：
+//   PB11 = DAP 指示灯：CMSIS-DAP 的 Connect LED，主机（调试器软件）连接到 DAP
+//          时点亮，由本文件的 LED_CONNECTED_OUT() 驱动。
+//   PB12 = UART 指示灯：亮 = 双串口模式，灭 = 串口1 + DTR/RTS 模式，
+//          由 src/drv/drv_uart.c 的模式小节驱动（不在这里，避免两处抢同一个引脚）。
 //
 // 由 DAP.c 的 DAP_HostStatus(ID_DAP_HostStatus=0x01) 驱动：
 //   request[0] = DAP_DEBUGGER_CONNECTED(0) -> LED_CONNECTED_OUT(request[1])
 //   request[0] = DAP_TARGET_RUNNING(1)     -> LED_RUNNING_OUT(request[1])
 // pyOCD 在 connect() 置 CONNECTED=1、disconnect() 置 0；
 // 它从不把 TARGET_RUNNING 置 1，故本板不为 Running 单独点灯。
-#define LED_CONNECTED_PORT        GPIOB
-#define LED_CONNECTED_PIN         GPIO_Pin_12
-// 1 = 高电平点亮，0 = 低电平点亮
-#define LED_CONNECTED_ACTIVE_HIGH 1U
+#define LED_CONNECTED_PORT        BOARD_LED_PORT
+#define LED_CONNECTED_PIN         BOARD_LED_DAP_PIN
+// 1 = 高电平点亮，0 = 低电平点亮（跟随 board_pin_map.h 的 BOARD_LED_ACTIVE_LOW）
+#define LED_CONNECTED_ACTIVE_HIGH (BOARD_LED_ACTIVE_LOW ? 0 : 1)
 
 __STATIC_INLINE void LED_CONNECTED_OUT(uint32_t bit) {
 #if LED_CONNECTED_ACTIVE_HIGH
@@ -237,8 +266,8 @@ __STATIC_INLINE uint32_t TIMESTAMP_GET(void) {
 }
 
 __STATIC_INLINE void DAP_SETUP(void) {
-    // GPIOB 给状态灯（PB12）用，GPIOA 给 SWD / nRESET 用
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB, ENABLE);
+    // GPIOB 给状态灯（PB12）用，GPIOA 给 SWD 用（SWCLK = PA5 / SWDIO = PA6）
+    RCC_APB2PeriphClockCmd(SWD_PORT_CLOCK | RCC_APB2Periph_GPIOB, ENABLE);
 
     // 先把输出数据寄存器置为「灭」，再切成推挽输出，避免初始化瞬间闪一下。
     // （高电平点亮时「灭」= 低，与复位值一致；低电平点亮时这一步才是必需的）
@@ -259,12 +288,19 @@ __STATIC_INLINE void DAP_SETUP(void) {
 // 不声明会被当成隐式声明报错
 extern void Delayms(uint32_t delay);
 
-// 设备专用复位序列：拉低 PA5 保持 20 ms 再释放。
+// 设备专用复位序列：拉低 nRESET 保持 20 ms 再释放。
 // 返回 1 表示已实现 —— 主机（OpenOCD / pyocd）执行 reset 时会优先走这里，
 // 而不是只靠 SWJ_Pins 逐次拉线。
+//
+// 本板没有 nRESET 引脚（见 src/swd_pin_map.h），返回 0 = 「未执行厂商复位」，
+// 主机随即退回 SWD 的 SYSRESETREQ，功能上仍能复位目标。
 __STATIC_INLINE uint8_t RESET_TARGET(void) {
+#if SWD_NRESET_ENABLE
     PIN_nRESET_OUT(0U);
     Delayms(20U);
     PIN_nRESET_OUT(1U);
     return 1U;
+#else
+    return 0U;
+#endif
 }

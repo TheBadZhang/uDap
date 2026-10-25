@@ -18,7 +18,7 @@ flowchart LR
     subgraph DAP["uDap2 (CH32X035F8U)"]
         USBFS["USB 全速设备"]
         DAPC["CMSIS-DAP<br/>DAP.c + sw_dp.c"]
-        BR["CDC ↔ USART4 桥<br/>drv_uart.c"]
+        BR["CDC 串口桥<br/>drv_uart.c"]
     end
     TGT["目标板<br/>SWCLK / SWDIO / nRESET"]
     UART["目标板 USART<br/>PB0=TX / PB1=RX"]
@@ -35,11 +35,20 @@ flowchart LR
 
 ### uDap-CH32X035F8U6
 
-- 调试器 ①：**CMSIS-DAP**（bulk，WinUSB）——OpenOCD / pyOCD / probe-rs 可直接使用
+- 调试器 ①：**CMSIS-DAP**（bulk，WinUSB）——OpenOCD / pyOCD / probe-rs 可直接使用。**固定编入**
 - 调试器 ②：**WCH-Link**（RVSWD，`1a86:8010`）——支持 CH32X03X / CH32L10X / CH32V20X /
-  CH32V30X / CH58X / CH59X 六个目标族
-- 两个调试器**同编入一份固件**（无裁剪选项），运行期按键（PA4 接 GND）切换，见「双模式：模式切换按键与持久化」
-- 桥接串口：CDC ACM ↔ 目标板 USART4（PB0=TX / PB1=RX），**不限制波特率**
+  CH32V30X / CH58X / CH59X 六个目标族。**可选编译**（`build.ps1 -Wchlink y`，默认不编），
+  编入后上电时**按住 PB3**切到另一种调试器模式
+- 桥接串口 ①：CDC ACM ↔ 目标板 USART4（PB0=TX / PB1=RX），**不限制波特率**
+- 桥接串口 ②（双串口模式）：CDC ACM ↔ USART2（PA2=TX2 / PA3=RX2），独立波特率
+- PA2 / PA3 **双用途**：`DTR` + `RTS`（低有效）或 `TX2`/`RX2`，按键**双击**切换、掉电保存
+- **串口模式决定 USB 里有几个 CDC**：单串口 + 流控只枚举 1 个 COM 口（USART2 关闭），
+  双串口枚举 2 个；切换模式会重新枚举一次
+- **COM1 的接收走 DMA**（USART4_RX = DMA1_Channel8，1 KB 环形缓冲）：逐字节 RXNE
+  中断从每秒 10 万次降到「每半个缓冲一次」，高波特率下不再因 ISR 延迟触发 ORE
+  丢字节。TX（含 COM2 全部方向）仍用中断 —— 实测给 TX 挂 DMA（Ch1 / Ch7）会让
+  对应串口卡死，原因未定位。注意 USB IN 侧的总吞吐天花板（≈190~200 KiB/s）与
+  DMA 无关，双口同时满速时仍受它限制
 - SWD 时钟：请求 **≥6 MHz** 自动切「快路径」，**6 MHz 与更高同速**，推荐就填 6 MHz
 - SWD 吞吐（STM32F411 目标，64 KiB 块）：**pyocd 262 写 / 232 读 KiB/s**、
   OpenOCD 149 / 148、probe-rs 155 / 140 —— 见「性能实测」一节
@@ -48,11 +57,15 @@ flowchart LR
 
 | 信号 | 引脚 | 说明 |
 | --- | --- | --- |
-| SWCLK | PA2 | SWD 时钟 |
-| SWDIO | PA3 | SWD 双向数据（CFGLR 动态切输入/输出） |
-| nRESET | PA5 | 低有效，复位目标 |
-| 桥接串口 | PB0 = TX / PB1 = RX | USART4 |
-| 状态灯 | PB12 | 高电平点亮，CMSIS-DAP连接时亮 |
+| SWCLK | PA5 | SWD 时钟 |
+| SWDIO | PA6 | SWD 双向数据（CFGLR 动态切输入/输出） |
+| nRESET | — | 本板未接 MCU（复位走 SWD 的 SYSRESETREQ） |
+| DTR / TX2 | PA2 | 流控模式 = DTR（低有效）；双串口模式 = USART2_TX |
+| RTS / RX2 | PA3 | 流控模式 = RTS（低有效）；双串口模式 = USART2_RX |
+| 桥接串口 1 | PB0 = TX / PB1 = RX | USART4 |
+| 模式按键 | PB3 | 上拉输入，按下接地；双击切串口模式，上电按住切调试器模式 |
+| DAP 灯 | PB11 | 低电平点亮，CMSIS-DAP 连接时亮 |
+| UART 灯 | PB12 | 低电平点亮，亮 = 双串口模式 |
 | USB | PC16 = DPDM / PC17 = DP | 固定复用 |
 
 ### uDap-CH32V203F8U6

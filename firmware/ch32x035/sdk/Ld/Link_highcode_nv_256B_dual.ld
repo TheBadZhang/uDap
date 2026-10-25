@@ -30,8 +30,13 @@
  *
  * 于是运行期只剩**清零数据段**（没有代码拷贝）：由 src/main.c 在进入某模式时执行
  *   _xxx_overlay_bss_start.._xxx_overlay_bss_end = 0
- * OVERLAY 取两者较大的作为窗口，并保留 AT(...) 让这段零内容仍有合法 LMA
- * （否则 LMA=VMA 落在 RAM 地址上，objcopy 生成 .bin 时会撑爆）。
+ * OVERLAY 取两者较大的作为窗口。两段里只放**零初始化数据**，所以代码把它们
+ * 放在 `.bss.overlay.*` 名下 —— 那是 SHT_NOBITS 段（同 .bss），**不产生 Flash
+ * 内容**，objcopy 也不会把它算进 .bin。因此这里不给 AT(...)：
+ *   - 段是 NOBITS 时 LMA 无所谓，objcopy 只按 PROGBITS 段生成字节；
+ *   - 反过来，若哪天有人往 overlay 里放带初值的变量，段就变成 PROGBITS，
+ *     LMA=VMA 会落在 RAM 地址上把 .bin 撑爆 —— 那种错误很容易被发现，
+ *     比「悄悄多占 8.2 KiB Flash」更好。
  *
  * 注意 .bss 在本脚本里去掉了 `AT > FLASH`：原来那会让 NOBITS 的 .bss 在
  * Flash 地址空间里白占一份等长区间（实测 0x31ac ≈ 12.7 KiB），而 overlay 的
@@ -194,14 +199,13 @@ SECTIONS
      * 代码已分别并进 .highcode（RAM，启动时拷入）与 .text（Flash XIP），
      * 这里只剩数据；LMA 紧跟在 .data 的 LMA 之后，两段取较大的作为窗口大小。
      */
-    __dual_overlay_lma = LOADADDR(.data) + SIZEOF(.data);
-
-    OVERLAY : NOCROSSREFS AT (__dual_overlay_lma)
+    OVERLAY : NOCROSSREFS
     {
         dap_overlay
         {
             . = ALIGN(4);
             _dap_overlay_bss_start = .;
+            *(.bss.overlay.dap)
             *(.overlay.dap)
             . = ALIGN(4);
             _dap_overlay_bss_end = .;
@@ -211,6 +215,7 @@ SECTIONS
         {
             . = ALIGN(4);
             _wchlink_overlay_bss_start = .;
+            *(.bss.overlay.wchlink)
             *(.overlay.wchlink)
             . = ALIGN(4);
             _wchlink_overlay_bss_end = .;
@@ -242,4 +247,11 @@ SECTIONS
         . = . + __stack_size;
         PROVIDE(_eusrstack = .);
     } > RAM
+
+    /* 数据区（含 overlay 窗口）不能顶到栈：栈的 VMA 是写死的
+     * ORIGIN(RAM)+LENGTH(RAM)-__stack_size，而 ld 只检查「段是否超出 RAM 区域」，
+     * **不检查段与段是否重叠**。所以这里显式断言，把「改大缓冲把栈覆盖掉」
+     * 变成链接错误，而不是运行期随机跑飞。 */
+    ASSERT(_ebss <= _susrstack,
+           ".bss/overlay overflow: data area reaches into the reserved stack")
 }

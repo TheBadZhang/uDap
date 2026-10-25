@@ -25,6 +25,22 @@
 #define CDC_OUT_EP 0x02
 #define CDC_INT_EP 0x83
 
+// 第二个 CDC（双串口模式的 COM2，桥到 USART2）。
+//
+// 端点分配（CH32X035 USBFS 只有 EP0..EP7 共 8 个端点）：
+//   EP0     控制
+//   EP1 IN  CDC1 数据 IN        EP2 OUT CDC1 数据 OUT      EP3 IN CDC1 通知
+//   EP4 OUT CDC2 数据 OUT       EP7 IN  CDC2 数据 IN
+//   EP5 IN  DAP bulk IN         EP6 OUT DAP bulk OUT
+// 正好把 8 个端点用满，**没有第三个空闲端点给 CDC2 的通知端点**，所以第二个
+// CDC 只声明数据接口（bNumEndpoints = 0 的控制接口），也就没有串行状态通知。
+// 本工程本来就不发 CDC 通知（DTR/RTS 是主机 -> 设备方向），功能上无损失。
+//
+// EP4 在 CH32X035 上与 EP0 共用 UEP0_DMA，端口层（src/port）已经把它按
+// 「EP0 用前 64 B、EP4 OUT 用 +64、EP4 IN 用 +128」切分好，可以正常使用。
+#define CDC2_IN_EP  0x87
+#define CDC2_OUT_EP 0x04
+
 #define MSC_IN_EP  0x86
 #define MSC_OUT_EP 0x07
 
@@ -70,11 +86,18 @@ extern struct usbd_interface hid_intf;
 
 void chry_dap_init(uint8_t busid, uint32_t reg_base);
 
+// 只做「注册描述符/接口/端点 + 启动 USB」这一步，可以反复调用。
+// 切换串口模式（单串口+DTR/RTS <-> 双串口）时，USB 里的 CDC 接口数会变，
+// 必须先 usbd_deinitialize() 再调本函数重新枚举 —— 否则主机看到的还是旧布局。
+void chry_dap_usb_start(void);
+
 void chry_dap_handle(void) DAP_HIGHCODE_SECTION;
 
 // COM 口 <-> 目标串口（USART4）的周期性服务，两个方向都在这里推进：
 //   OUT 方向：CDC OUT 背压恢复（TX FIFO 余量足够后重挂端点）
 //   IN  方向：从 UART RX FIFO 取数据送 CDC IN
+//
+// 同一个函数也服务第二个 CDC（COM2 <-> USART2，仅双串口模式）。
 //
 // 必须由主循环反复调用。OUT 那一支不能省略 —— 背压停止重挂端点后就再也不会
 // 有 USB 中断，「FIFO 已排空」只能在主循环里察觉。

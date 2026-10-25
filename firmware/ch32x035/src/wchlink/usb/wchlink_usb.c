@@ -3,7 +3,6 @@
 #include "bsp/bsp_delay.h"
 #include "bsp/bsp_system.h"
 #include "bsp/bsp_uid.h"
-#include "drv/drv_cdc_line.h"
 #include "drv/drv_uart.h"
 #include "mode_overlay.h"
 #include "status/status_led.h"

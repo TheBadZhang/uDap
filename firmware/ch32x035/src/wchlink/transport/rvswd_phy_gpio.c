@@ -5,13 +5,16 @@
 
 #include <ch32x035.h>
 
-// PA2 驱动 SWCLK，PA3 双向承载 SWDIO
-static const uint32_t rvswd_phy_clock_pin = GPIO_Pin_2;
-static const uint32_t rvswd_phy_data_pin = GPIO_Pin_3;
-static const uint8_t rvswd_phy_clock_cfg_shift = 8u;
-static const uint8_t rvswd_phy_data_cfg_shift = 12u;
+// SWCLK/SWDIO 与 CMSIS-DAP 共用同一对引脚，引脚号集中在 src/swd_pin_map.h
+#include "swd_pin_map.h"
+
+// SWCLK 单向驱动，SWDIO 双向承载（引脚号见 src/swd_pin_map.h：PA5 / PA6）
+static const uint32_t rvswd_phy_clock_pin = (uint32_t)SWD_CLK_PIN;
+static const uint32_t rvswd_phy_data_pin = (uint32_t)SWD_DIO_PIN;
+static const uint8_t rvswd_phy_clock_cfg_shift = (uint8_t)SWD_CLK_CFGLR_SHIFT;
+static const uint8_t rvswd_phy_data_cfg_shift = (uint8_t)SWD_DIO_CFGLR_SHIFT;
 static const uint32_t rvswd_phy_output_mode_50mhz = 0x03u;
-static const uint32_t rvswd_phy_pins = GPIO_Pin_2 | GPIO_Pin_3;
+static const uint32_t rvswd_phy_pins = (uint32_t)(SWD_CLK_PIN | SWD_DIO_PIN);
 static const uint8_t rvswd_phy_wakeup_clocks = 100u;
 
 // RVSWD 位时序相关函数统一放入 RAM，避免执行期间受到 Flash 等待周期影响
@@ -111,35 +114,35 @@ static inline __attribute__((always_inline)) void rvswd_phy_sample_phase_delay(b
 
 // 将 SWCLK 驱动为低电平
 static inline __attribute__((always_inline)) void rvswd_phy_clock_low(void) {
-    GPIOA->BCR = rvswd_phy_clock_pin;
+    SWD_PORT->BCR = rvswd_phy_clock_pin;
 }
 
 // 将 SWCLK 驱动为高电平
 static inline __attribute__((always_inline)) void rvswd_phy_clock_high(void) {
-    GPIOA->BSHR = rvswd_phy_clock_pin;
+    SWD_PORT->BSHR = rvswd_phy_clock_pin;
 }
 
 // 将已接管的 SWDIO 驱动为低电平
 static inline __attribute__((always_inline)) void rvswd_phy_data_low(void) {
-    GPIOA->BCR = rvswd_phy_data_pin;
+    SWD_PORT->BCR = rvswd_phy_data_pin;
 }
 
 // 将已接管的 SWDIO 驱动为高电平
 static inline __attribute__((always_inline)) void rvswd_phy_data_high(void) {
-    GPIOA->BSHR = rvswd_phy_data_pin;
+    SWD_PORT->BSHR = rvswd_phy_data_pin;
 }
 
 // 将 SWDIO 切换为推挽输出，供主机发送帧和停止条件使用
 void rvswd_phy_gpio_config_data_output(void) {
-    GPIOA->CFGLR = (GPIOA->CFGLR & ~(0xfu << rvswd_phy_data_cfg_shift)) |
+    SWD_PORT->CFGLR = (SWD_PORT->CFGLR & ~(0xfu << rvswd_phy_data_cfg_shift)) |
                    (rvswd_phy_output_mode_50mhz << rvswd_phy_data_cfg_shift);
 }
 
 // 释放 SWDIO 供目标回复，同时由内部上拉维持空闲高电平
 void rvswd_phy_gpio_config_data_input(void) {
-    // turnaround 开始前将锁存置高，释放 PA3 SWDIO，由 PA3 内部上拉保持空闲电平
-    GPIOA->BSHR = rvswd_phy_data_pin;
-    GPIOA->CFGLR = (GPIOA->CFGLR & ~(0xfu << rvswd_phy_data_cfg_shift)) |
+    // turnaround 开始前将锁存置高，释放 SWDIO，由内部上拉保持空闲电平
+    SWD_PORT->BSHR = rvswd_phy_data_pin;
+    SWD_PORT->CFGLR = (SWD_PORT->CFGLR & ~(0xfu << rvswd_phy_data_cfg_shift)) |
                    (0x08u << rvswd_phy_data_cfg_shift);
 }
 
@@ -188,7 +191,7 @@ static inline __attribute__((always_inline)) uint8_t rvswd_phy_sample_bit(bool f
     rvswd_phy_sample_phase_delay(fast_timing);
     rvswd_phy_clock_high();
     rvswd_phy_sample_phase_delay(fast_timing);
-    value = (GPIOA->INDR & rvswd_phy_data_pin) != 0u ? 1u : 0u;
+    value = (SWD_PORT->INDR & rvswd_phy_data_pin) != 0u ? 1u : 0u;
     return value;
 }
 
@@ -291,9 +294,9 @@ void rvswd_phy_gpio_wakeup(bool fast_timing, bool stop_condition) {
 
 // 初始化 GPIO，SWCLK 输出高电平，SWDIO 保持输入空闲态
 void rvswd_phy_gpio_init(void) {
-    RCC->APB2PCENR |= RCC_APB2Periph_GPIOA;
-    GPIOA->BSHR = rvswd_phy_clock_pin | rvswd_phy_data_pin;
-    GPIOA->CFGLR = (GPIOA->CFGLR & ~((0xfu << rvswd_phy_data_cfg_shift) |
+    RCC->APB2PCENR |= SWD_PORT_CLOCK;
+    SWD_PORT->BSHR = rvswd_phy_clock_pin | rvswd_phy_data_pin;
+    SWD_PORT->CFGLR = (SWD_PORT->CFGLR & ~((0xfu << rvswd_phy_data_cfg_shift) |
                                      (0xfu << rvswd_phy_clock_cfg_shift))) |
                    (0x08u << rvswd_phy_data_cfg_shift) |
                    (rvswd_phy_output_mode_50mhz << rvswd_phy_clock_cfg_shift);
@@ -301,9 +304,9 @@ void rvswd_phy_gpio_init(void) {
 
 // 释放 GPIO，避免目标断电时经调试线反向供电
 void rvswd_phy_gpio_disconnect(void) {
-    GPIOA->BSHR = rvswd_phy_pins;
+    SWD_PORT->BSHR = rvswd_phy_pins;
     // 会话结束后释放两根调试线，目标断电时禁止经 IO 反向供电
-    GPIOA->CFGLR = (GPIOA->CFGLR & ~((0xfu << rvswd_phy_data_cfg_shift) |
+    SWD_PORT->CFGLR = (SWD_PORT->CFGLR & ~((0xfu << rvswd_phy_data_cfg_shift) |
                                      (0xfu << rvswd_phy_clock_cfg_shift))) |
                    (0x04u << rvswd_phy_data_cfg_shift) |
                    (0x04u << rvswd_phy_clock_cfg_shift);
