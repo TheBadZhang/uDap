@@ -13,7 +13,8 @@
  *     CH32X035 的 USART2 默认引脚就是 PA2/PA3，无需重映射。
  *   - 模式按键：PB3，一端接 GND，内部上拉，**低电平 = 按下**
  *   - LED：PB11 = DAP 连接指示、PB12 = UART 模式指示，**低电平点亮**
- *   - SWD 调试口：PA5 = SWCLK / PA6 = SWDIO（见 src/swd_pin_map.h）
+ *   - SWD 调试口：PA5 = SWCLK / PA7 = SWDIO（见 src/swd_pin_map.h；PA7 同时是
+ *     SPI1_MOSI，便于用硬件 SPI 试数据相位加速）
  *
  * 注意 CH32X035 的 GPIO 配置寄存器分两段：CFGLR 管 pin0..7、CFGHR 管 pin8..15。
  * SDK 的 GPIO_Init() 对 CFGHR 走静态缓存（CFGHR_tmpA/B/C），**直接写 CFGHR

@@ -12,6 +12,9 @@
 #   .\tools\speed.ps1 -Raw                     # 打印 OpenOCD 全部输出
 #
 # 注意:
+#   - 读的计时用 dump_image（写文件），**不是** read_memory：后者会把每个 word 拼成
+#     TCL 列表，构造成本计在计时窗口内且大块时超线性（实测定制 OpenOCD 读 64 KiB：
+#     read_memory 3.18 s / dump_image 0.39 s，差 8 倍）。详见 openocd_speed_test.tcl。
 #   - 默认 6000 kHz 就是推荐档位：快路径的实际 SWCLK 由固定指令数决定（约 6 MHz），
 #     填 6 MHz 和填 12 MHz 拿到同一个速度，阈值处时序余量还最厚。
 #   - 参数必须用空格或冒号分隔：`-Khz 6000` 或 `-Khz:6000`。

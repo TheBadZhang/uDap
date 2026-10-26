@@ -93,6 +93,7 @@ typedef struct {
 #define SWD_GPIO_IMPL(base) SWD_GPIO_CAT(SWD_GPIO_CAT(base, _), SWD_PIN_VARIANT_NAME)
 
 /* 每套引脚方案各一份实现表（都声明，实际只有被编译的那份有定义） */
+extern const swd_gpio_if_t swd_gpio_if_x035_pa5_pa7;
 extern const swd_gpio_if_t swd_gpio_if_x035_pa5_pa6;
 extern const swd_gpio_if_t swd_gpio_if_x035_pa2_pa3;
 

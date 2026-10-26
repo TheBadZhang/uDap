@@ -2,6 +2,8 @@
 #include <stdint.h>
 #include "mode_overlay.h"
 #include "swd_gpio.h"
+#include "swd_parity.h"
+#include "swd_spi.h"
 
 #include <DAP.h>
 
@@ -70,14 +72,7 @@
 
 #define PIN_DELAY() PIN_DELAY_SLOW(DAP_Data.clock_delay)
 
-__STATIC_FORCEINLINE uint32_t SWD_Parity32(uint32_t value) {
-    value ^= value >> 16;
-    value ^= value >> 8;
-    value ^= value >> 4;
-    value ^= value >> 2;
-    value ^= value >> 1;
-    return value & 1U;
-}
+/* 奇偶位算法在 src/dap/swd_parity.h（SPI 路径也用同一份实现，别各写一份）。 */
 
 // 读数据相位（32 位）已改成手写汇编，见 SWD_TransferFast 里的读段落 ——
 // 排布与 SWD_FastWriteData 完全同构（每 bit 8 个 clk、低 4 / 高 4）。
@@ -155,23 +150,26 @@ void SWD_Sequence(uint32_t info, const uint8_t *swdo, uint8_t *swdi) {
 #endif
 
 #if (DAP_SWD != 0)
-// SWD Transfer I/O Fast
-//   request: A[3:2] RnW APnDP
-//   data:    DATA[31:0]
-//   return:  ACK[2:0]
-DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFast(
-    uint32_t request, uint32_t *data) {
+// ===========================================================================
+// 快路径：请求相位 + ACK 采样
+// ===========================================================================
+// 抽成 always_inline 的理由：这段的时序由固定指令数决定（PIN_DELAY_FAST() 就是
+// 一个 __NOP()），内联后读、写两个函数各自展开一份，指令序列与拆分前的对应分支
+// 完全一致；抽成普通函数则会多一次调用/返回，直接改变 SWCLK 相位。
+//
+// ⚠️ **不要**把「请求相位」和「ACK 采样」拆成两个函数。试过：两段都 always_inline、
+// 指令条数也没变，但拆开后寄存器分配/code layout 变了，读路径的长块读开始偶发
+// "Failed to read memory"（HEAD 版本 3/3 次 64 KiB 全对，拆开版本每次错 1 个）。
+// 所以 GPIO 版本按原样保持在一个函数里，只有走 SPI 的写事务用下面单独的
+// swd_fast_ack_phase_spi()。
+static inline __attribute__((always_inline))
+uint32_t swd_fast_ack_phase_gpio(uint32_t request) {
     uint32_t ack;
     uint32_t bit;
-    uint32_t val;
-    uint32_t parity;
-
-    uint32_t n;
 
     /* Packet Request —— 8 个 SWCLK（start/APnDP/RnW/A2/A3/parity/stop）。
      * 每拍 8 个 clk、低 4 / 高 4，指令顺序必须钉住，所以整段在
-     * swd_fast_packet_request() 的手写汇编里（摆位与理由见
-     * src/dap/swd_gpio_x035.c）。
+     * x035_packet_request() 的手写汇编里（摆位与理由见 src/dap/swd_gpio_x035.c）。
      */
     swd_gpio_if()->packet_request(request);
     PIN_SWCLK_CLR_SWDIO_OUT(1U);
@@ -186,21 +184,6 @@ DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFast(
     PIN_DELAY_FAST();
 
     /* Acknowledge response */
-#if 0
-    PIN_SWCLK_CLR();
-    PIN_DELAY_FAST();
-    PIN_SWCLK_SET();
-    bit = PIN_SWDIO_IN();
-    PIN_SWCLK_CLR();
-    ack = bit << 0;
-    PIN_SWCLK_SET();
-    bit = PIN_SWDIO_IN();
-    PIN_SWCLK_CLR();
-    ack |= bit << 1;
-    PIN_SWCLK_SET();
-    bit = PIN_SWDIO_IN();
-    ack |= bit << 2;
-#else
     PIN_SWCLK_CLR();
     PIN_DELAY_FAST();
     bit = PIN_SWDIO_IN();
@@ -219,66 +202,68 @@ DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFast(
     bit = PIN_SWDIO_IN();
     ack |= bit << 2;
     PIN_SWCLK_SET();        // 上升沿采样
+
+    return ack;
+}
+
+#if SWD_SPI_REQ
+/* 请求相位 + ACK 采样（请求头走 SPI，整字节一次发完，含 park 位）。
+ * 结束时 SCK 已是低 —— 「park 之后的那个下降沿」已经在 SPI 里给过了，所以
+ * turnaround 只剩一个上升沿，时钟总数与 GPIO 版本完全一致。
+ *
+ * ⚠️ 只用于**写**事务。读事务必须用 GPIO 版本：SPI 发完请求头时 SWDIO 是在
+ * park 拍结束之后才释放的（比位时序晚半个时钟），目标驱动 SWDIO 的读数据相位
+ * 起点会跟着偏，长块读会失败（实测 "Failed to read memory"）。 */
+static inline __attribute__((always_inline))
+uint32_t swd_fast_ack_phase_spi(uint32_t request) {
+    uint32_t ack;
+    uint32_t bit;
+
+    swd_spi_send_request(request);
+    /* ⚠️ 实测：请求头改由 SPI 发之后，写吞吐从 279~288 掉到 150~162 KiB/s（约 2×），
+     * 而且很稳定、可复现。排查过的、**不是**原因的：
+     *   - ACK 被解成 WAIT 导致重试：两种配置每轮的 WAIT/FAULT 计数相近（约 2.4~2.8k）；
+     *   - 余量不足：多补一个完整 turnaround 时钟没有任何改善；
+     *   - 接收缓冲残留（OVR/RXNE）：打开 SWD_SPI_TX_DRAIN 反而更慢（151）。
+     * 请求头本来只有 8 拍（约 1 µs），走 SPI 的收益上限也就 1 µs，所以这条路径
+     * 默认关闭（SWD_SPI_REQ = 0），留着开关和查表备用。 */
+    PIN_SWDIO_INPUT(); // 释放 SWDIO，目标从 park 之后开始驱动
+    PIN_DELAY_FAST();
+    PIN_SWCLK_SET();
+    PIN_DELAY_FAST();
+
+    /* Acknowledge response */
+    PIN_SWCLK_CLR();
+    PIN_DELAY_FAST();
+    bit = PIN_SWDIO_IN();
+    PIN_SWCLK_SET();        // 上升沿采样
+    PIN_DELAY_FAST();
+    PIN_DELAY_FAST();
+    ack = bit << 0;
+    PIN_SWCLK_CLR();
+    PIN_DELAY_FAST();
+    bit = PIN_SWDIO_IN();
+    PIN_SWCLK_SET();        // 上升沿采样
+    PIN_DELAY_FAST();
+    PIN_DELAY_FAST();
+    ack |= bit << 1;
+    PIN_SWCLK_CLR();
+    bit = PIN_SWDIO_IN();
+    ack |= bit << 2;
+    PIN_SWCLK_SET();        // 上升沿采样
+
+    return ack;
+}
 #endif
 
-    if (ack == DAP_TRANSFER_OK) { /* OK response */
-        /* Data transfer */
-        if (request & DAP_TRANSFER_RnW) {
-            /* Read data —— 32 个数据位（SWD 为 LSB first，每 bit 8 个 SWCLK、
-             * 低 4 / 高 4）。位循环、奇偶累加全部在 swd_fast_read_data() 的
-             * 手写汇编里（摆位与理由见 src/dap/swd_gpio_x035.c）。
-             */
-            swd_gpio_if()->read_data(&val, &parity);
-            PIN_SWCLK_CLR_READ();
-            bit = PIN_SWDIO_IN();
-            PIN_SWCLK_SET_READ(); /* Read Parity */
-            if ((parity ^ bit) & 1U) {
-                ack = DAP_TRANSFER_ERROR;
-            }
-            /* Turnaround */
-            PIN_SWCLK_CLR();
-            *data = val;
-            PIN_SWCLK_SET();
-            PIN_SWDIO_OUTPUT(); // turnaround
-        } else {
-            /* Turnaround */
-            PIN_SWCLK_CLR();
-            PIN_SWDIO_OUTPUT(); // turnaround
-            PIN_SWCLK_SET();
-
-            /* Write data */
-            val = *data;
-            const uint32_t parity = SWD_Parity32(val);
-            swd_gpio_if()->write_data(val);
-            PIN_SWCLK_CLR_SWDIO_OUT(parity); /* 奇偶位：原 C 同上，由 SWD_Parity32(val) 得到 */
-            PIN_DELAY_FAST();
-            PIN_DELAY_FAST();
-            PIN_SWCLK_SET();
-            PIN_DELAY_FAST();
-        }
-        /* Capture Timestamp */
-        #if 0
-        if (request & DAP_TRANSFER_TIMESTAMP) {
-            DAP_Data.timestamp = TIMESTAMP_GET();
-        }
-        #endif
-        /* Idle cycles */
-        n = DAP_Data.transfer.idle_cycles;
-        if (n) {
-            PIN_SWDIO_TMS_CLR();
-            for (; n; n--) {
-                PIN_SWCLK_CLR();
-                PIN_DELAY_FAST();
-                PIN_SWCLK_SET();
-            }
-        }
-        PIN_SWDIO_TMS_SET();
-        return ((uint8_t)ack);
-    }
+// 快路径：ACK 不是 OK 时的收尾（WAIT/FAULT 的 dummy 相位、以及协议错误的 back-off）
+static inline __attribute__((always_inline))
+uint8_t swd_fast_finish(uint32_t ack, uint32_t is_read) {
+    uint32_t n;
 
     if ((ack == DAP_TRANSFER_WAIT) || (ack == DAP_TRANSFER_FAULT)) {
         /* WAIT or FAULT response */
-        if (DAP_Data.swd_conf.data_phase && ((request & DAP_TRANSFER_RnW) != 0U)) {
+        if (DAP_Data.swd_conf.data_phase && is_read) {
             for (n = 32U + 1U; n; n--) {
                 PIN_SWCLK_CLR();
                 PIN_DELAY_FAST();
@@ -292,7 +277,7 @@ DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFast(
             PIN_SWCLK_SET();
         }
         PIN_SWDIO_OUTPUT(); // turnaround
-        if (DAP_Data.swd_conf.data_phase && ((request & DAP_TRANSFER_RnW) == 0U)) {
+        if (DAP_Data.swd_conf.data_phase && !is_read) {
             PIN_SWDIO_OUT(0U);
             for (n = 32U + 1U; n; n--) {
                 PIN_SWCLK_CLR();
@@ -315,6 +300,129 @@ DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFast(
     return ((uint8_t)ack);
 }
 
+// 快路径：OK 之后的收尾（时间戳 / idle cycles / 把 SWDIO 留在高电平）
+static inline __attribute__((always_inline))
+uint8_t swd_fast_finish_ok(uint32_t ack) {
+    uint32_t n;
+
+    /* Capture Timestamp */
+    #if 0
+    if (request & DAP_TRANSFER_TIMESTAMP) {
+        DAP_Data.timestamp = TIMESTAMP_GET();
+    }
+    #endif
+    /* Idle cycles */
+    n = DAP_Data.transfer.idle_cycles;
+    if (n) {
+        PIN_SWDIO_TMS_CLR();
+        for (; n; n--) {
+            PIN_SWCLK_CLR();
+            PIN_DELAY_FAST();
+            PIN_SWCLK_SET();
+        }
+    }
+    PIN_SWDIO_TMS_SET();
+    return ((uint8_t)ack);
+}
+
+// ---------------------------------------------------------------------------
+// 快路径 · 读：请求 + ACK + 32 位数据 + 奇偶校验 + turnaround
+//   数据相位是 32 个 bit 的批量实现：默认手写汇编 x035_read_data（顺带算出奇偶位）；
+//   SWD_SPI_RD=1 时换成 SPI1 单线半双工接收，见 src/dap/swd_spi_x035.c。
+// ---------------------------------------------------------------------------
+DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFastRead(
+    uint32_t request, uint32_t *data) {
+    uint32_t ack;
+    uint32_t bit;
+    uint32_t val;
+    uint32_t parity;
+
+    /* 读事务的请求头保持 GPIO 位时序：把它也换成 SPI 版本后实测吞吐腰斩
+     * （写 282→174、读 227→183 KiB/s，原因待查，疑与热路径代码膨胀/时序有关）。
+     * 请求头只有 8 拍（约 1 µs），走 SPI 并不能换来可测的收益。 */
+    ack = swd_fast_ack_phase_gpio(request);
+    if (ack != DAP_TRANSFER_OK) {
+        return swd_fast_finish(ack, 1U);
+    }
+
+    /* Read data —— 32 个数据位（SWD 为 LSB first，每 bit 8 个 SWCLK、
+     * 低 4 / 高 4）。默认由 x035_read_data() 的手写汇编完成，顺带算出奇偶位；
+     * SWD_SPI_RD 时这 32 拍交给 SPI1（模式 1，默认关闭，见 src/dap/swd_spi_x035.c）。
+     * 两条路径之后的「读奇偶位」一拍完全一样：SPI 只给 32 个时钟，
+     * 第 33 拍（奇偶位）永远是 GPIO。
+     */
+#if SWD_SPI_RD
+    val = swd_spi_recv32();
+    parity = swd_parity32(val);
+    /* SPI 模式 1 的采样点是上升沿，退出时 SCK 停在低电平；目标在下降沿换数据，
+     * 所以奇偶位就在线上，只要再给一个上升沿把它采下来（这一拍本来就是 SWD
+     * 数据相位的第 33 拍）。 */
+    PIN_SWCLK_SET_READ();
+    bit = PIN_SWDIO_IN();
+#else
+    swd_gpio_if()->read_data(&val, &parity);
+    PIN_SWCLK_CLR_READ();
+    bit = PIN_SWDIO_IN();
+    PIN_SWCLK_SET_READ(); /* Read Parity */
+#endif
+    if ((parity ^ bit) & 1U) {
+        ack = DAP_TRANSFER_ERROR;
+    }
+    /* Turnaround */
+    PIN_SWCLK_CLR();
+    *data = val;
+    PIN_SWCLK_SET();
+    PIN_SWDIO_OUTPUT(); // turnaround
+
+    return swd_fast_finish_ok(ack);
+}
+
+// ---------------------------------------------------------------------------
+// 快路径 · 写：请求 + ACK + 32 位数据 + 奇偶位 + 收尾
+//   数据相位是 32 个 bit 的批量实现：默认手写汇编 x035_write_data；
+//   SWD_SPI_WR=1 时换成 SPI1 单线半双工发送。奇偶位用位运算算。
+// ---------------------------------------------------------------------------
+DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFastWrite(
+    uint32_t request, uint32_t *data) {
+    uint32_t ack;
+    uint32_t val;
+    uint32_t parity;
+
+    /* 写事务的请求头：SWD_SPI_REQ 时交给 SPI（24 MHz 下 8 拍 0.33 µs，
+     * 汇编要 1.3 µs）；写方向余量大，这样做实测稳定。 */
+#if SWD_SPI_REQ
+    ack = swd_fast_ack_phase_spi(request);
+#else
+    ack = swd_fast_ack_phase_gpio(request);
+#endif
+    if (ack != DAP_TRANSFER_OK) {
+        return swd_fast_finish(ack, 0U);
+    }
+
+    /* Turnaround */
+    PIN_SWCLK_CLR();
+    PIN_SWDIO_OUTPUT(); // turnaround
+    PIN_SWCLK_SET();
+
+    /* Write data */
+    val = *data;
+#if SWD_SPI_WR
+    parity = swd_spi_send32(val);
+#else
+    /* 位时序版本：数据相位是整块汇编，先把它发出去；奇偶位在数据相位之后、
+     * 奇偶位那一拍之前算 —— 和位时序"在 bit 之间算"的节奏一致，不占发起时间。 */
+    swd_gpio_if()->write_data(val);
+    parity = swd_parity32(val);
+#endif
+    PIN_SWCLK_CLR_SWDIO_OUT(parity); /* 奇偶位 */
+    PIN_DELAY_FAST();
+    PIN_DELAY_FAST();
+    PIN_SWCLK_SET();
+    PIN_DELAY_FAST();
+
+    return swd_fast_finish_ok(ack);
+}
+
 // 慢路径不补占空比额外延时。
 //
 // 上面的 PIN_SWCLK_SET/CLR 带 x035_pin_delay_*_extra()，只适合快路径 ——
@@ -328,17 +436,13 @@ DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFast(
 #define PIN_SWCLK_SET() PIN_SWCLK_TCK_SET()
 #define PIN_SWCLK_CLR() PIN_SWCLK_TCK_CLR()
 
-// SWD Transfer I/O Slow
-//   request: A[3:2] RnW APnDP
-//   data:    DATA[31:0]
-//   return:  ACK[2:0]
-__attribute__((noinline)) static uint8_t SWD_TransferSlow(
-    uint32_t request, uint32_t *data) {
+// ===========================================================================
+// 慢路径：请求相位 + ACK 采样（读、写共用，always_inline 同上）
+// ===========================================================================
+__attribute__((noinline)) static uint32_t swd_slow_ack_phase(uint32_t request) {
     uint32_t ack;
     uint32_t bit;
-    uint32_t val;
     uint32_t parity;
-
     uint32_t n;
 
     /* Packet Request */
@@ -413,88 +517,16 @@ __attribute__((noinline)) static uint8_t SWD_TransferSlow(
     PIN_DELAY_SLOW(DAP_Data.clock_delay);
     ack |= bit << 2;
 
-    if (ack == DAP_TRANSFER_OK) { /* OK response */
-        /* Data transfer */
-        if (request & DAP_TRANSFER_RnW) {
-            /* Read data */
-            val = 0U;
-            parity = 0U;
-            for (n = 32U; n; n--) {
-                PIN_SWCLK_CLR();
-                PIN_DELAY_SLOW(DAP_Data.clock_delay);
-                bit = PIN_SWDIO_IN();
-                PIN_SWCLK_SET();
-                PIN_DELAY_SLOW(DAP_Data.clock_delay); /* Read RDATA[0:31] */
-                parity += bit;
-                val >>= 1;
-                val |= bit << 31;
-            }
-            PIN_SWCLK_CLR();
-            PIN_DELAY_SLOW(DAP_Data.clock_delay);
-            bit = PIN_SWDIO_IN();
-            PIN_SWCLK_SET();
-            PIN_DELAY_SLOW(DAP_Data.clock_delay); /* Read Parity */
-            if ((parity ^ bit) & 1U) {
-                ack = DAP_TRANSFER_ERROR;
-            }
-            if (data) {
-                *data = val;
-            }
-            /* Turnaround */
-            for (n = DAP_Data.swd_conf.turnaround; n; n--) {
-                PIN_SWCLK_CLR();
-                PIN_DELAY_SLOW(DAP_Data.clock_delay);
-                PIN_SWCLK_SET();
-                PIN_DELAY_SLOW(DAP_Data.clock_delay);
-            }
-            PIN_SWDIO_OUT_ENABLE();
-        } else {
-            /* Turnaround */
-            for (n = DAP_Data.swd_conf.turnaround; n; n--) {
-                PIN_SWCLK_CLR();
-                PIN_DELAY_SLOW(DAP_Data.clock_delay);
-                PIN_SWCLK_SET();
-                PIN_DELAY_SLOW(DAP_Data.clock_delay);
-            }
-            PIN_SWDIO_OUT_ENABLE();
-            /* Write data */
-            val = *data;
-            parity = 0U;
-            for (n = 32U; n; n--) {
-                PIN_SWCLK_CLR_SWDIO_OUT(val);
-                PIN_DELAY_SLOW(DAP_Data.clock_delay);
-                PIN_SWCLK_SET();
-                PIN_DELAY_SLOW(DAP_Data.clock_delay); /* Write WDATA[0:31] */
-                parity += val;
-                val >>= 1;
-            }
-            PIN_SWCLK_CLR_SWDIO_OUT(parity);
-            PIN_DELAY_SLOW(DAP_Data.clock_delay);
-            PIN_SWCLK_SET();
-            PIN_DELAY_SLOW(DAP_Data.clock_delay); /* Write Parity Bit */
-        }
-        /* Capture Timestamp */
-        if (request & DAP_TRANSFER_TIMESTAMP) {
-            DAP_Data.timestamp = TIMESTAMP_GET();
-        }
-        /* Idle cycles */
-        n = DAP_Data.transfer.idle_cycles;
-        if (n) {
-            PIN_SWDIO_OUT(0U);
-            for (; n; n--) {
-                PIN_SWCLK_CLR();
-                PIN_DELAY_SLOW(DAP_Data.clock_delay);
-                PIN_SWCLK_SET();
-                PIN_DELAY_SLOW(DAP_Data.clock_delay);
-            }
-        }
-        PIN_SWDIO_OUT(1U);
-        return ((uint8_t)ack);
-    }
+    return ack;
+}
+
+// 慢路径：ACK 不是 OK 时的收尾
+__attribute__((noinline)) static uint8_t swd_slow_finish(uint32_t ack, uint32_t is_read) {
+    uint32_t n;
 
     if ((ack == DAP_TRANSFER_WAIT) || (ack == DAP_TRANSFER_FAULT)) {
         /* WAIT or FAULT response */
-        if (DAP_Data.swd_conf.data_phase && ((request & DAP_TRANSFER_RnW) != 0U)) {
+        if (DAP_Data.swd_conf.data_phase && is_read) {
             for (n = 32U + 1U; n; n--) {
                 PIN_SWCLK_CLR();
                 PIN_DELAY_SLOW(DAP_Data.clock_delay);
@@ -510,7 +542,7 @@ __attribute__((noinline)) static uint8_t SWD_TransferSlow(
             PIN_DELAY_SLOW(DAP_Data.clock_delay);
         }
         PIN_SWDIO_OUT_ENABLE();
-        if (DAP_Data.swd_conf.data_phase && ((request & DAP_TRANSFER_RnW) == 0U)) {
+        if (DAP_Data.swd_conf.data_phase && !is_read) {
             PIN_SWDIO_OUT(0U);
             for (n = 32U + 1U; n; n--) {
                 PIN_SWCLK_CLR();
@@ -535,19 +567,143 @@ __attribute__((noinline)) static uint8_t SWD_TransferSlow(
     return ((uint8_t)ack);
 }
 
+// 慢路径：OK 之后的收尾（时间戳 / idle cycles）
+__attribute__((noinline)) static uint8_t swd_slow_finish_ok(uint32_t ack, uint32_t request) {
+    uint32_t n;
+
+    /* Capture Timestamp */
+    if (request & DAP_TRANSFER_TIMESTAMP) {
+        DAP_Data.timestamp = TIMESTAMP_GET();
+    }
+    /* Idle cycles */
+    n = DAP_Data.transfer.idle_cycles;
+    if (n) {
+        PIN_SWDIO_OUT(0U);
+        for (; n; n--) {
+            PIN_SWCLK_CLR();
+            PIN_DELAY_SLOW(DAP_Data.clock_delay);
+            PIN_SWCLK_SET();
+            PIN_DELAY_SLOW(DAP_Data.clock_delay);
+        }
+    }
+    PIN_SWDIO_OUT(1U);
+    return ((uint8_t)ack);
+}
+
+// ---------------------------------------------------------------------------
+// 慢路径 · 读：请求 + ACK + 32 位数据 + 奇偶校验 + turnaround
+// ---------------------------------------------------------------------------
+__attribute__((noinline)) static uint8_t SWD_TransferSlowRead(
+    uint32_t request, uint32_t *data) {
+    uint32_t ack;
+    uint32_t bit;
+    uint32_t val;
+    uint32_t parity;
+    uint32_t n;
+
+    ack = swd_slow_ack_phase(request);
+    if (ack != DAP_TRANSFER_OK) {
+        return swd_slow_finish(ack, 1U);
+    }
+
+    /* Read data */
+    val = 0U;
+    parity = 0U;
+    for (n = 32U; n; n--) {
+        PIN_SWCLK_CLR();
+        PIN_DELAY_SLOW(DAP_Data.clock_delay);
+        bit = PIN_SWDIO_IN();
+        PIN_SWCLK_SET();
+        PIN_DELAY_SLOW(DAP_Data.clock_delay); /* Read RDATA[0:31] */
+        parity += bit;
+        val >>= 1;
+        val |= bit << 31;
+    }
+    PIN_SWCLK_CLR();
+    PIN_DELAY_SLOW(DAP_Data.clock_delay);
+    bit = PIN_SWDIO_IN();
+    PIN_SWCLK_SET();
+    PIN_DELAY_SLOW(DAP_Data.clock_delay); /* Read Parity */
+    if ((parity ^ bit) & 1U) {
+        ack = DAP_TRANSFER_ERROR;
+    }
+    if (data) {
+        *data = val;
+    }
+    /* Turnaround */
+    for (n = DAP_Data.swd_conf.turnaround; n; n--) {
+        PIN_SWCLK_CLR();
+        PIN_DELAY_SLOW(DAP_Data.clock_delay);
+        PIN_SWCLK_SET();
+        PIN_DELAY_SLOW(DAP_Data.clock_delay);
+    }
+    PIN_SWDIO_OUT_ENABLE();
+
+    return swd_slow_finish_ok(ack, request);
+}
+
+// ---------------------------------------------------------------------------
+// 慢路径 · 写：请求 + ACK + 32 位数据 + 奇偶位 + 收尾
+// ---------------------------------------------------------------------------
+__attribute__((noinline)) static uint8_t SWD_TransferSlowWrite(
+    uint32_t request, uint32_t *data) {
+    uint32_t ack;
+    uint32_t val;
+    uint32_t parity;
+    uint32_t n;
+
+    ack = swd_slow_ack_phase(request);
+    if (ack != DAP_TRANSFER_OK) {
+        return swd_slow_finish(ack, 0U);
+    }
+
+    /* Turnaround */
+    for (n = DAP_Data.swd_conf.turnaround; n; n--) {
+        PIN_SWCLK_CLR();
+        PIN_DELAY_SLOW(DAP_Data.clock_delay);
+        PIN_SWCLK_SET();
+        PIN_DELAY_SLOW(DAP_Data.clock_delay);
+    }
+    PIN_SWDIO_OUT_ENABLE();
+    /* Write data */
+    val = *data;
+    parity = 0U;
+    for (n = 32U; n; n--) {
+        PIN_SWCLK_CLR_SWDIO_OUT(val);
+        PIN_DELAY_SLOW(DAP_Data.clock_delay);
+        PIN_SWCLK_SET();
+        PIN_DELAY_SLOW(DAP_Data.clock_delay); /* Write WDATA[0:31] */
+        parity += val;
+        val >>= 1;
+    }
+    PIN_SWCLK_CLR_SWDIO_OUT(parity);
+    PIN_DELAY_SLOW(DAP_Data.clock_delay);
+    PIN_SWCLK_SET();
+    PIN_DELAY_SLOW(DAP_Data.clock_delay); /* Write Parity Bit */
+
+    return swd_slow_finish_ok(ack, request);
+}
+
 // SWD Transfer I/O
 //   request: A[3:2] RnW APnDP
 //   data:    DATA[31:0]
 //   return:  ACK[2:0]
+//
+// 读、写在这里就分派到各自的实现：两者的数据相位完全不同（读采样+校验奇偶，
+// 写驱动+送奇偶），拆开后每条路径都是直线代码，也方便给数据相位换后端
+// （例如硬件 SPI 半双工，见 src/dap/swd_spi_x035.c）。
 DAP_HIGHCODE_SECTION uint8_t SWD_Transfer(uint32_t request, uint32_t *data) {
     // 快路径要求当前实现具备三段位时序（swd_gpio.h 约定：全给或全 NULL）。
     // 换成没有快路径的实现（例如纯 GPIO 轮询、外挂 MCU）时整体退回慢路径，
     // 不会出现「请求头走快、数据相位走慢」的半快半慢状态。
-    if (DAP_Data.fast_clock && swd_gpio_has_fast_path(swd_gpio_if())) {
-        return SWD_TransferFast(request, data);
-    } else {
-        return SWD_TransferSlow(request, data);
+    const uint32_t fast = (DAP_Data.fast_clock && swd_gpio_has_fast_path(swd_gpio_if())) ? 1U : 0U;
+
+    if (request & DAP_TRANSFER_RnW) {
+        return fast ? SWD_TransferFastRead(request, data)
+                    : SWD_TransferSlowRead(request, data);
     }
+    return fast ? SWD_TransferFastWrite(request, data)
+                : SWD_TransferSlowWrite(request, data);
 }
 
 #endif /* (DAP_SWD != 0) */

@@ -85,12 +85,40 @@ option("esig_sn")
     set_description("Use the chip ESIG UID (96-bit, unique per chip) as the USB serial number")
 option_end()
 
+-- SWD 引脚方案（对应 src/swd_pin_map.h 的 SWD_PIN_VARIANT）。
+-- 用来做 A/B：旧板/旧接线是 PA2(CLK)/PA3(DIO)，现板是 PA5/PA6。
+-- 两个方案各编一份实现时符号带方案后缀，互不冲突。
+option("swd_pins")
+    set_default("pa5_pa7")
+    set_values({"pa5_pa7", "pa5_pa6", "pa2_pa3"})
+    set_showmenu(true)
+    set_description("SWD pin variant: pa5_pa7 (default), pa5_pa6 or pa2_pa3 (legacy)")
+option_end()
+
 -- 是否把 WCH-Link（RVSWD）调试器一起编进固件
 option("wchlink")
     set_default(false)
     set_showmenu(true)
     set_description("Also build the WCH-Link (RVSWD) debugger mode (dual-mode firmware, costs ~6 KiB RAM)")
 option_end()
+
+-- SWD 的请求头（仅写事务）与 32 位写数据相位改用硬件 SPI1（PA5 = SCK、PA7 = MOSI，
+-- 单线半双工）。只有 pa5_pa7 方案可用；默认关闭，打开后读事务、turnaround、
+-- ACK 采样、奇偶位、idle 仍全走 GPIO 位时序。
+option("swd_spi")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Use hardware SPI1 (1-line half duplex) for the 32-bit SWD write data phase (needs swd_pins=pa5_pa7); SWD_SPI_REQ/SWD_SPI_RD in swd_pin_map.h also switch the header/read phases")
+option_end()
+
+-- SPI 位相位的时钟分频：ctlr1 的 BR[2:0]，PCLK2=48MHz -> /2=24MHz(0) /4=12MHz(1) /8=6MHz(2)
+option("swd_spi_br")
+    set_default(0)
+    set_showmenu(true)
+    set_description("SPI prescaler for the SWD SPI bit phases: 0=/2 24MHz, 1=/4 12MHz, 2=/8 6MHz, ... 7=/256")
+option_end()
+
+
 
 target("firmware")
     -- 目标属性
@@ -114,6 +142,15 @@ target("firmware")
     add_includedirs("src", "src/port")
     add_defines("ESIG_SN=" .. (esig_sn_enabled and 1 or 0))
     add_defines("WCHLINK_ENABLE=" .. (wchlink_enabled and 1 or 0))
+
+    -- SWD 引脚方案 -> SWD_PIN_VARIANT（undefined 时 swd_pin_map.h 默认 PA5/PA7）
+    local swd_pins = get_config("swd_pins") or "pa5_pa7"
+    add_defines("SWD_PIN_VARIANT=SWD_PIN_VARIANT_" .. string.upper(swd_pins))
+
+    -- SPI 位相位（仅 pa5_pa7 方案，见 src/dap/swd_spi_x035.c）
+    local swd_spi_on = has_config("swd_spi")
+    add_defines("SWD_SPI_DATA_PHASE=" .. (swd_spi_on and 1 or 0))
+    add_defines("SWD_SPI_BR=" .. (get_config("swd_spi_br") or 0))
 
     -- 串口驱动（全部串口相关代码都在这一对文件里，见 src/drv/drv_uart.h 的说明）
     --   COM1  <-> USART4 (PB0/PB1)          两模式都可用
@@ -260,6 +297,11 @@ target("firmware")
         cprint("${cyan}Using mode:${clear} %s", get_config("mode") or "debug")
         cprint("${cyan}Using toolchain:${clear} %s", toolchain_root)
         cprint("${cyan}Using SDK:${clear} sdk/")
+        cprint("${cyan}SWD pins:${clear} %s", get_config("swd_pins") or "pa5_pa7")
+        cprint("${cyan}SWD SPI:${clear} %s", has_config("swd_spi")
+            and string.format("write data phase via SPI1 (PCLK2/%d); header/read stay bit-bang",
+                1 << ((tonumber(get_config("swd_spi_br")) or 0) + 1))
+            or "off (GPIO bit-bang)")
         cprint("${cyan}Debugger:${clear} %s", wchlink_enabled
             and "CMSIS-DAP + WCH-Link (dual mode, hold button at power-up to switch)"
             or "CMSIS-DAP only (--wchlink=y to add WCH-Link)")

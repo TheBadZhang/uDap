@@ -13,6 +13,9 @@
 // 本文件里的边沿级原语是编译期展开的；相位级操作（端口配置、三段位时序）
 // 走这里的函数表，换驱动只改绑定，不用改本文件。
 #include "swd_gpio.h"
+#if SWD_SPI_DATA_PHASE
+#include "swd_spi.h"
+#endif
 
 // 板级引脚（状态灯 PB11/PB12 等）
 #include "board_pin_map.h"
@@ -75,6 +78,18 @@ __STATIC_FORCEINLINE void x035_pin_delay_slow(uint32_t delay) {
 #define DAP_JTAG_DEV_CNT        1U
 #define DAP_DEFAULT_PORT        1U
 #define DAP_DEFAULT_SWJ_CLOCK   1000000U
+// DAP 协议包大小（DAP_Info 上报给主机，决定主机一次能发/收多少字节）。
+//
+// ⚠️ 在这颗芯片上**必须等于 USB 端点 MPS（64）**，不能放大。
+// 实测把本值改成 256 后，主机（OpenOCD 的 write_memory）会把 1024 个 word 的
+// block 写一次性发过来（4101 字节），而 CH32X035 的 USBFS **只上报每个包的长度、
+// 不提供本次传输的总长度**，固件只能按「凑满请求长度或收到短包」判断一条命令结束
+// —— 于是长命令被切成几段当成多条命令解析，响应错位，报
+//     CMSIS-DAP command mismatch. Sent 0x3 received 0x5
+// 所以这里保持 64：主机遵守它，一条命令就是一个包。
+//
+// 想提高 DAP_TransferBlock 的批量只能靠减少「每条命令的往返延迟」，那是主机的
+// 事（见 tools/speed.ps1 的实测对比：pyOCD 读 216 KiB/s vs 定制 OpenOCD 21 KiB/s）。
 #define DAP_PACKET_SIZE         64U
 #define DAP_PACKET_COUNT        8U
 #define SWO_UART                0
@@ -210,6 +225,11 @@ __STATIC_INLINE void PORT_JTAG_SETUP(void) {}
 // 这两支只在 DAP 连接/断开时各调一次，走函数表不影响任何时序。
 __STATIC_INLINE void PORT_SWD_SETUP(void) {
     swd_gpio_if()->port_setup();
+#if SWD_SPI_DATA_PHASE
+    // 数据相位用 SPI1：这里只做外设初始化（SPE 仍为 0，不接管引脚），
+    // 每次事务的引脚交接由 swd_spi_write32/read32 自己完成
+    swd_spi_init();
+#endif
     // 连接时释放目标复位（CMSIS-DAP 规定 nRESET 初始为高；未接引脚时为空操作）
     PIN_nRESET_OUT(1U);
 }
