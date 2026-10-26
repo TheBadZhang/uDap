@@ -13,9 +13,6 @@
 // 本文件里的边沿级原语是编译期展开的；相位级操作（端口配置、三段位时序）
 // 走这里的函数表，换驱动只改绑定，不用改本文件。
 #include "swd_gpio.h"
-#if SWD_SPI_DATA_PHASE
-#include "swd_spi.h"
-#endif
 
 // 板级引脚（状态灯 PB11/PB12 等）
 #include "board_pin_map.h"
@@ -225,11 +222,6 @@ __STATIC_INLINE void PORT_JTAG_SETUP(void) {}
 // 这两支只在 DAP 连接/断开时各调一次，走函数表不影响任何时序。
 __STATIC_INLINE void PORT_SWD_SETUP(void) {
     swd_gpio_if()->port_setup();
-#if SWD_SPI_DATA_PHASE
-    // 数据相位用 SPI1：这里只做外设初始化（SPE 仍为 0，不接管引脚），
-    // 每次事务的引脚交接由 swd_spi_write32/read32 自己完成
-    swd_spi_init();
-#endif
     // 连接时释放目标复位（CMSIS-DAP 规定 nRESET 初始为高；未接引脚时为空操作）
     PIN_nRESET_OUT(1U);
 }
