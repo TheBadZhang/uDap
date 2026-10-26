@@ -206,6 +206,7 @@ __STATIC_FORCEINLINE void PIN_nRESET_OUT(uint32_t bit) {
         SWD_PORT->BCR = PIN_nRESET_PIN;   // 先让输出数据为低
         SWD_PORT->CFGLR = (SWD_PORT->CFGLR & ~(0xFU << PIN_nRESET_SHIFT)) | (0x1U << PIN_nRESET_SHIFT);
     }
+    board_swd_cfglr_resync(); /* 动过 CFGLR，SWD 的影子要重建 */
 }
 
 #else /* !SWD_NRESET_ENABLE */

@@ -13,6 +13,7 @@
 #include <usbd_cdc_acm.h>
 
 #include "board_pin_map.h"
+#include "swd_pin_map.h"
 #include "drv/drv_mode_store.h"
 
 // ===========================================================================
@@ -297,6 +298,7 @@ void drv_flow_pins_release(void) {
         (BOARD_AUX_PORT->CFGLR &
          ~((0xFUL << BOARD_AUX_DTR_CFGLR_SHIFT) | (0xFUL << BOARD_AUX_RTS_CFGLR_SHIFT))) |
         (0x4UL << BOARD_AUX_DTR_CFGLR_SHIFT) | (0x4UL << BOARD_AUX_RTS_CFGLR_SHIFT);
+    board_swd_cfglr_resync(); /* 动过 CFGLR，SWD 的影子要重建 */
     s_enabled = false;
 }
 
@@ -310,6 +312,7 @@ void drv_flow_pins_enable(void) {
         (BOARD_AUX_PORT->CFGLR &
          ~((0xFUL << BOARD_AUX_DTR_CFGLR_SHIFT) | (0xFUL << BOARD_AUX_RTS_CFGLR_SHIFT))) |
         (0x1UL << BOARD_AUX_DTR_CFGLR_SHIFT) | (0x1UL << BOARD_AUX_RTS_CFGLR_SHIFT);
+    board_swd_cfglr_resync(); /* 动过 CFGLR，SWD 的影子要重建 */
     s_enabled = true;
 
     flow_pins_apply();
@@ -370,8 +373,9 @@ bool drv_flow_pins_rts(void) {
 #define UART_RX_DMA_SIZE 1024u
 
 // TX 是软件 ring（USB 侧按它做背压），由 TXE 中断逐字节排空。
-// 256 B = 4 个 USB 包，配合背压足够。
-#define UART_TX_FIFO_SIZE 256u
+// 128 B = 2 个 USB 包；再大在双模式固件（CMSIS-DAP + WCH-Link）里会顶到栈，
+// 见 Link_highcode_nv_256B_dual.ld 末尾的 ASSERT。USB 侧有背压，2 个包够用。
+#define UART_TX_FIFO_SIZE 128u
 
 #define UART_DEFAULT_BAUDRATE 115200u
 
@@ -638,6 +642,8 @@ void drv_uart2_init(uint32_t baudrate) {
     gpio.GPIO_Pin = BOARD_AUX_UART_RX_PIN;
     gpio.GPIO_Mode = GPIO_Mode_IPU;
     GPIO_Init(BOARD_AUX_PORT, &gpio);
+
+    board_swd_cfglr_resync(); /* GPIO_Init 写过 CFGLR，SWD 的影子要重建 */
 
     drv_uart2_reset();
 

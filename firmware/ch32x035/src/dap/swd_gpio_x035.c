@@ -3,6 +3,9 @@
 #include "mode_overlay.h"
 #include "swd_pin_map.h"
 
+/* CFGLR 基准值（见 src/swd_pin_map.h 的说明）：只在 port_on/off 或别人改过 CFGLR 后重建 */
+uint32_t board_swd_cfglr_base;
+
 /*
  * SWD 物理层的**芯片内置实现**（swd_gpio_if_x035）。
  *

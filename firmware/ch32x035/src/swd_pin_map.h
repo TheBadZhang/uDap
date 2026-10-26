@@ -27,7 +27,7 @@
 #define SWD_PIN_VARIANT_PA5_PA7 3 /* 现板：PA5 = SWCLK，PA7 = SWDIO */
 
 #ifndef SWD_PIN_VARIANT
-#define SWD_PIN_VARIANT SWD_PIN_VARIANT_PA5_PA7
+#define SWD_PIN_VARIANT SWD_PIN_VARIANT_PA5_PA6
 #endif
 
 #if SWD_PIN_VARIANT == SWD_PIN_VARIANT_PA5_PA6
@@ -111,15 +111,35 @@ BOARD_SWD_ATTR uint32_t board_swd_dio_level(void) { return (SWD_PORT->INDR & SWD
  * 若换短排线/加地线后要再试，只改这一个宏即可。 */
 #define BOARD_SWD_OUT_CFG 0x1UL
 
+/* ---------------------------------------------------------------------------
+ * CFGLR 的基准值：省掉 DIO 方向切换时的外设读
+ * ---------------------------------------------------------------------------
+ * CFGLR 每脚 4 位、只能读改写（lw CFGLR + and + or + sw），而 SWD 每个事务要切
+ * 两次 SWDIO 方向。外设读（AHB→APB）在这颗芯片上比几条指令贵得多，所以把
+ * 「CFGLR 去掉 SWDIO 那 4 位」的值缓存起来，切换时只需 lw(RAM) + or + sw：
+ *
+ *     推挽输出：CFGLR = base | (OUT_CFG << shift)
+ *     浮空输入：CFGLR = base | (0x4     << shift)
+ *
+ * 什么时候必须重建（任何「别人」改过 CFGLR 之后）：
+ *   - 本文件的 port_on / port_off：自己改完顺手重建；
+ *   - src/drv/drv_uart.c 改 PA2/PA3 之后：调 board_swd_cfglr_resync()；
+ *   - DAP_config.h 的 nRESET（默认关闭）同样在改完调一次。
+ * 漏掉重建的后果是 PA2/PA3 的配置被旧值覆盖（UART 流控脚失效）。
+ */
+extern uint32_t board_swd_cfglr_base; /* CFGLR 去掉 SWDIO 那 4 位 */
+
+BOARD_SWD_ATTR void board_swd_cfglr_resync(void) {
+    board_swd_cfglr_base = SWD_PORT->CFGLR & ~(0xFUL << SWD_DIO_CFGLR_SHIFT);
+}
+
 /* SWDIO 方向：切成推挽输出 / 释放为浮空输入（供目标驱动）。
- * 只有 turnaround 用，每事务一次 —— 但仍然内联，保持一致。 */
+ * 只有 turnaround 用，每事务两次 —— 只读一次 RAM、写一次寄存器。 */
 BOARD_SWD_ATTR void board_swd_dio_output(void) {
-    SWD_PORT->CFGLR =
-        (SWD_PORT->CFGLR & ~(0xFUL << SWD_DIO_CFGLR_SHIFT)) | (BOARD_SWD_OUT_CFG << SWD_DIO_CFGLR_SHIFT);
+    SWD_PORT->CFGLR = board_swd_cfglr_base | (BOARD_SWD_OUT_CFG << SWD_DIO_CFGLR_SHIFT);
 }
 BOARD_SWD_ATTR void board_swd_dio_input(void) {
-    SWD_PORT->CFGLR =
-        (SWD_PORT->CFGLR & ~(0xFUL << SWD_DIO_CFGLR_SHIFT)) | (0x4UL << SWD_DIO_CFGLR_SHIFT);
+    SWD_PORT->CFGLR = board_swd_cfglr_base | (0x4UL << SWD_DIO_CFGLR_SHIFT);
 }
 
 
@@ -131,11 +151,13 @@ BOARD_SWD_ATTR void board_swd_port_on(void) {
                        ~((0xFUL << SWD_CLK_CFGLR_SHIFT) | (0xFUL << SWD_DIO_CFGLR_SHIFT))) |
                       (BOARD_SWD_OUT_CFG << SWD_CLK_CFGLR_SHIFT) |
                       (BOARD_SWD_OUT_CFG << SWD_DIO_CFGLR_SHIFT);
+    board_swd_cfglr_resync();
 }
 BOARD_SWD_ATTR void board_swd_port_off(void) {
     SWD_PORT->CFGLR = (SWD_PORT->CFGLR &
                        ~((0xFUL << SWD_CLK_CFGLR_SHIFT) | (0xFUL << SWD_DIO_CFGLR_SHIFT))) |
                       (0x4UL << SWD_CLK_CFGLR_SHIFT) | (0x4UL << SWD_DIO_CFGLR_SHIFT);
+    board_swd_cfglr_resync();
 }
 
 /*
