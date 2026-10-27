@@ -8,17 +8,16 @@ uint32_t board_swd_cfglr_out;
 uint32_t board_swd_cfglr_in;
 
 /*
- * SWD 物理层的**芯片内置实现**（swd_gpio_if_x035）。
+ * SWD 物理层的**芯片内置实现**（符号都带引脚方案后缀，见 src/dap/swd_gpio.h）。
  *
- * 三件事都在这个文件里：
- *   1. GPIO 描述符（引脚来自 src/swd_pin_map.h，换板只改那个头文件）
- *   2. 端口生命周期（PORT_SWD_SETUP / PORT_OFF）与三段位时序手写汇编
- *      （原先内联在 src/dap/sw_dp.c 的 SWD_TransferFast 里）
+ * 两件事都在这个文件里：
+ *   1. 端口生命周期（PORT_SWD_SETUP / PORT_OFF）
+ *   2. 三段位时序手写汇编（原先内联在 src/dap/sw_dp.c 的 SWD_TransferFast 里）
  *      —— 注意 DIO 方向切换（turnaround）**不在这里**：它只是一次 CFGLR 写，
  *      由 swd_pin_map.h 的 board_swd_dio_output/input 编译期内联展开，
- *      进实现表就只能留成 out-of-line 函数，每个事务多付两次调用。
- * 对外的接口定义见 src/dap/swd_gpio.h：换驱动时照着那个接口再写一份、
- * 启动时 swd_gpio_bind() 一下即可，sw_dp.c 与 DAP_config.h 不用动。
+ *      做成函数就只能留成 out-of-line 调用，每个事务多付两次。
+ * 对外的声明见 src/dap/swd_gpio.h（没有函数指针表），使用方是 sw_dp.c 与
+ * DAP_config.h —— 换实现时改那边的声明与本文件的定义即可。
  *
  * ---------------------------------------------------------------------------
  * 以下为三段汇编的原始说明
@@ -84,7 +83,7 @@ uint32_t board_swd_cfglr_in;
  * A3/parity/stop 三拍没有 4 条 ALU 可填，用 nop 补齐到同样的 低2/高3，
  * 这样整帧每一拍都是 8 个 clk，波形完全均匀。
  */
-DAP_HIGHCODE_SECTION static void SWD_GPIO_IMPL(swd_fast_packet_request)(uint32_t request) {
+DAP_HIGHCODE_SECTION SWD_GPIO_NOINLINE void SWD_GPIO_IMPL(swd_fast_packet_request)(uint32_t request) {
     volatile uint32_t *const pa = &SWD_PORT->BSHR;
 
     /* 逐行对照的原 C（下面注释里的「原 C:」都指这段合并前的写法）：
@@ -224,7 +223,7 @@ DAP_HIGHCODE_SECTION static void SWD_GPIO_IMPL(swd_fast_packet_request)(uint32_t
  *
  * 寄存器：t0 = 采样临时  t1 = SWD_CLK_SET  %[par] = 奇偶累加器
  */
-DAP_HIGHCODE_SECTION static void SWD_GPIO_IMPL(swd_fast_read_data)(uint32_t *value, uint32_t *parity) {
+DAP_HIGHCODE_SECTION SWD_GPIO_NOINLINE void SWD_GPIO_IMPL(swd_fast_read_data)(uint32_t *value, uint32_t *parity) {
     uint32_t val = 0U;
     uint32_t par = 0U;
     volatile uint32_t *const pa = &SWD_PORT->BSHR;
@@ -291,19 +290,27 @@ DAP_HIGHCODE_SECTION static void SWD_GPIO_IMPL(swd_fast_read_data)(uint32_t *val
  * 于是每 bit 少一条 `srli val, val, 1`（32 个 bit 共省 32 条）。
  * 代价是每个 bit 的立即数不同，用 GAS 的 .set + .if 按 k 生成。
  *
- * 每 bit 的排布（ALU 拆 2+2，让占空比接近 1:1）：
+ * 每 bit 的排布（占空比完全由**指令条数**决定，24 MHz 下 1 条 ≈ 42 ns）：
  *   ① sw t0 : 清 SWCLK + 按位设/清 SWDIO  （下降沿；t0 在上一轮已算好）
- *   -- 低电平期：slli/andi 2 条 --
+ *   -- 低电平期：取位 + andi，恒 2 条 --
  *   ② sw hi : 置 SWCLK                    （上升沿）
- *   -- 高电平期：srl/or 2 条 + 可调 NOP --
+ *   -- 高电平期：srl/or 2 条 + 1 个 NOP，恒 3 条 --
+ * 于是每 bit 恒 5 个 slot（低 2 / 高 3，实测 80 ns / 120 ns）。
+ *
+ * ⚠️ 32 个 cell 的指令条数**必须完全一致**：任何一位少发一条，这一位的低电平
+ * 就只有 1 个 slot（42 ns）、高电平仍是 3 个（实测 40 / 120 ns），目标端会在
+ * 这一位上看到明显不对称的时钟 —— 曾经 `k+1 == 4` 那条「省掉一次 slli」的
+ * 优化就是这么把第 4 位搞歪的。想省指令只能整组一起省（比如 32 位全减一条），
+ * 单独特化某一位必须补 `nop` 把 slot 数补回来（读路径的 `rb_k == SWD_DIO_BIT`
+ * 分支就是这么做的）。
  *
  * 这 4 条 ALU 只依赖 val，不依赖①要写的 t0，所以拆到上升沿两侧**不会**引入
  * 额外停顿；而 or 算完后隔着 nop + sw 才是下一轮的 sw t0，也没写后写气泡。
- * 想继续调：把 srl/or 之一搬到②之前，或删掉 nop。
+ * 想继续调：把 srl/or 之一搬到②之前，或改 nop 的数量（32 位一起改）。
  *
  * 寄存器：t0 = 当前位 BSHR 值  t2 = SWD_DIO_CLR  t3 = SWD_CLK_CLR
  */
-DAP_HIGHCODE_SECTION static void SWD_GPIO_IMPL(swd_fast_write_data)(uint32_t value) {
+DAP_HIGHCODE_SECTION SWD_GPIO_NOINLINE void SWD_GPIO_IMPL(swd_fast_write_data)(uint32_t value) {
     volatile uint32_t *const pa = &SWD_PORT->BSHR;
 
     /* 逐行对照的原 C（合并前的写法）：
@@ -330,6 +337,8 @@ DAP_HIGHCODE_SECTION static void SWD_GPIO_IMPL(swd_fast_write_data)(uint32_t val
         "slli t0, %[val], (3 - wb_k)\n\t"  /* │ wb_k+1 < 4：(val << (3-wb_k)) 再 & 16 取该位 */
         ".elseif (wb_k + 1) == 4\n\t"      /* │ wb_k+1 == 4：直接用 val & 16（省掉一次 slli）*/
         "andi t0, %[val], 16\n\t"          /* │ */
+        "nop\n\t"                          /* │ 但低电平期的 slot 数要补齐，否则这一位变得 */
+                                           /* │ 低 1 / 高 3（实测 40 ns / 120 ns），见上面 ⚠️ */
         ".else\n\t"                        /* │ wb_k+1 > 4：(val >> (wb_k-3)) 再 & 16 */
         "srli t0, %[val], (wb_k - 3)\n\t"  /* ┘ 等价于原 C 的 (val >> k) & 1U 后 << 4 */
         ".endif\n\t"
@@ -349,48 +358,14 @@ DAP_HIGHCODE_SECTION static void SWD_GPIO_IMPL(swd_fast_write_data)(uint32_t val
 
 
 // ---------------------------------------------------------------------------
-// GPIO 描述符：数据全部来自 src/swd_pin_map.h（引脚的唯一来源）
+// 端口生命周期：直接复用板级原语（src/swd_pin_map.h 的 board_swd_port_on/off），
+// 不在这里重复一遍寄存器写法 —— 换板只改引脚表，两个使用方（DAP_config.h 的
+// PORT_SWD_SETUP/PORT_OFF 与本实现）自动保持一致。
 // ---------------------------------------------------------------------------
-static const swd_gpio_desc_t SWD_GPIO_IMPL(swd_gpio_x035_desc) = {
-    // 名字里带上引脚方案，便于诊断时一眼看出当前绑的是哪套脚
-    .name = "ch32x035-gpio-fast/" SWD_PIN_VARIANT_STR,
-    .port = SWD_PORT,
-    .clk_pin = (uint32_t)SWD_CLK_PIN,
-    .dio_pin = (uint32_t)SWD_DIO_PIN,
-    .clk_shift = (uint8_t)SWD_CLK_CFGLR_SHIFT,
-    .dio_shift = (uint8_t)SWD_DIO_CFGLR_SHIFT,
-};
-
-// 端口操作直接复用板级原语（src/swd_pin_map.h 的 board_swd_port_on/off），
-// 不再在这里重复一遍寄存器写法 —— 换板只改引脚表，两个使用方（DAP_config.h
-// 的 PORT_SWD_SETUP/PORT_OFF 与本实现）自动保持一致。
-static void SWD_GPIO_IMPL(x035_port_setup)(void) {
+void SWD_GPIO_IMPL(x035_port_setup)(void) {
     board_swd_port_on();
 }
 
-static void SWD_GPIO_IMPL(x035_port_off)(void) {
+void SWD_GPIO_IMPL(x035_port_off)(void) {
     board_swd_port_off();
-}
-
-// DIO 方向切换（turnaround）**不在实现表里**：它就是 CFGLR 的一次写，见
-// src/swd_pin_map.h 的 board_swd_dio_output/input，由 DAP_config.h 与 sw_dp.c
-// 编译期内联展开（进接口表就只能留成 out-of-line 函数，每次事务多两次调用）。
-
-// ---------------------------------------------------------------------------
-// 实现表 + 默认绑定
-// ---------------------------------------------------------------------------
-const swd_gpio_if_t swd_gpio_if_x035 = {
-    .desc = &SWD_GPIO_IMPL(swd_gpio_x035_desc),
-    .port_setup = SWD_GPIO_IMPL(x035_port_setup),
-    .port_off = SWD_GPIO_IMPL(x035_port_off),
-    .packet_request = SWD_GPIO_IMPL(swd_fast_packet_request),
-    .read_data = SWD_GPIO_IMPL(swd_fast_read_data),
-    .write_data = SWD_GPIO_IMPL(swd_fast_write_data),
-};
-
-// 默认就用芯片内置实现：不调用 swd_gpio_bind() 也能正常工作
-const swd_gpio_if_t *swd_gpio_current = &swd_gpio_if_x035;
-
-void swd_gpio_bind(const swd_gpio_if_t *iface) {
-    swd_gpio_current = (iface != NULL) ? iface : &swd_gpio_if_x035;
 }

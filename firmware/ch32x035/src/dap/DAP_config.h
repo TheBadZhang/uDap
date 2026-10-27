@@ -169,11 +169,9 @@ __STATIC_FORCEINLINE void PIN_SWDIO_TMS_SET(void) { board_swd_dio_set(); }
 __STATIC_FORCEINLINE void PIN_SWDIO_TMS_CLR(void) { board_swd_dio_clr(); }
 #define PIN_SWDIO_IN() (board_swd_dio_level() != 0U)
 
-// DIO 方向切换：每次事务的 turnaround 一次。
-// 这里**直接写寄存器**（板级 inline 原语），不走 swd_gpio_if() 的接口表：
-// 接口表成员是函数指针，编译器只能「去虚化」成直接调用，无法内联，每次切换
-// 都要多一次调用/返回。慢路径（SWD_Sequence / SWJ）也走这两支，展开同样是
-// lw + sw 两条指令，比「auipc + jalr + 函数体 + ret」还短。
+// DIO 方向切换：每次事务的 turnaround 一次，**直接写寄存器**（板级 inline 原语）。
+// 做成函数（更别说函数指针了）编译器就内联不了，每次切换多一次调用/返回；这两个
+// 宏展开就是 lw + sw 两条指令。慢路径（SWD_Sequence / SWJ）也走这两支。
 __STATIC_FORCEINLINE void PIN_SWDIO_OUT_ENABLE(void) { board_swd_dio_output(); }
 __STATIC_FORCEINLINE void PIN_SWDIO_OUT_DISABLE(void) { board_swd_dio_input(); }
 
@@ -223,17 +221,17 @@ __STATIC_FORCEINLINE void PIN_nRESET_OUT(uint32_t bit) { (void)bit; }
 
 __STATIC_INLINE void PORT_JTAG_SETUP(void) {}
 
-// 端口生命周期交给当前实现（默认芯片内置实现，见 src/dap/swd_gpio.h）。
-// 这两支只在 DAP 连接/断开时各调一次，走函数表不影响任何时序。
+// 端口生命周期（见 src/dap/swd_gpio.h）。这两支只在 DAP 连接/断开时各调一次，
+// 直接调用内置实现，不经过任何函数指针。
 __STATIC_INLINE void PORT_SWD_SETUP(void) {
-    swd_gpio_if()->port_setup();
+    swd_gpio_port_setup();
     // 连接时释放目标复位（CMSIS-DAP 规定 nRESET 初始为高；未接引脚时为空操作）
     PIN_nRESET_OUT(1U);
 }
 
 __STATIC_INLINE void PORT_OFF(void) {
     // DAP 端口关闭：两脚释放为浮空输入（由实现决定具体寄存器写法）
-    swd_gpio_if()->port_off();
+    swd_gpio_port_off();
     // 同时释放 nRESET：断开后不能把目标一直摁在复位里
     PIN_nRESET_OUT(1U);
 }

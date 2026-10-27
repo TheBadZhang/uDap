@@ -36,17 +36,14 @@
 // #define PIN_SWDIO_SET() {}
 // #define PIN_SWDIO_CLR() {}
 
-// DIO 方向切换：**直接写寄存器**，不走 swd_gpio_if() 的接口表。
+// DIO 方向切换：**直接写寄存器**（板级 inline 原语，见 src/swd_pin_map.h）。
 //
-// 接口表里的成员是函数指针，编译器无论如何都不可能把它内联（LTO 只做到去虚化：
-// 把 `swd_gpio_if()->dio_out_enable()` 变成一条 auipc+jalr 的**直接调用**到
-// x035_dio_out_enable，函数体本身仍是独立的 out-of-line 函数）。每个事务切两次
-// 方向，于是每个事务白花两次「调用 + 返回 + 重新加载 CFGLR 基准」，还多占了
-// 一段 .text。
+// 这里曾经走过一张函数指针表（swd_gpio_if()->dio_out_enable()）：那玩意儿编译器
+// 无论如何都内联不了 —— LTO 最多把它去虚化成一条 auipc+jalr 的**直接调用**，
+// 函数体仍是独立的 out-of-line 函数。而一个事务要切两次方向，于是每个事务白花
+// 两次「调用 + 返回 + 重新加载 CFGLR 预算值」，还多占一段 .text。
 //
-// 展开后就是 lw(board_swd_cfglr_in/out) + sw 两条指令（见 src/swd_pin_map.h）。
-// 与每比特的 CLK/DIO 原语一样属于**编译期绑定** —— 换驱动要连 swd_pin_map.h 一起换，
-// 这一点在 src/dap/swd_gpio.h 的文件头已说明。
+// 展开后就是 lw(board_swd_cfglr_in/out) + sw 两条指令。
 #define PIN_SWDIO_OUTPUT() { board_swd_dio_output(); }
 #define PIN_SWDIO_INPUT() { board_swd_dio_input(); }
 
@@ -185,7 +182,7 @@ uint32_t swd_fast_ack_phase(uint32_t request) {
      * 每拍 8 个 clk、低 4 / 高 4，指令顺序必须钉住，所以整段在
      * x035_packet_request() 的手写汇编里（摆位与理由见 src/dap/swd_gpio_x035.c）。
      */
-    swd_gpio_if()->packet_request(request);
+    swd_gpio_packet_request(request);
     PIN_SWCLK_CLR_SWDIO_OUT(1U);
     PIN_SWDIO_INPUT();  //  Turnaround
     PIN_SWCLK_SET(); /* Park Bit */
@@ -310,7 +307,7 @@ DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFastRead(
      * 低 4 / 高 4）。位循环与奇偶累加都在 x035_read_data() 的手写汇编里
      * （摆位与理由见 src/dap/swd_gpio_x035.c），回来后再用 GPIO 采第 33 拍（奇偶位）。
      */
-    swd_gpio_if()->read_data(&val, &parity);
+    swd_gpio_read_data(&val, &parity);
     PIN_SWCLK_CLR_READ();
     bit = PIN_SWDIO_IN();
     PIN_SWCLK_SET_READ(); /* Read Parity */
@@ -333,7 +330,7 @@ DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFastRead(
 DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFastWrite(
     uint32_t request, uint32_t *data) {
     uint32_t ack;
-    uint32_t val;
+    uint32_t val = *data;
     uint32_t parity;
 
     /* 请求相位（走 x035 的手写汇编：8 拍 + park + turnaround + ACK 采样） */
@@ -349,8 +346,7 @@ DAP_HIGHCODE_SECTION static uint8_t SWD_TransferFastWrite(
 
     /* Write data：数据相位是整块汇编，先把它发出去；奇偶位在数据相位之后、
      * 奇偶位那一拍之前算 —— 和位时序"在 bit 之间算"的节奏一致，不占发起时间。 */
-    val = *data;
-    swd_gpio_if()->write_data(val);
+    swd_gpio_write_data(val);
     parity = SWD_Parity32(val);
     PIN_SWCLK_CLR_SWDIO_OUT(parity); /* 奇偶位 */
     PIN_DELAY_FAST();
@@ -630,10 +626,9 @@ __attribute__((noinline)) static uint8_t SWD_TransferSlowWrite(
 // 读、写在这里就分派到各自的实现：两者的数据相位完全不同（读采样+校验奇偶，
 // 写驱动+送奇偶），拆开后每条路径都是直线代码。
 DAP_HIGHCODE_SECTION uint8_t SWD_Transfer(uint32_t request, uint32_t *data) {
-    // 快路径要求当前实现具备三段位时序（swd_gpio.h 约定：全给或全 NULL）。
-    // 换成没有快路径的实现（例如纯 GPIO 轮询、外挂 MCU）时整体退回慢路径，
-    // 不会出现「请求头走快、数据相位走慢」的半快半慢状态。
-    const uint32_t fast = (DAP_Data.fast_clock && swd_gpio_has_fast_path(swd_gpio_if())) ? 1U : 0U;
+    // 三段位时序是芯片内置实现的一部分（swd_gpio.h 里没有"可能没有快路径"这回事），
+    // 所以是否走快路径只看主机要求的时钟档位。
+    const uint32_t fast = DAP_Data.fast_clock ? 1U : 0U;
 
     if (request & DAP_TRANSFER_RnW) {
         return fast ? SWD_TransferFastRead(request, data)

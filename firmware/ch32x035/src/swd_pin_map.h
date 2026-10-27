@@ -152,7 +152,7 @@ BOARD_SWD_ATTR void board_swd_dio_input(void) {
 
 
 /* 端口整体：连接（CLK/DIO 推挽输出、先摆成空闲高）/ 断开（两脚浮空）。
- * 换驱动（swd_gpio_if_t）时由实现自己负责，这里供内置实现与 DAP_config.h 共用。 */
+ * 供内置实现（x035_port_setup/off）与 DAP_config.h 的 PORT_SWD_SETUP/PORT_OFF 共用。 */
 BOARD_SWD_ATTR void board_swd_port_on(void) {
     SWD_PORT->BSHR = SWD_CLK_PIN | SWD_DIO_PIN;
     SWD_PORT->CFGLR = (SWD_PORT->CFGLR &
