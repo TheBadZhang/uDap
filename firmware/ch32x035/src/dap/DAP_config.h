@@ -169,9 +169,13 @@ __STATIC_FORCEINLINE void PIN_SWDIO_TMS_SET(void) { board_swd_dio_set(); }
 __STATIC_FORCEINLINE void PIN_SWDIO_TMS_CLR(void) { board_swd_dio_clr(); }
 #define PIN_SWDIO_IN() (board_swd_dio_level() != 0U)
 
-// DIO 方向切换：每次事务的 turnaround 一次，走接口表（可被别的实现替换）
-__STATIC_FORCEINLINE void PIN_SWDIO_OUT_ENABLE(void) { swd_gpio_if()->dio_out_enable(); }
-__STATIC_FORCEINLINE void PIN_SWDIO_OUT_DISABLE(void) { swd_gpio_if()->dio_out_disable(); }
+// DIO 方向切换：每次事务的 turnaround 一次。
+// 这里**直接写寄存器**（板级 inline 原语），不走 swd_gpio_if() 的接口表：
+// 接口表成员是函数指针，编译器只能「去虚化」成直接调用，无法内联，每次切换
+// 都要多一次调用/返回。慢路径（SWD_Sequence / SWJ）也走这两支，展开同样是
+// lw + sw 两条指令，比「auipc + jalr + 函数体 + ret」还短。
+__STATIC_FORCEINLINE void PIN_SWDIO_OUT_ENABLE(void) { board_swd_dio_output(); }
+__STATIC_FORCEINLINE void PIN_SWDIO_OUT_DISABLE(void) { board_swd_dio_input(); }
 
 __STATIC_FORCEINLINE uint32_t PIN_TDI_IN(void) { return 0U; }
 __STATIC_FORCEINLINE void PIN_TDI_OUT(uint32_t bit) { (void)bit; }

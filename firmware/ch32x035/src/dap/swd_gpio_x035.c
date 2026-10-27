@@ -3,16 +3,20 @@
 #include "mode_overlay.h"
 #include "swd_pin_map.h"
 
-/* CFGLR 基准值（见 src/swd_pin_map.h 的说明）：只在 port_on/off 或别人改过 CFGLR 后重建 */
-uint32_t board_swd_cfglr_base;
+/* CFGLR 的两份预算值（见 src/swd_pin_map.h 的说明）：只在 port_on/off 或别人改过 CFGLR 后重建 */
+uint32_t board_swd_cfglr_out;
+uint32_t board_swd_cfglr_in;
 
 /*
  * SWD 物理层的**芯片内置实现**（swd_gpio_if_x035）。
  *
  * 三件事都在这个文件里：
  *   1. GPIO 描述符（引脚来自 src/swd_pin_map.h，换板只改那个头文件）
- *   2. 端口生命周期与 DIO 方向切换（PORT_SWD_SETUP / PORT_OFF / turnaround）
- *   3. 三段位时序手写汇编（原先内联在 src/dap/sw_dp.c 的 SWD_TransferFast 里）
+ *   2. 端口生命周期（PORT_SWD_SETUP / PORT_OFF）与三段位时序手写汇编
+ *      （原先内联在 src/dap/sw_dp.c 的 SWD_TransferFast 里）
+ *      —— 注意 DIO 方向切换（turnaround）**不在这里**：它只是一次 CFGLR 写，
+ *      由 swd_pin_map.h 的 board_swd_dio_output/input 编译期内联展开，
+ *      进实现表就只能留成 out-of-line 函数，每个事务多付两次调用。
  * 对外的接口定义见 src/dap/swd_gpio.h：换驱动时照着那个接口再写一份、
  * 启动时 swd_gpio_bind() 一下即可，sw_dp.c 与 DAP_config.h 不用动。
  *
@@ -368,14 +372,9 @@ static void SWD_GPIO_IMPL(x035_port_off)(void) {
     board_swd_port_off();
 }
 
-// DIO 方向切换同样复用板级原语
-static void SWD_GPIO_IMPL(x035_dio_out_enable)(void) {
-    board_swd_dio_output();
-}
-
-static void SWD_GPIO_IMPL(x035_dio_out_disable)(void) {
-    board_swd_dio_input();
-}
+// DIO 方向切换（turnaround）**不在实现表里**：它就是 CFGLR 的一次写，见
+// src/swd_pin_map.h 的 board_swd_dio_output/input，由 DAP_config.h 与 sw_dp.c
+// 编译期内联展开（进接口表就只能留成 out-of-line 函数，每次事务多两次调用）。
 
 // ---------------------------------------------------------------------------
 // 实现表 + 默认绑定
@@ -384,8 +383,6 @@ const swd_gpio_if_t swd_gpio_if_x035 = {
     .desc = &SWD_GPIO_IMPL(swd_gpio_x035_desc),
     .port_setup = SWD_GPIO_IMPL(x035_port_setup),
     .port_off = SWD_GPIO_IMPL(x035_port_off),
-    .dio_out_enable = SWD_GPIO_IMPL(x035_dio_out_enable),
-    .dio_out_disable = SWD_GPIO_IMPL(x035_dio_out_disable),
     .packet_request = SWD_GPIO_IMPL(swd_fast_packet_request),
     .read_data = SWD_GPIO_IMPL(swd_fast_read_data),
     .write_data = SWD_GPIO_IMPL(swd_fast_write_data),

@@ -36,8 +36,19 @@
 // #define PIN_SWDIO_SET() {}
 // #define PIN_SWDIO_CLR() {}
 
-#define PIN_SWDIO_OUTPUT() { swd_gpio_if()->dio_out_enable(); }
-#define PIN_SWDIO_INPUT() { swd_gpio_if()->dio_out_disable(); }
+// DIO 方向切换：**直接写寄存器**，不走 swd_gpio_if() 的接口表。
+//
+// 接口表里的成员是函数指针，编译器无论如何都不可能把它内联（LTO 只做到去虚化：
+// 把 `swd_gpio_if()->dio_out_enable()` 变成一条 auipc+jalr 的**直接调用**到
+// x035_dio_out_enable，函数体本身仍是独立的 out-of-line 函数）。每个事务切两次
+// 方向，于是每个事务白花两次「调用 + 返回 + 重新加载 CFGLR 基准」，还多占了
+// 一段 .text。
+//
+// 展开后就是 lw(board_swd_cfglr_in/out) + sw 两条指令（见 src/swd_pin_map.h）。
+// 与每比特的 CLK/DIO 原语一样属于**编译期绑定** —— 换驱动要连 swd_pin_map.h 一起换，
+// 这一点在 src/dap/swd_gpio.h 的文件头已说明。
+#define PIN_SWDIO_OUTPUT() { board_swd_dio_output(); }
+#define PIN_SWDIO_INPUT() { board_swd_dio_input(); }
 
 // 在 BSHR 的置位与复位半字间选择，避免每个数据位都执行条件分支
 #define PIN_SWDIO_OUT(bit) { PIN_SWD_PORT->BSHR = (PIN_SWDIO << 16) >> ((bit & 1U) << 4); }

@@ -112,14 +112,19 @@ BOARD_SWD_ATTR uint32_t board_swd_dio_level(void) { return (SWD_PORT->INDR & SWD
 #define BOARD_SWD_OUT_CFG 0x1UL
 
 /* ---------------------------------------------------------------------------
- * CFGLR 的基准值：省掉 DIO 方向切换时的外设读
+ * CFGLR 的**两份预算值**：省掉 DIO 方向切换时的外设读
  * ---------------------------------------------------------------------------
  * CFGLR 每脚 4 位、只能读改写（lw CFGLR + and + or + sw），而 SWD 每个事务要切
- * 两次 SWDIO 方向。外设读（AHB→APB）在这颗芯片上比几条指令贵得多，所以把
- * 「CFGLR 去掉 SWDIO 那 4 位」的值缓存起来，切换时只需 lw(RAM) + or + sw：
+ * 两次 SWDIO 方向。外设读（AHB→APB）在这颗芯片上比几条指令贵得多，所以把两个
+ * 方向的**完整 CFGLR 值**预先算好放在 RAM 里，切换时只剩
  *
- *     推挽输出：CFGLR = base | (OUT_CFG << shift)
- *     浮空输入：CFGLR = base | (0x4     << shift)
+ *     lw  a5, board_swd_cfglr_out    ; 或 _in
+ *     sw  a5, 0(GPIOA)               ; = CFGLR
+ *
+ * 两条指令、不占额外寄存器、也不需要 lui/or 现组常量。实测（STM32F411，64 KiB，
+ * fork OpenOCD，5 轮）比「缓存 base 再 or」的写法又快约 1%（266.6 vs 263.9 KiB/s
+ * 写），而且只在 .highcode 里多 12 字节 —— .highcode 是 RAM，挤出来的都是 SRAM。
+ * 代价是 8 字节 RAM（两个 word）。
  *
  * 什么时候必须重建（任何「别人」改过 CFGLR 之后）：
  *   - 本文件的 port_on / port_off：自己改完顺手重建；
@@ -127,19 +132,22 @@ BOARD_SWD_ATTR uint32_t board_swd_dio_level(void) { return (SWD_PORT->INDR & SWD
  *   - DAP_config.h 的 nRESET（默认关闭）同样在改完调一次。
  * 漏掉重建的后果是 PA2/PA3 的配置被旧值覆盖（UART 流控脚失效）。
  */
-extern uint32_t board_swd_cfglr_base; /* CFGLR 去掉 SWDIO 那 4 位 */
+extern uint32_t board_swd_cfglr_out; /* CFGLR 值：SWDIO 推挽输出 */
+extern uint32_t board_swd_cfglr_in;  /* CFGLR 值：SWDIO 浮空输入 */
 
 BOARD_SWD_ATTR void board_swd_cfglr_resync(void) {
-    board_swd_cfglr_base = SWD_PORT->CFGLR & ~(0xFUL << SWD_DIO_CFGLR_SHIFT);
+    const uint32_t base = SWD_PORT->CFGLR & ~(0xFUL << SWD_DIO_CFGLR_SHIFT);
+    board_swd_cfglr_out = base | (BOARD_SWD_OUT_CFG << SWD_DIO_CFGLR_SHIFT);
+    board_swd_cfglr_in = base | (0x4UL << SWD_DIO_CFGLR_SHIFT);
 }
 
 /* SWDIO 方向：切成推挽输出 / 释放为浮空输入（供目标驱动）。
- * 只有 turnaround 用，每事务两次 —— 只读一次 RAM、写一次寄存器。 */
+ * 只有 turnaround 用，每事务两次 —— 读一次 RAM、写一次寄存器。 */
 BOARD_SWD_ATTR void board_swd_dio_output(void) {
-    SWD_PORT->CFGLR = board_swd_cfglr_base | (BOARD_SWD_OUT_CFG << SWD_DIO_CFGLR_SHIFT);
+    SWD_PORT->CFGLR = board_swd_cfglr_out;
 }
 BOARD_SWD_ATTR void board_swd_dio_input(void) {
-    SWD_PORT->CFGLR = board_swd_cfglr_base | (0x4UL << SWD_DIO_CFGLR_SHIFT);
+    SWD_PORT->CFGLR = board_swd_cfglr_in;
 }
 
 
