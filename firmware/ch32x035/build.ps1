@@ -42,9 +42,9 @@ param(
     [string]$Wchlink = 'n',
 
     # SWD 引脚方案，对应 xmake.lua 的 option("swd_pins")。
-    # pa5_pa7 = 现板（默认，SWDIO 在 PA7）；pa5_pa6 / pa2_pa3 用于 A/B 对照。
+    # pa5_pa6 = 默认（SWDIO 在 PA6，PA7 留给 nRESET）；pa5_pa7 / pa2_pa3 用于 A/B 对照。
     [ValidateSet('pa5_pa7', 'pa5_pa6', 'pa2_pa3')]
-    [string]$SwdPins = 'pa5_pa7',
+    [string]$SwdPins = 'pa5_pa6',
 
     [switch]$Clean,
     [switch]$Reconfigure

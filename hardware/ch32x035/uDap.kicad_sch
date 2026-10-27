@@ -3021,10 +3021,6 @@
 		(uuid "8a3f208c-ba92-4999-8d3e-6f62e90c3f84")
 	)
 	(no_connect
-		(at 127 114.3)
-		(uuid "ca5b048f-94ed-468c-819f-4e9dcb4dab04")
-	)
-	(no_connect
 		(at 127 106.68)
 		(uuid "f5b680af-460a-4c3a-9564-778f68270a82")
 	)
@@ -3837,6 +3833,16 @@
 			(justify left bottom)
 		)
 		(uuid "62339d87-b963-4ca9-ac72-aacb18340ece")
+	)
+	(label "nRST"
+		(at 127 114.3 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "69185823-bfe4-4b92-b6df-ed7fabd52a45")
 	)
 	(label "CC2"
 		(at 82.55 100.33 0)

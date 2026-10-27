@@ -171,21 +171,16 @@ BOARD_SWD_ATTR void board_swd_port_off(void) {
 /*
  * nRESET（目标复位，低电平有效）。
  *
- * 本板原理图（hardware/ch32x035）里 net /NRST 只引到调试排针，MCU 侧没有
- * 连接；而 PA5 已经让给 SWCLK，所以默认**关闭**：
- *   - PIN_nRESET_OUT() 退化为空操作
- *   - DAP_ResetTarget 返回「未执行厂商复位」，主机（OpenOCD / pyOCD）会退回
- *     SWD 的 SYSRESETREQ，仍然能复位目标
+ * 本板已将目标 nRESET 接到 PA7，默认启用；默认 SWD 引脚方案为 PA5(SWCLK)/PA6(SWDIO)。
  *
- * 换板后把 SWD_NRESET_BIT 指向实际引脚、SWD_NRESET_ENABLE 置 1 即可启用。
- * 注意 SWD_NRESET_BIT 的默认值沿用旧板的 PA5，启用前必须改 —— 不改会被下面的
- * 编译期检查挡住（PA5 现在是 SWCLK）。
+ * 选择 pa5_pa7 时 PA7 与 SWDIO 冲突，编译期检查会报错；需将 SWDIO 改到 PA6
+ * （pa5_pa6）或显式关闭 nRESET。SWD_NRESET_BIT 可由构建参数覆盖。
  */
 #ifndef SWD_NRESET_ENABLE
-#define SWD_NRESET_ENABLE 0
+#define SWD_NRESET_ENABLE 1
 #endif
 #ifndef SWD_NRESET_BIT
-#define SWD_NRESET_BIT 5
+#define SWD_NRESET_BIT 7
 #endif
 
 #if SWD_NRESET_ENABLE

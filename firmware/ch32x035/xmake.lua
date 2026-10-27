@@ -89,10 +89,10 @@ option_end()
 -- 用来做 A/B：旧板/旧接线是 PA2(CLK)/PA3(DIO)，现板是 PA5/PA6。
 -- 两个方案各编一份实现时符号带方案后缀，互不冲突。
 option("swd_pins")
-    set_default("pa5_pa7")
+    set_default("pa5_pa6")
     set_values({"pa5_pa7", "pa5_pa6", "pa2_pa3"})
     set_showmenu(true)
-    set_description("SWD pin variant: pa5_pa7 (default), pa5_pa6 or pa2_pa3 (legacy)")
+    set_description("SWD pin variant: pa5_pa6 (default), pa5_pa7 or pa2_pa3 (legacy)")
 option_end()
 
 -- 是否把 WCH-Link（RVSWD）调试器一起编进固件
@@ -125,8 +125,8 @@ target("firmware")
     add_defines("ESIG_SN=" .. (esig_sn_enabled and 1 or 0))
     add_defines("WCHLINK_ENABLE=" .. (wchlink_enabled and 1 or 0))
 
-    -- SWD 引脚方案 -> SWD_PIN_VARIANT（undefined 时 swd_pin_map.h 默认 PA5/PA7）
-    local swd_pins = get_config("swd_pins") or "pa5_pa7"
+    -- SWD 引脚方案 -> SWD_PIN_VARIANT（undefined 时 swd_pin_map.h 默认 PA5/PA6）
+    local swd_pins = get_config("swd_pins") or "pa5_pa6"
     add_defines("SWD_PIN_VARIANT=SWD_PIN_VARIANT_" .. string.upper(swd_pins))
 
     
@@ -275,7 +275,7 @@ target("firmware")
         cprint("${cyan}Using mode:${clear} %s", get_config("mode") or "debug")
         cprint("${cyan}Using toolchain:${clear} %s", toolchain_root)
         cprint("${cyan}Using SDK:${clear} sdk/")
-        cprint("${cyan}SWD pins:${clear} %s", get_config("swd_pins") or "pa5_pa7")
+        cprint("${cyan}SWD pins:${clear} %s", get_config("swd_pins") or "pa5_pa6")
         cprint("${cyan}Debugger:${clear} %s", wchlink_enabled
             and "CMSIS-DAP + WCH-Link (dual mode, hold button at power-up to switch)"
             or "CMSIS-DAP only (--wchlink=y to add WCH-Link)")

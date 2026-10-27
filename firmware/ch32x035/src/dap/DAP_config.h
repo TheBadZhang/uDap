@@ -182,8 +182,8 @@ __STATIC_FORCEINLINE uint32_t PIN_nTRST_IN(void) { return 1U; }
 __STATIC_FORCEINLINE void PIN_nTRST_OUT(uint32_t bit) { (void)bit; }
 
 // nRESET（目标复位，低有效）是否启用由 src/swd_pin_map.h 决定：
-// 本板 /NRST 没有连到 MCU，PA5 又让给了 SWCLK，所以 SWD_NRESET_ENABLE = 0，
-// 三个操作全部退化为空操作（详见该头文件的说明）。
+// 本板目标 nRESET 接到 PA7，默认启用；SWD_NRESET_ENABLE = 0 时，
+// 三个操作退化为空操作。SWDIO 必须使用 PA6，避免与 PA7 复位脚冲突。
 #if SWD_NRESET_ENABLE
 
 // nRESET 在 CFGLR 中占第 SWD_NRESET_CFGLR_SHIFT 起的 4 位（每脚 4 位）
@@ -307,8 +307,8 @@ extern void Delayms(uint32_t delay);
 // 返回 1 表示已实现 —— 主机（OpenOCD / pyocd）执行 reset 时会优先走这里，
 // 而不是只靠 SWJ_Pins 逐次拉线。
 //
-// 本板没有 nRESET 引脚（见 src/swd_pin_map.h），返回 0 = 「未执行厂商复位」，
-// 主机随即退回 SWD 的 SYSRESETREQ，功能上仍能复位目标。
+// 默认通过 PA7 拉低 nRESET 20 ms 后释放；关闭 SWD_NRESET_ENABLE 时返回 0，
+// 主机退回 SWD SYSRESETREQ。
 __STATIC_INLINE uint8_t RESET_TARGET(void) {
 #if SWD_NRESET_ENABLE
     PIN_nRESET_OUT(0U);
