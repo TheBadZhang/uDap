@@ -37,7 +37,7 @@ param(
     [string]$OpenOcdRoot = 'D:\program\wch\MounRiver_Studio2\resources\app\resources\win32\components\WCH\OpenOCD\OpenOCD',
 
     # 固件切到「快路径」的 SWCLK 阈值（kHz），只用于打印标注；
-    # 必须与 src/dap/DAP_config.h 的 DELAY_FAST_CYCLES 保持一致
+    # 必须与 application/dap/DAP_config.h 的 DELAY_FAST_CYCLES 保持一致
     # （阈值 = (24 MHz) / (2 + DELAY_FAST_CYCLES)）
     [double]$FastMinKhz = 6000,
 

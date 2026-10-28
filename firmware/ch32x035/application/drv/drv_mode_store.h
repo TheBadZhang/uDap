@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 
+#include "drv/drv_led.h"
 #include "drv/drv_uart.h"
 
 /*
@@ -18,8 +19,16 @@
  *   Data0 = 调试器模式（firmware_mode_t）
  *           0x00 = CMSIS-DAP，0x01 = WCH-Link
  *           （WCH-Link 不参与编译时该字节仍然保留，不影响已烧录板子的记录）
- *   Data1 = 桥接串口工作模式（drv_uart_mode_t）
- *           0x00 = 串口 1 + DTR/RTS，0x01 = 双串口
+ *   Data1 = 桥接串口模式 + LED 模式（位域）
+ *           bit0    = 串口模式：0 = 串口 1 + DTR/RTS，1 = 双串口
+ *           bit2:1  = LED 模式：0..3（见 drv/drv_led.h 的 drv_led_mode_t）
+ *           bit7:3  = 保留，必须为 0；不满足（例如擦除态 0xFF）就整体当作
+ *                     「从未保存过」，由调用方回退到默认值
+ *
+ * 为什么把 LED 模式和串口模式挤在同一个字节里：用户选择字只有 Data0/Data1
+ * 两个字节可用（其余是读保护 / 写保护 / USER 配置字，动它们风险太大）。
+ * 旧固件写进去的 0x00/0x01 恰好等于「LED 模式 0 + 对应串口模式」，
+ * 所以升级后老板子的记录仍然有效。
  *
  * 读回时要求反码匹配且取值合法，否则视为「从未保存过」，由调用方回退到默认值。
  * 擦除态读回 0xFFFF，反码校验天然失败。
@@ -63,6 +72,12 @@ bool drv_mode_store_save(firmware_mode_t mode);
 // 非法）时返回 false，调用方回退到 DRV_UART_MODE_FLOW。
 bool drv_mode_store_load_uart_mode(drv_uart_mode_t *out_mode);
 
-// 把桥接串口模式写入 Data1，其余选择字（含 Data0）保持不变。
+// 把桥接串口模式写入 Data1（保留同一字节里的 LED 模式位）。
 // 已保存相同值时直接返回 true（不擦写）。
 bool drv_mode_store_save_uart_mode(drv_uart_mode_t mode);
+
+// 从 Data1 的 bit2:1 读取 LED 模式。无效时返回 false（调用方用 DRV_LED_MODE_STATUS）。
+bool drv_mode_store_load_led_mode(drv_led_mode_t *out_mode);
+
+// 把 LED 模式写入 Data1（保留同一字节里的串口模式位）。
+bool drv_mode_store_save_led_mode(drv_led_mode_t mode);

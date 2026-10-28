@@ -24,7 +24,7 @@
 #   - test_bytes 必须是 4 的倍数；被测地址必须在可写 RAM 内。
 #   - SM32F411 的 SRAM 只有 128 KiB (0x20000000..0x20020000)，别超。
 #   - Khz >= FastMinKhz（默认 6000）时固件会切到「快路径」，速度会有明显跳变。
-#     FastMinKhz 要和固件 src/dap/DAP_config.h 的 DELAY_FAST_CYCLES 保持一致：
+#     FastMinKhz 要和固件 application/dap/DAP_config.h 的 DELAY_FAST_CYCLES 保持一致：
 #     阈值 = (24 MHz) / (2 + DELAY_FAST_CYCLES)。
 
 # [CmdletBinding()] 是必需的：没有它时，无法识别的参数（例如误写成
@@ -52,7 +52,7 @@ param(
     [string]$OpenOcdRoot = 'D:\program\wch\MounRiver_Studio2\resources\app\resources\win32\components\WCH\OpenOCD\OpenOCD',
 
     # 固件切到「快路径」的 SWCLK 阈值（kHz），只用于打印标注；
-    # 必须与 src/dap/DAP_config.h 的 DELAY_FAST_CYCLES 保持一致
+    # 必须与 application/dap/DAP_config.h 的 DELAY_FAST_CYCLES 保持一致
     [double]$FastMinKhz = 6000,
 
     [switch]$Raw

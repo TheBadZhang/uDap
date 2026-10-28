@@ -225,9 +225,23 @@ handle_reset:
 /* Enable interrupt nesting and hardware stack */
 	li t0, 0x3
 	csrw 0x804, t0
-/* Enable global interrupt and configure privileged mode */
-   	li t0, 0x88           
-   	csrw mstatus, t0
+/* Enable global interrupt and configure privileged mode
+ *
+ * 默认 0x88：MPP=0 —— `mret` 之后进入**用户模式**（WCH 例程的行为）。
+ * 定义 START_KEEP_MACHINE_MODE 时用 0x1880：MPP=3，留在**机器模式**。
+ *
+ * UF2 bootloader 必须用后者（见 bootloader/xmake 相关的 define）：
+ * 它要把控制权交给应用的 `_start`，而应用入口会重跑本文件里的
+ * `csrw 0xbc0`（CSR 0xB00~0xBFF 是机器模式专用）。如果 bootloader 已经掉到
+ * 用户模式，跳进应用后这条指令直接触发非法指令异常 —— 实测
+ * `mcause=2, mepc=handle_reset+0x80`，表现为「应用一进去就复位」的死循环。
+ */
+#ifdef START_KEEP_MACHINE_MODE
+    li t0, 0x1880
+#else
+    li t0, 0x88
+#endif
+    csrw mstatus, t0
 /* Configure the interrupt vector table recognition mode and entry address mode */
  	la t0, _vector_base
     ori t0, t0, 3           

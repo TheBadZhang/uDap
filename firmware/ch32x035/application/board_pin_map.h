@@ -12,7 +12,9 @@
  *       · 双串口模式：PA2 = USART2_TX（TX2）、PA3 = USART2_RX（RX2）
  *     CH32X035 的 USART2 默认引脚就是 PA2/PA3，无需重映射。
  *   - 模式按键：PB3，一端接 GND，内部上拉，**低电平 = 按下**
- *   - LED：PB11 = DAP 连接指示、PB12 = UART 模式指示，**低电平点亮**
+ *   - LED：PB11 = LED 1、PB12 = LED 2，**低电平点亮**。
+ *     两颗灯的具体含义由 LED 模式决定（见 src/drv/drv_led.h）：
+ *     默认 PB11 = DAP 连接指示、PB12 = 串口模式指示（亮 = 双串口）。
  *   - SWD 调试口：PA5 = SWCLK / PA7 = SWDIO（见 src/swd_pin_map.h）
  *
  * 注意 CH32X035 的 GPIO 配置寄存器分两段：CFGLR 管 pin0..7、CFGHR 管 pin8..15。

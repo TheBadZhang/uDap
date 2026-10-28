@@ -51,7 +51,9 @@ PROVIDE(_stack_size = __stack_size);
 
 MEMORY
 {
-    /* Reserve last 256B for NV settings */
+    /* 双模式固件约 56 KiB，62 KiB Flash 里放不下「UF2 bootloader + 它」
+     * （bootloader 20 KiB），所以双模式**不支持 UF2 拖拽升级**，只能继续用
+     * SWD 烧录，布局保持应用独占 0x0..0xF6FF。见 xmake.lua 的 bootloader 选项。 */
     FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 62K - 256
     RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = 20K
 }

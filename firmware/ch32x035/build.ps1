@@ -1,22 +1,35 @@
-# 构建 ch32x035f8u-dap (uDap) 固件
+﻿# 构建 ch32x035f8u-dap (uDap) 固件
 #
 # 调试器模式：
 #   CMSIS-DAP            固定编入
 #   WCH-Link（RVSWD）    默认**不编入**（省 Flash 与约 6 KiB RAM）；
-#                        传 -Wchlink y 编成双模式固件，上电时按住 PB3 切换。
+#                        传 -Wchlink y 编成双模式固件，运行中双击 PB3 切换。
+#
+# UF2 bootloader：
+#   默认一起构建（同一份 xmake.lua 里的 bootloader target），应用链接到 0x5000，
+#   产物 firmware.uf2 可以直接拖进 bootloader 的 U 盘里升级；
+#   firmware_full.bin 是 bootloader + 应用的合并镜像（整片烧录用）。
+#   双模式固件约 57 KiB，62 KiB Flash 里放不下 20 KiB 的 bootloader，
+#   所以 -Wchlink y 时自动退回「应用从 0x0 起、只走 SWD 烧录」的老布局。
 #
 # 用法:
 #   .\build.ps1               # release 构建（默认用芯片 ESIG UID 作序列号）
-#   .\build.ps1 -Wchlink y    # 把 WCH-Link（RVSWD）也编进去（双模式）
+#   .\build.ps1 -Wchlink y    # 把 WCH-Link（RVSWD）也编进去（双模式，无 UF2）
 #   .\build.ps1 -EsigSn n     # 退回固定串 DEADBEEF（所有板子相同）
 #   .\build.ps1 -SwdPins pa5_pa6   # 换 SWD 引脚方案（A/B 对照用）
+#   .\build.ps1 -Bootloader n # 不要 bootloader（应用从 0x0 起，只走 SWD）
 #   .\build.ps1 -Clean        # 先清理再构建
 #   .\build.ps1 -Mode debug   # debug 构建
 #   .\build.ps1 -Reconfigure  # 强制重新生成配置（工具链路径变化后用）
 #
 # 参数用空格或冒号分隔（-Mode debug 或 -Mode:debug），**不能写 -Mode=debug**。
+# 也可以直接双击/命令行跑 build.bat（参数原样转给本脚本）。
 #
-# 产物: build\<mode>\firmware.elf / .bin / .map
+# 产物（都在 build\<mode>\ 下）:
+#   firmware.elf / .bin / .map
+#   firmware.uf2          （带 bootloader 的布局）
+#   firmware_full.bin     （bootloader + 应用，整片烧录用）
+#   bootloader.elf / .bin / .map   （带 bootloader 的布局）
 
 # [CmdletBinding()] 是必需的：没有它时，无法识别的参数（例如误写成
 # `-Mode=debug`）会被静默收进 $args 并被忽略，脚本照常按默认值构建且不报错
@@ -46,6 +59,12 @@ param(
     [ValidateSet('pa5_pa7', 'pa5_pa6', 'pa2_pa3')]
     [string]$SwdPins = 'pa5_pa6',
 
+    # 是否按「UF2 bootloader 布局」构建应用（应用从 0x5000 起），对应
+    # xmake.lua 的 option("bootloader")。它同时决定是否构建 bootloader target。
+    # 双模式固件会自动忽略它。
+    [ValidateSet('y', 'n')]
+    [string]$Bootloader = 'y',
+
     [switch]$Clean,
     [switch]$Reconfigure
 )
@@ -66,10 +85,23 @@ foreach ($candidate in @(
 
 Push-Location $PSScriptRoot
 try {
+    # 双模式固件（约 57 KiB）放不下 20 KiB 的 bootloader，xmake 里也会自动关掉；
+    # 这里先算出来，好让打印的布局与实际一致。
+    $useBootloader = ($Bootloader -eq 'y') -and ($Wchlink -ne 'y')
+
     $snLabel = if ($EsigSn -eq 'y') { '芯片 ESIG UID（每颗唯一）' } else { '固定 DEADBEEF' }
-    $dbgLabel = if ($Wchlink -eq 'y') { '双模式（CMSIS-DAP + WCH-Link，上电按住 PB3 切换）' } else { 'CMSIS-DAP only（-Wchlink y 可加编 WCH-Link）' }
+    $dbgLabel = if ($Wchlink -eq 'y') { '双模式（CMSIS-DAP + WCH-Link，运行中双击 PB3 切换）' } else { 'CMSIS-DAP only（-Wchlink y 可加编 WCH-Link）' }
+    $layoutLabel = if ($useBootloader) {
+        'UF2 bootloader @0x0 + 应用 @0x5000（可拖 firmware.uf2 升级）'
+    } elseif ($Wchlink -eq 'y') {
+        '应用 @0x0（双模式固件放不下 bootloader，只走 SWD 烧录）'
+    } else {
+        '应用 @0x0（不带 bootloader，只走 SWD 烧录）'
+    }
+
     Write-Host "工具链   : $env:WCH_TOOLCHAIN_ROOT" -ForegroundColor DarkGray
     Write-Host "调试器   : $dbgLabel" -ForegroundColor Yellow
+    Write-Host "布局     : $layoutLabel" -ForegroundColor Yellow
     Write-Host "SWD 引脚 : $SwdPins" -ForegroundColor DarkGray
     Write-Host "序列号   : $snLabel (-EsigSn $EsigSn)" -ForegroundColor DarkGray
 
@@ -81,8 +113,12 @@ try {
 
     # -P 指定本目录为工程根：仓库根目录也有一个只含 task 的 xmake.lua，
     # 不指定时 xmake 会向上找到它，导致找不到 --esig_sn 等本工程选项。
+    #
+    # 应用与 bootloader 现在**同一个工程**（本目录的 xmake.lua 里两个 target），
+    # 所以这里只配置/构建一次，xmake 会把 bootloader 排在前、firmware 排在后。
     $configArgs = @('f', '-P', $PSScriptRoot, '-m', $Mode, "--esig_sn=$EsigSn",
-                    "--wchlink=$Wchlink", "--swd_pins=$SwdPins", '-y')
+                    "--wchlink=$Wchlink", "--swd_pins=$SwdPins",
+                    "--bootloader=$Bootloader", '-y')
     if ($Reconfigure) { $configArgs += '-c' }
     Write-Host "==> xmake $($configArgs -join ' ')" -ForegroundColor Cyan
     & xmake @configArgs
@@ -92,8 +128,57 @@ try {
     xmake -r -P $PSScriptRoot
     if ($LASTEXITCODE -ne 0) { throw 'xmake 构建失败' }
 
+    # ===== 合并镜像：bootloader(0x0) + 应用(0x5000) =====
+    #
+    # 用途：没有调试器（RVSWD/WCH-Link 烧不了）时，用「整片烧录」的方式一次写进去。
+    # 常见工具都接受「一个 bin + 起始地址 0x0」：
+    #   * WCH 芯片自带的 BOOT 区（USB ISP）：WCHISPTool / wchisp，见 .\flash_isp.ps1
+    #   * 任何 SWD/SDI 调试器（WCH-Link、J-Link、DAPLink…）
+    if ($useBootloader) {
+        $bootBin = Join-Path $PSScriptRoot "build\$Mode\bootloader.bin"
+        $appBin = Join-Path $PSScriptRoot "build\$Mode\firmware.bin"
+
+        if ((Test-Path $bootBin) -and (Test-Path $appBin)) {
+            $boot = [System.IO.File]::ReadAllBytes($bootBin)
+            $app = [System.IO.File]::ReadAllBytes($appBin)
+            if ($boot.Length -gt 0x5000) {
+                throw "bootloader.bin 有 $($boot.Length) 字节，超过 20 KiB 的 bootloader 区"
+            }
+
+            $full = New-Object byte[] (0x5000 + $app.Length)
+            [Array]::Fill($full, [byte]0xFF)
+            [Array]::Copy($boot, 0, $full, 0, $boot.Length)
+            [Array]::Copy($app, 0, $full, 0x5000, $app.Length)
+
+            $fullPath = Join-Path $PSScriptRoot "build\$Mode\firmware_full.bin"
+            [System.IO.File]::WriteAllBytes($fullPath, $full)
+            Write-Host ''
+            Write-Host ("合并镜像: {0}（{1} 字节 = bootloader {2} + 应用 {3}）" -f `
+                    $fullPath, $full.Length, $boot.Length, $app.Length) -ForegroundColor Green
+            Write-Host '  手动整片烧录（不用调试器）: .\flash_isp.ps1' -ForegroundColor Green
+        } else {
+            Write-Host '跳过合并镜像：bootloader.bin 或 firmware.bin 不存在' -ForegroundColor Yellow
+        }
+    }
+
     Write-Host ''
-    Get-ChildItem "build\$Mode\firmware.*" | Select-Object Name, Length, LastWriteTime
+    Write-Host "产物（build\$Mode\）:" -ForegroundColor Cyan
+    $artifacts = @('bootloader.elf', 'bootloader.bin', 'bootloader.map',
+                   'firmware.elf', 'firmware.bin', 'firmware.map', 'firmware.uf2',
+                   'firmware_full.bin')
+    foreach ($name in $artifacts) {
+        $path = Join-Path $PSScriptRoot "build\$Mode\$name"
+        if (Test-Path $path) {
+            Write-Host ("  {0,-18} {1,9} B" -f $name, (Get-Item $path).Length)
+        }
+    }
+
+    if ($useBootloader) {
+        Write-Host ''
+        Write-Host '升级：上电时按住 PB3 约 1.2 s 进入 UF2，把 firmware.uf2 拖进 U 盘即可。' -ForegroundColor Green
+        Write-Host '首次烧录（有 WCH-Link / SDI）: .\flash.ps1' -ForegroundColor Green
+        Write-Host '首次烧录（没有调试器，走芯片自带 USB ISP）: .\flash_isp.ps1' -ForegroundColor Green
+    }
 }
 finally {
     Pop-Location

@@ -12,8 +12,6 @@ static bool s_click_pending;
 static uint32_t s_click_at_ms;
 static bool s_double_click;
 
-static bool s_boot_held;
-
 static bool mode_button_raw_pressed(void) {
 #if DRV_MODE_BUTTON_ACTIVE_LOW
     return (DRV_MODE_BUTTON_PORT->INDR & DRV_MODE_BUTTON_PIN) == 0u;
@@ -24,8 +22,6 @@ static bool mode_button_raw_pressed(void) {
 
 void drv_mode_button_init(void) {
     GPIO_InitTypeDef gpio = {0};
-    bool held = true;
-    uint32_t i;
 
     RCC_APB2PeriphClockCmd(DRV_MODE_BUTTON_CLK, ENABLE);
 
@@ -33,16 +29,6 @@ void drv_mode_button_init(void) {
     gpio.GPIO_Speed = GPIO_Speed_50MHz;
     gpio.GPIO_Mode = GPIO_Mode_IPU;
     GPIO_Init(DRV_MODE_BUTTON_PORT, &gpio);
-
-    // 「上电时按住」的判定：连续采样约 20 ms 都保持按下才算数。
-    // 上电瞬间的接触抖动/电源爬升会被这几次采样滤掉，避免误切调试器模式。
-    for (i = 0u; i < 4u; ++i) {
-        bsp_delay_ms(5u);
-        if (!mode_button_raw_pressed()) {
-            held = false;
-        }
-    }
-    s_boot_held = held;
 
     // 初始就采一次真实电平：否则上电时 s_stable 的默认值会在第一次轮询里
     // 被当成"刚变化"，白白等一个去抖窗口
@@ -96,13 +82,4 @@ bool drv_mode_button_take_double_click(void) {
 
     s_double_click = false;
     return click;
-}
-
-bool drv_mode_button_held_at_boot(void) {
-    return s_boot_held;
-}
-
-void drv_mode_button_wait_release(void) {
-    while (drv_mode_button_pressed()) {
-    }
 }

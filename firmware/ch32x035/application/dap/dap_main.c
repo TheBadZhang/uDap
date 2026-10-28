@@ -1,5 +1,6 @@
 #include "dap_main.h"
 
+#include "drv/drv_led.h"
 #include "drv/drv_uart.h"
 
 // 序列号来源（xmake 的 option("esig_sn") -> -DESIG_SN=0/1）。
@@ -622,6 +623,9 @@ static void cdc1_bridge(void) {
         return;
     }
 
+    // 串口有数据 -> 活动指示灯（具体亮不亮由 LED 模式决定，见 drv/drv_led.h）
+    drv_led_pulse_uart(1u);
+
     cdc_tx_busy = 1U;
     if (usbd_ep_start_write(0, CDC_IN_EP, cdc_in_buffer, length) < 0) {
         cdc_tx_busy = 0U;
@@ -650,6 +654,8 @@ static void cdc2_bridge(void) {
     if (length == 0U) {
         return;
     }
+
+    drv_led_pulse_uart(2u);
 
     cdc2_tx_busy = 1U;
     if (usbd_ep_start_write(0, CDC2_IN_EP, cdc2_in_buffer, length) < 0) {
@@ -749,6 +755,9 @@ void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes) {
     // 走背压路径时本包必然放得下，故不会丢；若仍发生部分写入，
     // 说明有非预期的重入，会被 drv_uart_tx_overflow_count() 记下来。
     drv_uart_write(cdc_out_buffer, nbytes);
+    if (nbytes != 0u) {
+        drv_led_pulse_uart(1u);
+    }
 
     // **背压**：只有 FIFO 除本包外还能再容一整包时才立刻重挂端点。
     // 余量不足就不重挂 —— 主机侧 bulk 写会一直被 NAK，于是它自然阻塞在
@@ -789,6 +798,9 @@ void usbd_cdc_acm2_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes) {
     }
 
     drv_uart2_write(cdc2_out_buffer, nbytes);
+    if (nbytes != 0u) {
+        drv_led_pulse_uart(2u);
+    }
 
     if (drv_uart2_tx_free() >= CDC_OUT_BUFFER_SIZE) {
         usbd_ep_start_read(0, CDC2_OUT_EP, cdc2_out_buffer, sizeof(cdc2_out_buffer));

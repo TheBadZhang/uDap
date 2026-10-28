@@ -14,6 +14,7 @@
 
 #include "board_pin_map.h"
 #include "swd_pin_map.h"
+#include "drv/drv_led.h"
 #include "drv/drv_mode_store.h"
 
 // ===========================================================================
@@ -23,7 +24,7 @@
 //   PA2 = DTR / PA3 = RTS（低有效输出）
 //   drv_uart.c       COM1：USART4（PB0 / PB1）
 //   COM2：USART2（PA2 / PA3，仅双串口模式）
-//   串口模式切换 + PB12 指示灯 + 选项字持久化
+//   串口模式切换 + 选项字持久化
 //   CDC ACM 行编码 / DTR / RTS 回调
 //
 // 合并的理由：这几块共用同一组引脚（PA2/PA3）、同一套 DMA 引擎、同一份
@@ -783,48 +784,14 @@ void DMA1_Channel6_IRQHandler(void) {
 
 
 // ===========================================================================
-// 第 5 节：串口工作模式（单串口+DTR/RTS <-> 双串口）+ PB12 指示
+// 第 5 节：串口工作模式（单串口+DTR/RTS <-> 双串口）
 // ===========================================================================
+// 状态灯不在这里驱动：PB12 的语义随 LED 模式变化（见 src/drv/drv_led.h），
+// 这里只把「当前是不是双串口」告诉 drv_led。
 
 static drv_uart_mode_t s_mode = DRV_UART_MODE_FLOW;
 
-// PB12 是 pin12 -> CFGHR，走 GPIO_Init（SDK 对 CFGHR 有静态缓存，裸写会让缓存
-// 失步，详见 board_pin_map.h 的说明）
-static void uart_mode_led_init(void) {
-    GPIO_InitTypeDef gpio = {0};
-
-    RCC_APB2PeriphClockCmd(BOARD_LED_PORT_CLK, ENABLE);
-
-    // 先把输出数据摆成「灭」再切输出，避免初始化瞬间闪一下
-#if BOARD_LED_ACTIVE_LOW
-    BOARD_LED_PORT->BSHR = BOARD_LED_UART_PIN;
-#else
-    BOARD_LED_PORT->BCR = BOARD_LED_UART_PIN;
-#endif
-
-    gpio.GPIO_Pin = BOARD_LED_UART_PIN;
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;
-    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
-    GPIO_Init(BOARD_LED_PORT, &gpio);
-}
-
-static void uart_mode_led_set(bool on) {
-#if BOARD_LED_ACTIVE_LOW
-    if (on) {
-        BOARD_LED_PORT->BCR = BOARD_LED_UART_PIN;
-    } else {
-        BOARD_LED_PORT->BSHR = BOARD_LED_UART_PIN;
-    }
-#else
-    if (on) {
-        BOARD_LED_PORT->BSHR = BOARD_LED_UART_PIN;
-    } else {
-        BOARD_LED_PORT->BCR = BOARD_LED_UART_PIN;
-    }
-#endif
-}
-
-// 把 PA2/PA3 交给对应功能，并同步指示灯。
+// 把 PA2/PA3 交给对应功能，并同步「双串口」状态给 LED 模块。
 // 两个分支都先让「下一个使用者」之外的功能退场，避免两边抢同一组 CFGLR 位。
 static void uart_mode_apply(drv_uart_mode_t mode) {
     if (mode == DRV_UART_MODE_DUAL) {
@@ -836,16 +803,21 @@ static void uart_mode_apply(drv_uart_mode_t mode) {
     }
 
     s_mode = mode;
-    uart_mode_led_set(mode == DRV_UART_MODE_DUAL);
+    drv_led_set_uart_dual(mode == DRV_UART_MODE_DUAL);
 }
 
 void drv_uart_mode_init(void) {
     drv_uart_mode_t mode = DRV_UART_MODE_FLOW;
 
-    uart_mode_led_init();
-
+#if WCHLINK_ENABLE
+    // 双模式固件（CMSIS-DAP + WCH-Link）串口固定为「单串口 + DTR/RTS」：
+    //   * 那个构建的 RAM 只剩一百多字节余量，双串口不值得再占；
+    //   * 切换串口模式的手势（双击 PB3）已经让给调试器模式切换（见 src/main.c）。
+    // 选项字里的历史记录不再影响它。
+#else
     // 选项字里的记录无效（全新芯片 / 擦除态 / 校验失败）时保持默认的 DTR/RTS 模式
     (void)drv_mode_store_load_uart_mode(&mode);
+#endif
 
     // uart_mode_apply 内部保证：接管 DTR/RTS 时先摆成「未断言」（高）再切输出，
     // 所以上电不会把目标摁进复位
@@ -860,19 +832,28 @@ bool drv_uart_mode_is_dual(void) {
     return s_mode == DRV_UART_MODE_DUAL;
 }
 
-void drv_uart_mode_toggle(void) {
-    drv_uart_mode_t next = (s_mode == DRV_UART_MODE_DUAL) ? DRV_UART_MODE_FLOW : DRV_UART_MODE_DUAL;
+bool drv_uart_mode_set(drv_uart_mode_t mode) {
+    if ((uint32_t)mode >= (uint32_t)DRV_UART_MODE_COUNT) {
+        return false;
+    }
 
-    uart_mode_apply(next);
+    uart_mode_apply(mode);
 
     // 只影响持久化，失败也保持刚切过去的模式
-    (void)drv_mode_store_save_uart_mode(next);
+    (void)drv_mode_store_save_uart_mode(mode);
 
     // 必须在写选项字**之后**：擦整页要几十毫秒，期间 CPU 停在 Flash 编程上，
     // 两路 RX 的 DMA 都在自己绕圈，计数基准会失真。这里重新对齐
     // （在途字节会计入丢失），否则之后读到的数据位置会错。
     drv_uart_rx_resync();
     drv_uart2_rx_resync();
+    return true;
+}
+
+void drv_uart_mode_toggle(void) {
+    drv_uart_mode_t next = (s_mode == DRV_UART_MODE_DUAL) ? DRV_UART_MODE_FLOW : DRV_UART_MODE_DUAL;
+
+    (void)drv_uart_mode_set(next);
 }
 
 

@@ -1,6 +1,32 @@
--- 工程与全局策略
+-- uDap CH32X035F8U6：**应用固件 + UF2 bootloader 的统一构建入口**
+--
+-- 两个 target 放在同一个工程里（不再有 bootloader/xmake.lua 那种「自成一家」）：
+--
+--   target("bootloader")  Flash 0x0000..0x4FFF（20 KiB），只做 UF2 拖拽升级
+--   target("firmware")    应用；带 bootloader 布局时链接到 0x5000
+--
+-- 两者共用同一套工具链/编译选项/SDK，只有链接脚本、需要的 CherryUSB 类
+-- （bootloader 只要 MSC）和入口代码不同，所以放在一个文件里更好对照。
+--
+-- 用法:
+--   xmake f -P . -m release --esig_sn=y --wchlink=n --swd_pins=pa5_pa6 --bootloader=y -y
+--   xmake -P . -r                  # 两个 target 都编（bootloader 在前）
+--   xmake -P . -r firmware         # 只编应用
+--   xmake -P . -r bootloader       # 只编 bootloader（默认布局下才存在）
+--
+-- 注意 `-P .` 不能省：仓库根目录也有一个只含 task 的 xmake.lua，不给 -P 时
+-- xmake 会认成那个工程（报 not a valid target name）。
+--
+-- 一般直接用上层脚本（它还会把 bootloader + 应用合并成 firmware_full.bin 并生成
+-- firmware.uf2）：
+--   .\build.ps1     或     build.bat
+--
+-- 产物（都在 build\<mode>\ 下）：
+--   firmware.elf / .bin / .map / .uf2
+--   bootloader.elf / .bin / .map
+
 set_project("ch32x035f8u-dap")
-set_version("0.1.0")
+set_version("1.3.0")
 set_xmakever("2.9.8")
 set_policy("build.release.strip", false)
 
@@ -10,9 +36,26 @@ add_rules("plugin.compile_commands.autoupdate", {outputdir = ".vscode"})
 includes("toolchains/wch-riscv/xmake.lua")
 
 local arch_flags = {"-march=rv32imacxw", "-mabi=ilp32", "-msmall-data-limit=8", "-mno-save-restore"}
-local startup_file = "sdk/Startup/startup_ch32x035_highcode.S"
 
--- 构建后统计输出用的辅助函数
+local app_src = "application"
+local sdk = "sdk"
+local third_party = "../third_party"
+
+-- CherryDAP 里的 UF2 / 虚拟 FAT16 实现（Apache-2.0），bootloader 复用它的读路径
+local cherrydap_bootuf2 = third_party .. "/cherrydap/projects/HSLink-Pro/bootloader/bootuf2"
+
+local esig_sn_enabled = has_config("esig_sn")
+local wchlink_enabled = has_config("wchlink")
+-- 双模式固件（约 57 KiB）放不下 20 KiB 的 bootloader，只能退回应用独占 Flash
+local use_bootloader = has_config("bootloader") and not wchlink_enabled
+
+local function format_size(bytes)
+    if bytes >= 1024 then
+        return string.format("%.2f KiB (%d bytes)", bytes / 1024.0, bytes)
+    end
+    return string.format("%d bytes", bytes)
+end
+
 local function parse_berkeley_size(size_output)
     for line in size_output:gmatch("[^\r\n]+") do
         local text, data, bss = line:match("^%s*(%d+)%s+(%d+)%s+(%d+)%s+%d+%s+%x+%s+")
@@ -50,44 +93,69 @@ local function sum_section_sizes(sections, names)
     return total
 end
 
-local function format_size(bytes)
-    if bytes >= 1024 then
-        return string.format("%.2f KiB (%d bytes)", bytes / 1024.0, bytes)
-    end
-    return string.format("%d bytes", bytes)
-end
-
 local function print_memory_summary(size_info)
     print(string.format("Flash used: %s", format_size(size_info.text + size_info.data)))
     print(string.format("RAM   used: %s", format_size(size_info.ram)))
 end
 
--- 调试器功能：CMSIS-DAP（CherryDAP + src/dap、src/drv glue）**固定编入**；
--- WCH-Link（RVSWD 目标调试 / Flash 烧录，见 src/wchlink）**可选**。
+-- 两个 target 共用的编译/汇编选项
+local function add_shared_flags(extra_cxflags)
+    local cxflags = {
+        "-D__PACKED=__attribute__((packed))",
+        "-fmessage-length=0",
+        "-fsigned-char",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fno-common",
+        "-Wno-comment",
+        "-Wno-unused-parameter",
+        "-Wno-missing-prototypes"
+    }
+    for _, flag in ipairs(extra_cxflags or {}) do
+        table.insert(cxflags, flag)
+    end
+
+    add_cxflags(table.join(arch_flags, cxflags), {force = true})
+    add_asflags(table.join(arch_flags, {
+                   "-ffunction-sections",
+                   "-fdata-sections"}), {force = true})
+
+    -- 空间都很紧：debug/release 都用 -Os + LTO
+    --   * release：-O3 会把整条 USB 调用链内联进 .highcode，Flash/RAM 都装不下；
+    --   * debug：-Og/-O0 装不进 Flash，所以也只加调试符号。
+    if is_mode("debug") then
+        set_symbols("debug")
+    else
+        set_symbols("hidden")
+    end
+    set_optimize("smallest")
+    add_cxflags("-flto", {force = true})
+end
+
+local function add_map_file_hook()
+    before_link(function (target)
+        local mapfile = path.join(target:targetdir(), target:basename() .. ".map")
+        target:add("ldflags", "-Wl,-Map=" .. mapfile, {force = true})
+    end)
+end
+
+-- ===========================================================================
+-- 调试器功能：CMSIS-DAP（固定编入）+ WCH-Link（可选）
+-- ===========================================================================
+-- 默认只编 CMSIS-DAP：WCH-Link 的代码占数 KiB Flash、数据占约 6 KiB RAM（overlay
+-- 段），把这两样省下来才能放得下双串口（第二个 CDC + USART2 + 两路 FIFO）。
 --
--- 默认只编 CMSIS-DAP：WCH-Link 平时用不到，但它的代码占掉数 KiB Flash、
--- 数据占掉约 6 KiB RAM（overlay 段），把这两样省下来才能放得下双串口
--- （第二个 CDC + USART2 + 两路 FIFO）。
---
--- 传 --wchlink=y 得到「双模式」固件：两套调试器同编一份，上电时按住 PB3
--- 切到另一种（见 src/main.c），两套私有数据共用同一段 RAM（overlay，见
--- src/mode_overlay.h 与 sdk/Ld/Link_highcode_nv_256B_dual.ld）。
--- USB 本身不可关：本芯片必然用到 USB。
+-- 传 --wchlink=y 得到「双模式」固件：两套调试器同编一份，运行中双击 PB3 切换
+-- （见 src/main.c）。这种构建放不下 bootloader，自动退回应用 @0x0。
 
 -- 用芯片出厂 UID（ESIG 区，96 位、每颗唯一）作为 CMSIS-DAP 的 USB 序列号。
--- **默认开启**：只有每颗芯片唯一，多块板子同时插在一台机器上才能区分。
--- 传 --esig_sn=n 退回固定的 "DEADBEEF"（所有板子相同，无法区分）。
--- 寄存器定义见 CH32X035 应用手册第 19 章「电子签名（ESIG）」。
--- 序列号在 src/dap/dap_main.c 里设置。
 option("esig_sn")
     set_default(true)
     set_showmenu(true)
     set_description("Use the chip ESIG UID (96-bit, unique per chip) as the USB serial number")
 option_end()
 
--- SWD 引脚方案（对应 src/swd_pin_map.h 的 SWD_PIN_VARIANT）。
--- 用来做 A/B：旧板/旧接线是 PA2(CLK)/PA3(DIO)，现板是 PA5/PA6。
--- 两个方案各编一份实现时符号带方案后缀，互不冲突。
+-- SWD 引脚方案（对应 src/swd_pin_map.h 的 SWD_PIN_VARIANT）
 option("swd_pins")
     set_default("pa5_pa6")
     set_values({"pa5_pa7", "pa5_pa6", "pa2_pa3"})
@@ -99,11 +167,138 @@ option_end()
 option("wchlink")
     set_default(false)
     set_showmenu(true)
-    set_description("Also build the WCH-Link (RVSWD) debugger mode (dual-mode firmware, costs ~6 KiB RAM)")
+    set_description("Also build the WCH-Link (RVSWD) debugger mode (dual-mode firmware, ~6 KiB RAM)")
 option_end()
 
+-- 是否按「UF2 bootloader 布局」构建（应用从 0x5000 起 + 同时构建 bootloader）
+option("bootloader")
+    set_default(true)
+    set_showmenu(true)
+    set_description("Build the UF2 bootloader and put the app at 0x5000 (auto-disabled with --wchlink=y)")
+option_end()
+
+-- ===========================================================================
+-- target: bootloader（0x0000..0x4FFF）
+-- ===========================================================================
+if use_bootloader then
+    target("bootloader")
+        set_plat("cross")
+        set_arch("riscv")
+        set_kind("binary")
+        set_languages("gnu11")
+        set_toolchains("wch-riscv")
+        set_warnings("all")
+        set_targetdir("build/$(mode)")
+        set_filename("bootloader.elf")
+
+        -- bootloader 自己的源码
+        add_files("bootloader/src/*.c")
+
+        -- 与应用共用的启动握手区（src/boot_info.h）在这里必须真的读写那块 RAM；
+        -- 不定义这个宏时头文件里的访问会编译成空操作。
+        add_defines("UDAP_UF2_BOOTLOADER=1")
+
+        -- 复用的应用侧公共源码。
+        -- 不取 src/system_ch32x035.c：bootloader 用自己的最小 SystemInit
+        -- （bootloader/src/boot_system.c），省掉 400 B 的 GPIO_IPD_Unused。
+        add_files(app_src .. "/ch32x035_it.c",
+                  app_src .. "/bsp/bsp_delay.c",
+                  app_src .. "/bsp/bsp_print.c",
+                  app_src .. "/bsp/bsp_uid.c",
+                  app_src .. "/bsp/bsp_usb.c",
+                  app_src .. "/port/usb_ch32x035_dc_usbfs.c")
+
+        -- CH32X035 SDK（与应用一样排除 sdk/Debug/debug.c，它自带 _write/_sbrk）
+        add_files(sdk .. "/Startup/startup_ch32x035_highcode.S",
+                  sdk .. "/Core/*.c",
+                  sdk .. "/Peripheral/src/*.c")
+
+        -- CherryUSB：核心 + MSC 类（bootloader 只有 U 盘）
+        add_files(third_party .. "/cherryusb/core/usbd_core.c",
+                  third_party .. "/cherryusb/class/msc/usbd_msc.c")
+
+        -- UF2 解析 + 虚拟 FAT16（CherryDAP 子模块）
+        -- 只复用它的**读**路径（DBR/FAT/目录）。上游那份写路径不复用：状态无法复位、
+        -- 块号上限判断还会越界写位图（见 bootloader/src/boot_uf2.c 的说明）。
+        -- 这里在编译期改名，避免和我们的 boot_uf2_write_sector() 撞符号。
+        add_files(cherrydap_bootuf2 .. "/bootuf2.c",
+                  {defines = {"bootuf2_write_sector=bootuf2_write_sector_unused"}})
+
+        -- 头文件搜索路径。**顺序有意义**：bootloader/src 必须排在最前，
+        -- 它提供自己的 usb_config.h / bootuf2_config.h。
+        add_includedirs("bootloader/src", app_src, cherrydap_bootuf2, {public = true})
+        add_includedirs(third_party .. "/uf2", {public = true})
+        add_sysincludedirs(sdk .. "/Core", sdk .. "/Peripheral/inc", sdk .. "/Debug",
+                           third_party .. "/cherryusb/core",
+                           third_party .. "/cherryusb/common",
+                           third_party .. "/cherryusb/class/msc")
+
+        add_shared_flags({"-Wno-discarded-qualifiers"})
+
+        -- bootloader 必须留在**机器模式**：它要跳进应用的 _start，而应用入口会
+        -- 重跑 `csrw 0xbc0`（机器模式专用 CSR）。若 bootloader 的 startup 已按
+        -- WCH 默认 (mstatus=0x88) 掉进用户模式，跳转后那条指令就是非法指令
+        -- （实测 mcause=2 @handle_reset+0x80 → 无限复位）。见 startup 里的注释。
+        add_asflags("-DSTART_KEEP_MACHINE_MODE", {force = true})
+        add_ldflags(table.join(arch_flags, {
+                       "-ffunction-sections",
+                       "-fdata-sections",
+                       "--specs=nano.specs",
+                       "--specs=nosys.specs",
+                       "-nostartfiles",
+                       "-Wl,-T" .. path.join("bootloader", "ld", "Link_bootloader.ld"),
+                       "-Wl,--gc-sections"}), {force = true})
+        add_ldflags("-flto", {force = true})
+
+        add_map_file_hook()
+
+        before_build(function (target)
+            local required = {"bootloader/src/main.c",
+                              "bootloader/src/boot_config.h",
+                              "bootloader/src/boot_flash.c",
+                              "bootloader/src/boot_log.c",
+                              "bootloader/src/boot_uf2.c",
+                              "bootloader/src/boot_usb.c",
+                              "bootloader/ld/Link_bootloader.ld"}
+            for _, req in ipairs(required) do
+                if not os.isfile(req) then
+                    raise("missing required source: " .. req)
+                end
+            end
+            cprint("${cyan}bootloader:${clear} 20 KiB @0x0000 (UF2 drag-and-drop)")
+        end)
+
+        after_build(function (target)
+            local toolchain = assert(target:toolchain("wch-riscv"))
+            local prefix = toolchain:get("gcc_prefix")
+            local targetfile = target:targetfile()
+            local bindir = target:targetdir()
+            local binfile = path.join(bindir, "bootloader.bin")
+
+            os.execv(prefix .. "objcopy", {"-O", "binary", targetfile, binfile})
+
+            -- 链接脚本里 FLASH 只有 20 KiB，超了 ld 会直接报错；这里再按 .bin
+            -- 实际长度兜底检查一次（.bin 更接近真实占用）。
+            local binsize = os.filesize(binfile)
+            if binsize > 0x5000 then
+                raise(string.format("bootloader.bin is %d B, exceeds the 20 KiB bootloader region",
+                                    binsize))
+            end
+            print(string.format("Bootloader size: %d B / 20480 B (%.1f%% free)",
+                                binsize, 100.0 * (20480 - binsize) / 20480.0))
+        end)
+
+        after_clean(function (target)
+            local bindir = target:targetdir()
+            os.rm(path.join(bindir, "bootloader.bin"))
+            os.rm(path.join(bindir, target:basename() .. ".map"))
+        end)
+end
+
+-- ===========================================================================
+-- target: firmware（应用）
+-- ===========================================================================
 target("firmware")
-    -- 目标属性
     set_plat("cross")
     set_arch("riscv")
     set_kind("binary")
@@ -113,68 +308,77 @@ target("firmware")
     set_targetdir("build/$(mode)")
     set_filename("firmware.elf")
 
-    local esig_sn_enabled = has_config("esig_sn")
-    local wchlink_enabled = has_config("wchlink")
+    -- 先编 bootloader：上层脚本要在 build 结束后把两者合并成 firmware_full.bin
+    -- （order = true 只保证顺序，不做链接依赖）
+    if use_bootloader then
+        add_deps("bootloader", {order = true})
+    end
 
-    -- 本工程应用代码
-    -- src/*.c        系统初始化、中断、main（调试器模式：CMSIS-DAP [+ WCH-Link]）
-    -- src/bsp/*.c    延时/打印/系统/USB 硬件初始化/UID
-    -- src/port/*.c   CherryUSB 的 CH32X035 设备端口 glue
-    add_files("src/*.c", "src/bsp/*.c", "src/port/*.c")
-    add_includedirs("src", "src/port")
+    -- 应用代码（源码都在 application/ 下，链接脚本在 application/ld/）
+    -- application/*.c        系统初始化、中断、main（调试器模式：CMSIS-DAP [+ WCH-Link]）
+    -- application/bsp/*.c    延时/打印/系统/USB 硬件初始化/UID
+    -- application/port/*.c   CherryUSB 的 CH32X035 设备端口 glue
+    add_files(app_src .. "/*.c", app_src .. "/bsp/*.c", app_src .. "/port/*.c")
+    add_includedirs(app_src, app_src .. "/port")
     add_defines("ESIG_SN=" .. (esig_sn_enabled and 1 or 0))
     add_defines("WCHLINK_ENABLE=" .. (wchlink_enabled and 1 or 0))
+    add_defines("UDAP_UF2_BOOTLOADER=" .. (use_bootloader and 1 or 0))
 
-    -- SWD 引脚方案 -> SWD_PIN_VARIANT（undefined 时 swd_pin_map.h 默认 PA5/PA6）
+    -- SWD 引脚方案 -> SWD_PIN_VARIANT
     local swd_pins = get_config("swd_pins") or "pa5_pa6"
     add_defines("SWD_PIN_VARIANT=SWD_PIN_VARIANT_" .. string.upper(swd_pins))
 
-    
-    -- 串口驱动（全部串口相关代码都在这一对文件里，见 src/drv/drv_uart.h 的说明）
-    --   COM1  <-> USART4 (PB0/PB1)          两模式都可用
-    --   COM2  <-> USART2 (PA2/PA3)          仅双串口模式
+    -- 串口驱动（全部串口相关代码都在这一对文件里，见 application/drv/drv_uart.h 的说明）
+    --   COM1 <-> USART4 (PB0/PB1)     两模式都可用
+    --   COM2 <-> USART2 (PA2/PA3)     仅双串口模式
     --   PA2/PA3 在单串口模式下是 DTR / RTS（低有效）
     --   两路 RX 都走 DMA（USART4=Ch8、USART2=Ch6），TX 用 TXE 中断
-    --   还包含：串口模式切换 + PB12 指示灯 + 选项字持久化 + CDC 行编码回调
-    -- （usbd_cdc_acm_* 回调由两种调试器模式**共用**；不共用的话双模式固件会撞成
-    --   重复符号，因为两个模式各定义一份。）
-    add_files("src/drv/drv_uart.c")
+    --   （usbd_cdc_acm_* 回调由两种调试器模式共用，所以放在这里而不是各模式目录）
+    add_files(app_src .. "/drv/drv_uart.c")
     add_sysincludedirs("../third_party/cherryrb")
     add_files("../third_party/cherryrb/chry_ringbuffer.c")
 
-    -- 模式按键（上电按住切调试器模式 / 双击切串口模式）+ 把模式持久化到用户选择字
-    add_files("src/drv/drv_mode_button.c", "src/drv/drv_mode_store.c")
+    -- 状态灯（PB11/PB12 的用途由 LED 模式决定，见 application/drv/drv_led.h）
+    add_files(app_src .. "/drv/drv_led.c")
+
+    -- 应用侧控制（vendor command 的延迟动作：切串口模式后重新枚举、进 UF2、复位）
+    add_files(app_src .. "/drv/drv_control.c")
+
+    -- 模式按键（双击切模式）+ 把模式持久化到用户选择字
+    add_files(app_src .. "/drv/drv_mode_button.c", app_src .. "/drv/drv_mode_store.c")
 
     -- CMSIS-DAP 专有的应用 glue
-    add_files("src/dap/*.c")
-    add_includedirs("src/dap")
+    add_files(app_src .. "/dap/*.c")
+    add_includedirs(app_src .. "/dap")
 
-    -- 链接脚本：
-    --   --wchlink=y  双模式，带 OVERLAY 段（两套私有数据共用同一段 RAM 地址）
-    --   默认只有 CMSIS-DAP，用不带 overlay 的脚本（不需要 _xxx_overlay_bss 符号）
-    local linker_script = wchlink_enabled and "sdk/Ld/Link_highcode_nv_256B_dual.ld"
-        or "sdk/Ld/Link_highcode_nv_256B.ld"
+    -- 链接脚本（application/ld/）：
+    --   双模式                    Link_highcode_nv_256B_dual.ld（应用 0x0 起，带 OVERLAY）
+    --   单模式 + UF2 bootloader    Link_highcode_nv_256B_uf2.ld（应用 0x5000 起，
+    --                             RAM 前 16 B 留给启动握手区）
+    --   单模式、不要 bootloader    Link_highcode_nv_256B.ld（应用 0x0 起）
+    local ld_dir = app_src .. "/ld"
+    local linker_script
+    if wchlink_enabled then
+        linker_script = ld_dir .. "/Link_highcode_nv_256B_dual.ld"
+    elseif use_bootloader then
+        linker_script = ld_dir .. "/Link_highcode_nv_256B_uf2.ld"
+    else
+        linker_script = ld_dir .. "/Link_highcode_nv_256B.ld"
+    end
 
     -- WCH-Link 专有的应用 glue（含无 LED / 无电源开关的空实现）
     if wchlink_enabled then
-        add_files("src/wchlink/**/*.c", "src/wchlink/**/*.S",
-                  "src/status/*.c", "src/drv/drv_power_switch.c")
+        add_files(app_src .. "/wchlink/**/*.c", app_src .. "/wchlink/**/*.S",
+                  app_src .. "/status/*.c", app_src .. "/drv/drv_power_switch.c")
     end
 
     -- CH32X035 SDK
-    -- 注意：不编译 sdk/Debug/debug.c —— 它无条件定义了 _write 与 _sbrk，
-    -- 会与 src/bsp/bsp_print.c 的 retarget 实现重复定义（参考工程同样排除它）。
-    -- sdk/Debug 仍需作为头文件搜索路径：src/ch32x035_it.h 依赖 debug.h。
-    add_files(startup_file,
-              "sdk/Core/*.c",
-              "sdk/Peripheral/src/*.c")
+    -- 不编译 sdk/Debug/debug.c（它无条件定义 _write / _sbrk，会与
+    -- application/bsp/bsp_print.c 的 retarget 重复定义），但保留 sdk/Debug 作为头文件路径。
+    add_files(sdk .. "/Startup/startup_ch32x035_highcode.S", "sdk/Core/*.c", "sdk/Peripheral/src/*.c")
     add_includedirs("sdk/Core", "sdk/Peripheral/inc", "sdk/Debug")
 
     -- ===== USB：必选，不做任何条件裁剪 =====
-    -- 本芯片必然使用 USB，因此 CherryUSB 核心、CH32X035 设备端口 glue、
-    -- 应用侧初始化配置（src/usb_config.h）与芯片级 USB 硬件初始化
-    -- （src/bsp/bsp_usb.c）缺一不可。缺文件由下面的 before_build 报错，
-    -- 避免默默编出一个没有 USB 的固件。
     add_files("../third_party/cherryusb/core/usbd_core.c",
               "../third_party/cherryusb/class/cdc/usbd_cdc_acm.c")
     add_sysincludedirs("../third_party/cherryusb/core",
@@ -184,26 +388,13 @@ target("firmware")
                        "../third_party/cherryusb/class/hid")
 
     -- ===== CMSIS-DAP =====
-    -- CherryDAP（上游 CMSIS-DAP 实现）
-    add_files("../third_party/cherrydap/DAP/Source/DAP.c",
-              "../third_party/cherrydap/DAP/Source/DAP_vendor.c")
+    -- 注意**不编译** DAP/Source/DAP_vendor.c：上游那份是空模板，本工程的 vendor
+    -- 命令在 application/dap/udap_vendor.c（DAP.c 里的实现是 __WEAK，由我们覆盖）。
+    add_files("../third_party/cherrydap/DAP/Source/DAP.c")
     add_sysincludedirs("../third_party/cherrydap",
                        "../third_party/cherrydap/DAP/Include")
 
-    -- 编译、汇编与链接选项
-    add_cxflags(table.join(arch_flags, {
-                   "-D__PACKED=__attribute__((packed))",
-                   "-fmessage-length=0",
-                   "-fsigned-char",
-                   "-ffunction-sections",
-                   "-fdata-sections",
-                   "-fno-common",
-                   "-Wno-comment",
-                   "-Wno-unused-parameter",
-                   "-Wno-missing-prototypes"}), {force = true})
-    add_asflags(table.join(arch_flags, {
-                   "-ffunction-sections",
-                   "-fdata-sections"}), {force = true})
+    add_shared_flags()
     add_ldflags(table.join(arch_flags, {
                    "-ffunction-sections",
                    "-fdata-sections",
@@ -212,57 +403,35 @@ target("firmware")
                    "-nostartfiles",
                    "-Wl,-T" .. linker_script,
                    "-Wl,--gc-sections"}), {force = true})
-
-    -- 按模式追加优化与符号设置
-    --
-    -- 两种模式（CMSIS-DAP / WCH-Link）的代码必须同时装进 62 KiB Flash，
-    -- 所以 debug 与 release 都用 -Os：
-    --   * release：-O3 + LTO 会把整条 USB 调用链内联进 .highcode 的中断处理函数，
-    --     使其膨胀到 18 KiB，同时吃光 62 KiB Flash 与 20 KiB RAM（参考工程
-    --     ch32x035-usb-wchlink-main 同样使用 smallest）。
-    --   * debug：-Og / -O0 下两套代码 + overlay 装不进 Flash（`.data` 直接报
-    --     region overflow），所以也改用 -Os + LTO，只保留调试符号。
-    if is_mode("debug") then
-        set_symbols("debug")
-    else
-        set_symbols("hidden")
-    end
-    set_optimize("smallest")
-    add_cxflags("-flto", {force = true})
     add_ldflags("-flto", {force = true})
 
-    -- 构建钩子，按触发顺序排列
-
-    -- 打印当前模式、工具链与 SDK 目录
+    -- 打印当前模式、工具链与布局（before_build 是脚本作用域，可以用 raise）
     before_build(function (target)
-        -- 必需文件校验放在这里，而不是 xmake.lua 顶层：
-        -- xmake 的工程描述作用域是精简沙箱，顶层没有 raise（顶层调用会报
-        -- "attempt to call a nil value (global 'raise')"），而 before_build 是
-        -- 脚本作用域，raise 可用，且它在任何编译动作之前执行。
-        --
-        -- CMSIS-DAP 侧的文件全部必需；WCH-Link 的文件只在 --wchlink=y 时必需。
-        -- 少任何一个都直接报错，而不是默默编出一个少了一半功能的固件。
-        local required = {"src/board_pin_map.h",
-                          "src/swd_pin_map.h",
-                          "src/usb_config.h",
-                          "src/port/usb_ch32x035_dc_usbfs.c",
-                          "src/bsp/bsp_usb.c",
-                          "src/drv/drv_uart.c",
-                          "src/drv/drv_uart.h",
-                          "src/drv/drv_mode_button.c",
-                          "src/drv/drv_mode_store.c",
-                          "src/dap/DAP_config.h",
-                          "src/dap/dap_main.c",
-                          "src/dap/sw_dp.c",
-                          "src/dap/swd_gpio.h",
-                          "src/dap/swd_gpio_x035.c",
-                          "src/bsp/bsp_uid.c"}
+        local required = {app_src .. "/board_pin_map.h",
+                          app_src .. "/swd_pin_map.h",
+                          app_src .. "/usb_config.h",
+                          app_src .. "/boot_info.h",
+                          app_src .. "/port/usb_ch32x035_dc_usbfs.c",
+                          app_src .. "/bsp/bsp_usb.c",
+                          app_src .. "/drv/drv_uart.c",
+                          app_src .. "/drv/drv_uart.h",
+                          app_src .. "/drv/drv_led.c",
+                          app_src .. "/drv/drv_control.c",
+                          app_src .. "/drv/drv_mode_button.c",
+                          app_src .. "/drv/drv_mode_store.c",
+                          app_src .. "/dap/DAP_config.h",
+                          app_src .. "/dap/dap_main.c",
+                          app_src .. "/dap/udap_vendor.c",
+                          app_src .. "/dap/sw_dp.c",
+                          app_src .. "/dap/swd_gpio.h",
+                          app_src .. "/dap/swd_gpio_x035.c",
+                          app_src .. "/bsp/bsp_uid.c"}
         if wchlink_enabled then
-            table.insert(required, "src/wchlink/usb/wchlink_usb.c")
-            table.insert(required, "src/wchlink/transport/rvswd_phy_gpio.c")
-            table.insert(required, "src/wchlink/target/rvswd_target_registry.c")
-            table.insert(required, "src/status/status_led.c")
-            table.insert(required, "src/drv/drv_power_switch.c")
+            table.insert(required, app_src .. "/wchlink/usb/wchlink_usb.c")
+            table.insert(required, app_src .. "/wchlink/transport/rvswd_phy_gpio.c")
+            table.insert(required, app_src .. "/wchlink/target/rvswd_target_registry.c")
+            table.insert(required, app_src .. "/status/status_led.c")
+            table.insert(required, app_src .. "/drv/drv_power_switch.c")
         end
         for _, req in ipairs(required) do
             if not os.isfile(req) then
@@ -271,26 +440,28 @@ target("firmware")
         end
 
         local toolchain = assert(target:toolchain("wch-riscv"))
-        local toolchain_root = toolchain:get("toolchain_root")
         cprint("${cyan}Using mode:${clear} %s", get_config("mode") or "debug")
-        cprint("${cyan}Using toolchain:${clear} %s", toolchain_root)
+        cprint("${cyan}Using toolchain:${clear} %s", toolchain:get("toolchain_root"))
         cprint("${cyan}Using SDK:${clear} sdk/")
-        cprint("${cyan}SWD pins:${clear} %s", get_config("swd_pins") or "pa5_pa6")
+        cprint("${cyan}SWD pins:${clear} %s", swd_pins)
         cprint("${cyan}Debugger:${clear} %s", wchlink_enabled
-            and "CMSIS-DAP + WCH-Link (dual mode, hold button at power-up to switch)"
+            and "CMSIS-DAP + WCH-Link (dual mode, double-click the button at runtime to switch)"
             or "CMSIS-DAP only (--wchlink=y to add WCH-Link)")
+        cprint("${cyan}Layout:${clear} %s", use_bootloader
+            and "UF2 bootloader + app at 0x5000 (drag firmware.uf2 to upgrade)"
+            or (wchlink_enabled
+                and "app at 0x0000 (dual-mode firmware does not fit behind the bootloader)"
+                or "app at 0x0000 (no bootloader, SWD flashing only)"))
         cprint("${cyan}Serial #:${clear} %s", has_config("esig_sn")
             and "chip ESIG UID (unique)" or "fixed DEADBEEF")
     end)
 
-    -- 指定 map 文件，与 elf 同目录
-    before_link(function (target)
-        local mapfile = path.join(target:targetdir(), target:basename() .. ".map")
-        target:add("ldflags", "-Wl,-Map=" .. mapfile, {force = true})
-    end)
+    add_map_file_hook()
 
-    -- 生成 bin 并统计 Flash 与 RAM 占用
+    -- 生成 bin、UF2 并统计 Flash 与 RAM 占用
     after_build(function (target)
+        import("lib.detect.find_program")
+
         local toolchain = assert(target:toolchain("wch-riscv"))
         local prefix = toolchain:get("gcc_prefix")
         local targetfile = target:targetfile()
@@ -299,14 +470,36 @@ target("firmware")
         local binfile = path.join(bindir, "firmware.bin")
         os.execv(prefix .. "objcopy", {"-O", "binary", targetfile, binfile})
 
-        -- OVERLAY 段的 LMA 由 ld 单独排布，**不受 FLASH 区域长度约束**，超了也不报错，
-        -- 只会静默生成一个装不进芯片的 .bin。所以按 .bin 实际长度兜底检查。
-        local flash_limit = 63232  -- 62K - 256（末尾 256 B 留给 NV 配置，见链接脚本）
+        -- OVERLAY 段的 LMA 不受 FLASH 区域长度约束，超了 ld 也不报错，只会静默
+        -- 生成一个装不进芯片的 .bin，所以按 .bin 实际长度兜底检查。
+        local flash_limit = use_bootloader and (63232 - 20480) or 63232
         local binsize = os.filesize(binfile)
         if binsize > flash_limit then
-            raise(string.format("firmware.bin is %d B, exceeds the %d B FLASH limit " ..
+            raise(string.format("firmware.bin is %d B, exceeds the %d B application region " ..
                                 "(OVERLAY LMAs are not bounded by the FLASH region)",
                                 binsize, flash_limit))
+        end
+
+        if use_bootloader then
+            -- family ID 与起始地址必须和 bootloader/src/boot_config.h 一致
+            local uf2_family = "0x75446170"
+            local uf2_base = "0x5000"
+            local uf2conv = path.join(os.scriptdir(), "..", "third_party", "uf2", "utils", "uf2conv.py")
+            local uf2file = path.join(bindir, "firmware.uf2")
+            local python = find_program("python") or find_program("py") or find_program("python3")
+            if python and os.isfile(uf2conv) then
+                if type(python) == "table" then
+                    python = python.program
+                end
+                os.execv(python, {uf2conv, "-c", "-f", uf2_family, "-b", uf2_base,
+                                  "-o", uf2file, binfile})
+                cprint("${green}UF2:${clear} %s", uf2file)
+            else
+                cprint("${yellow}skip UF2:${clear} 找不到 python 或 third_party/uf2（先 git submodule update --init）")
+            end
+        else
+            -- 非 bootloader 布局：删掉上次留下的 firmware.uf2（地址按 0x5000 算，拖进去没用）
+            os.rm(path.join(bindir, "firmware.uf2"))
         end
 
         local sections_output = os.iorunv(prefix .. "size", {"--format=sysv", targetfile})
@@ -314,10 +507,9 @@ target("firmware")
         local sections = parse_sysv_section_sizes(sections_output)
 
         print(sections_output)
-        -- .highcode 在 SRAM 中执行；.stack 是 NOBITS，不应依赖 Berkeley 分类推断 RAM 占用
+        -- .highcode 在 SRAM 中执行；.stack 是 NOBITS
         size_info.ram = sum_section_sizes(sections, {".highcode", ".data", ".bss", ".stack"})
-        -- 双模式的 overlay 段（dap_overlay / wchlink_overlay）被链接到**同一段地址**，
-        -- 不能相加，只能取较大的那个作为这段窗口的占用（见 sdk/Ld/Link_highcode_nv_256B_dual.ld）。
+        -- 双模式的 overlay 段链接到**同一段地址**，只能取较大的那个
         size_info.overlay = 0
         for _, name in ipairs({"dap_overlay", "wchlink_overlay"}) do
             local size = sections[name]
@@ -329,9 +521,13 @@ target("firmware")
         print_memory_summary(size_info)
     end)
 
-    -- 清理生成的 bin 与 map
     after_clean(function (target)
         local bindir = target:targetdir()
         os.rm(path.join(bindir, "firmware.bin"))
+        os.rm(path.join(bindir, "firmware.uf2"))
         os.rm(path.join(bindir, target:basename() .. ".map"))
+        if use_bootloader then
+            os.rm(path.join(bindir, "bootloader.bin"))
+            os.rm(path.join(bindir, "bootloader.map"))
+        end
     end)

@@ -132,9 +132,12 @@ bool drv_flow_pins_rts(void);
  *   DRV_UART_MODE_DUAL  「双串口」
  *       COM1 <-> USART4；COM2 <-> USART2（PA2 = TX2 / PA3 = RX2）。
  *
- * 模式由按键**双击**切换，并存进用户选择字 Data1（掉电保存）；切换会重新枚举
- * USB（描述符里的接口数变了），主机侧看到一次插拔。
- * 指示：PB12 亮 = 双串口模式，灭 = DTR/RTS 模式（低电平点亮）。 */
+ * 模式由按键**双击**或 vendor command 切换，并存进用户选择字 Data1（掉电保存）；
+ * 注意双模式固件（CMSIS-DAP + WCH-Link）里串口**固定**为单串口 + DTR/RTS，
+ * 双击手势让给调试器模式切换（见 src/main.c）。
+ * 切换会重新枚举 USB（描述符里的接口数变了），主机侧看到一次插拔。
+ * 指示：由 LED 模块决定（见 src/drv/drv_led.h 的 DRV_LED_MODE_STATUS 模式：
+ * PB12 亮 = 双串口模式，灭 = DTR/RTS 模式，低电平点亮）。 */
 
 typedef enum {
     DRV_UART_MODE_FLOW = 0, /* 串口 1 + DTR/RTS（默认） */
@@ -142,11 +145,15 @@ typedef enum {
     DRV_UART_MODE_COUNT,
 } drv_uart_mode_t;
 
-/* 上电初始化：PB12 灯 + 从选项字恢复模式 + 按模式配置 PA2/PA3 */
+/* 上电初始化：从选项字恢复模式 + 按模式配置 PA2/PA3 */
 void drv_uart_mode_init(void);
 
 drv_uart_mode_t drv_uart_mode_get(void);
 bool drv_uart_mode_is_dual(void);
+
+/* 切换到指定模式并写入选项字持久化；返回 false 表示参数非法。
+ * 调用方负责重新枚举 USB（描述符里的 CDC 接口数变了）。 */
+bool drv_uart_mode_set(drv_uart_mode_t mode);
 
 /* 切换到另一个模式，并写入选项字持久化。由按键双击触发。 */
 void drv_uart_mode_toggle(void);

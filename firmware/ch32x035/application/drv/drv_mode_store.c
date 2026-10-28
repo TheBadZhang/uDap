@@ -82,6 +82,37 @@ static bool mode_store_write_byte(uint32_t shift, uint8_t value) {
     return mode_store_byte_ok(mode_store_ob_words()[1], shift, &current) && current == value;
 }
 
+/* ---------------------------------------------------------------------------
+ * Data1 的位域（定义见 drv_mode_store.h）
+ *
+ *   bit0   = 串口模式（0 = 串口1+DTR/RTS，1 = 双串口）
+ *   bit2:1 = LED 模式
+ *   bit7:3 = 保留，必须为 0（擦除态/旧垃圾值因此被判为无效）
+ * ------------------------------------------------------------------------- */
+#define MODE_STORE_DATA1_UART_MASK     ((uint8_t)0x01u)
+#define MODE_STORE_DATA1_LED_SHIFT     1u
+#define MODE_STORE_DATA1_LED_MASK      ((uint8_t)0x06u)
+#define MODE_STORE_DATA1_RESERVED_MASK ((uint8_t)0xF8u)
+
+static bool mode_store_data1_decode(uint8_t value) {
+    return (value & MODE_STORE_DATA1_RESERVED_MASK) == 0u;
+}
+
+// 改 Data1 里的一段位，另一段（以及 Data0）保持原值。
+// 读不到有效旧值（擦除态 / 反码不匹配 / 保留位非 0）时按「串口1+DTR/RTS + LED 默认模式」起步。
+static bool mode_store_data1_update(uint8_t clear_mask, uint8_t set_value) {
+    uint8_t current = 0u;
+    uint8_t data1;
+
+    if (mode_store_byte_ok(mode_store_ob_words()[1], DRV_MODE_STORE_BYTE1_SHIFT, &data1) &&
+        mode_store_data1_decode(data1)) {
+        current = data1;
+    }
+
+    current = (uint8_t)((current & (uint8_t)~clear_mask) | set_value);
+    return mode_store_write_byte(DRV_MODE_STORE_BYTE1_SHIFT, current);
+}
+
 bool drv_mode_store_load(firmware_mode_t *out_mode) {
     uint8_t data0;
 
@@ -118,19 +149,43 @@ bool drv_mode_store_load_uart_mode(drv_uart_mode_t *out_mode) {
     if (!mode_store_byte_ok(mode_store_ob_words()[1], DRV_MODE_STORE_BYTE1_SHIFT, &data1)) {
         return false;
     }
-    if (data1 >= (uint8_t)DRV_UART_MODE_COUNT) {
+    if (!mode_store_data1_decode(data1)) {
         return false;
     }
 
-    *out_mode = (drv_uart_mode_t)data1;
+    *out_mode = (data1 & MODE_STORE_DATA1_UART_MASK) ? DRV_UART_MODE_DUAL : DRV_UART_MODE_FLOW;
     return true;
 }
 
 bool drv_mode_store_save_uart_mode(drv_uart_mode_t mode) {
-    uint8_t data1 = (uint8_t)mode;
-
-    if (data1 >= (uint8_t)DRV_UART_MODE_COUNT) {
+    if ((uint32_t)mode >= (uint32_t)DRV_UART_MODE_COUNT) {
         return false;
     }
-    return mode_store_write_byte(DRV_MODE_STORE_BYTE1_SHIFT, data1);
+    return mode_store_data1_update(MODE_STORE_DATA1_UART_MASK,
+                                   (mode == DRV_UART_MODE_DUAL) ? MODE_STORE_DATA1_UART_MASK : 0u);
+}
+
+bool drv_mode_store_load_led_mode(drv_led_mode_t *out_mode) {
+    uint8_t data1;
+
+    if (out_mode == 0) {
+        return false;
+    }
+    if (!mode_store_byte_ok(mode_store_ob_words()[1], DRV_MODE_STORE_BYTE1_SHIFT, &data1)) {
+        return false;
+    }
+    if (!mode_store_data1_decode(data1)) {
+        return false;
+    }
+
+    *out_mode = (drv_led_mode_t)((data1 & MODE_STORE_DATA1_LED_MASK) >> MODE_STORE_DATA1_LED_SHIFT);
+    return true;
+}
+
+bool drv_mode_store_save_led_mode(drv_led_mode_t mode) {
+    if ((uint32_t)mode >= (uint32_t)DRV_LED_MODE_COUNT) {
+        return false;
+    }
+    return mode_store_data1_update(MODE_STORE_DATA1_LED_MASK,
+                                   ((uint32_t)mode << MODE_STORE_DATA1_LED_SHIFT) & MODE_STORE_DATA1_LED_MASK);
 }
