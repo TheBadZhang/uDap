@@ -7,3 +7,6 @@
 [submodule "firmware/third_party/cherrydap"]
 	path = firmware/third_party/cherrydap
 	url = https://github.com/cherry-embedded/CherryDAP.git
+[submodule "firmware/third_party/uf2"]
+	path = firmware/third_party/uf2
+	url = https://github.com/microsoft/uf2.git
