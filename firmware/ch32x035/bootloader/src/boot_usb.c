@@ -1,12 +1,10 @@
 /*
  * UF2 bootloader 的 USB 设备：一个只含 MSC（大容量存储）接口的复合设备，
- * 主机看到的是一个 FAT16 U 盘，里面有两个文件：
- *
- *   INFO_UF2.TXT  产品/板名/进入 bootloader 的原因
- *   INDEX   HTM / JOIN HTM  指向项目主页的小网页；另有 family ID 标记文件
+ * 主机看到的是一个 FAT16 U 盘，里面只有一个 index.htm（指向项目主页）。
  *
  * 拖任意 .uf2 文件进去即可升级：MSC 的扇区写回调把数据交给 src/boot_uf2.c，
- * 由它校验 UF2 块并逐页落 Flash（每页回读校验）。
+ * 由它校验 UF2 块并逐页落 Flash（每页回读校验）。拖拽不依赖文件名，
+ * 所以盘里不需要 INFO_UF2.TXT / family ID 标记等文件。
  *
  * 描述符/字符串部分照抄工程里 CMSIS-DAP 那套（CONFIG_USBDEV_ADVANCE_DESC
  * 要求的 callback 形式），只是把接口换成 MSC、序列号仍旧用芯片 UID。
@@ -20,10 +18,9 @@
 #include <usbd_msc.h>
 
 #include "boot_config.h"
-#include "boot_log.h"
+#include "boot_disk.h"
 #include "boot_uf2.h"
 #include "boot_usb.h"
-#include "bootuf2.h"
 
 #include "bsp/bsp_uid.h"
 
@@ -80,39 +77,25 @@ __WEAK const char *string_descriptor_callback(uint8_t speed, uint8_t index) {
 void usbd_msc_get_cap(uint8_t busid, uint8_t lun, uint32_t *block_num, uint32_t *block_size) {
     (void)busid;
     (void)lun;
-    *block_num = bootuf2_get_sector_count();
-    *block_size = bootuf2_get_sector_size();
+    *block_num = boot_disk_sector_count();
+    *block_size = boot_disk_sector_size();
 }
 
 int usbd_msc_sector_read(uint8_t busid, uint8_t lun, uint32_t sector, uint8_t *buffer, uint32_t length) {
     (void)busid;
     (void)lun;
-    return boot2uf2_read_sector(sector, buffer, length / bootuf2_get_sector_size());
+    return boot_disk_read_sector(sector, buffer, length / boot_disk_sector_size());
 }
 
 int usbd_msc_sector_write(uint8_t busid, uint8_t lun, uint32_t sector, uint8_t *buffer, uint32_t length) {
     (void)busid;
     (void)lun;
-    return boot_uf2_write_sector(sector, buffer, length / bootuf2_get_sector_size());
+    return boot_uf2_write_sector(sector, buffer, length / boot_disk_sector_size());
 }
 
 static void boot_usbd_event_handler(uint8_t busid, uint8_t event) {
     (void)busid;
-
-    // 这里的日志很有用：主机到底有没有枚举、有没有挂载成盘，一眼就能看出来
-    switch (event) {
-    case USBD_EVENT_RESET:
-        boot_log("[usb] 总线复位\n");
-        break;
-    case USBD_EVENT_CONFIGURED:
-        boot_log("[usb] 已配置（主机认到 U 盘）\n");
-        break;
-    case USBD_EVENT_DISCONNECTED:
-        boot_log("[usb] 断开\n");
-        break;
-    default:
-        break;
-    }
+    (void)event;
 }
 
 static struct usbd_interface msc_intf;
@@ -126,9 +109,8 @@ static const struct usb_descriptor boot_descriptor = {
 void boot_usb_init(void) {
     bsp_get_uid_hex16(boot_serial);
 
-    // 必须在 usbd_initialize() 之前：主机一上来就会读 0 号扇区，
-    // 而 bootuf2_init() 负责把文件簇链算好。
-    bootuf2_init();
+    // 必须在 usbd_initialize() 之前：主机一上来就会读 0 号扇区。
+    boot_disk_init();
 
     usbd_desc_register(0, &boot_descriptor);
     usbd_add_interface(0, usbd_msc_init_intf(0, &msc_intf, BOOT_MSC_OUT_EP, BOOT_MSC_IN_EP));

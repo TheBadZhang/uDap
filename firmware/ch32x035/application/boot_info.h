@@ -98,7 +98,7 @@ static inline void boot_info_stage(uint32_t stage) {
     boot_info_write(BOOT_INFO_REASON_APP_STAGE, stage);
 }
 
-/* 应用异常记录：高 8 位 mcause、低 24 位 mepc（我们的地址空间 0x5000..0xF7FF
+/* 应用异常记录：高 8 位 mcause、低 24 位 mepc（我们的地址空间 0x4000..0xF7FF
  * 完全放得下）。配合 ELF 就能还原到具体函数/行。 */
 static inline void boot_info_panic(uint32_t mepc, uint32_t mcause) {
     boot_info_write(BOOT_INFO_REASON_APP_PANIC,

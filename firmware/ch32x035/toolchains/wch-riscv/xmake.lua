@@ -52,12 +52,25 @@ end
 local function host_toolchain_root_candidates()
     local roots = {}
 
+    -- 版本按优先级排列：GCC15 的 -Os 更省 Flash（bootloader 14.5 KiB vs GCC12 的
+    -- 15.3 KiB），装了就优先用它；没装的版本会被 resolve_toolchain_root() 自动跳过。
+    local versions = {
+        "RISC-V Embedded GCC15",
+        "RISC-V Embedded GCC12",
+        "RISC-V Embedded GCC"
+    }
+
+    local base
     if os.host() == "macosx" then
-        append_unique(roots, "/Applications/MounRiver Studio 2.app/Contents/Resources/app/resources/darwin/components/WCH/Toolchain/RISC-V Embedded GCC12")
-        append_unique(roots, "/Applications/MounRiver Studio 2.app/Contents/Resources/app/resources/darwin/components/WCH/Toolchain/RISC-V Embedded GCC")
+        base = "/Applications/MounRiver Studio 2.app/Contents/Resources/app/resources/darwin/components/WCH/Toolchain"
     elseif os.host() == "windows" then
-        append_unique(roots, "C:/MounRiver/MounRiver_Studio2/resources/app/resources/win32/components/WCH/Toolchain/RISC-V Embedded GCC12")
-        append_unique(roots, "C:/MounRiver/MounRiver_Studio2/resources/app/resources/win32/components/WCH/Toolchain/RISC-V Embedded GCC")
+        base = "C:/MounRiver/MounRiver_Studio2/resources/app/resources/win32/components/WCH/Toolchain"
+    end
+
+    if base then
+        for _, version in ipairs(versions) do
+            append_unique(roots, path.join(base, version))
+        end
     end
 
     return roots
@@ -91,7 +104,7 @@ toolchain("wch-riscv")
     on_load(function (toolchain)
         local toolchain_root, _, gcc_prefix = find_toolchain()
         if not gcc_prefix then
-            raise("WCH toolchain not found; set WCH_TOOLCHAIN_ROOT or install MounRiver Studio 2 in the default host path")
+            os.raise("WCH toolchain not found; set WCH_TOOLCHAIN_ROOT or install MounRiver Studio 2 in the default host path")
         end
 
         toolchain:set("plat", "cross")

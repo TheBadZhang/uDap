@@ -45,7 +45,6 @@
 #include "boot_config.h"
 #include "boot_flash.h"
 #include "boot_info.h"
-#include "boot_log.h"
 #include "boot_time.h"
 #include "boot_uf2.h"
 #include "boot_usb.h"
@@ -201,15 +200,11 @@ static void jump_to_app(void) {
 static void uf2_run(void) {
     uint32_t blink_start = BOOT_SYSTICK_CNTL;
     bool blink_on = false;
-    uint32_t last_reported = 0u;
     uint8_t error;
-    uint8_t last_error = 0u;
 
     boot_flash_init();
     boot_uf2_init();
     boot_usb_init();
-
-    boot_log("[uf2] MSC 模式已启动，等待主机拖 firmware.uf2\n");
 
     for (;;) {
         error = boot_uf2_error();
@@ -218,8 +213,6 @@ static void uf2_run(void) {
         if (error == BOOT_UF2_OK && boot_uf2_is_done()) {
             // 整份固件已落盘（含最后提交的入口页）：常亮一下再软复位，
             // 重新走一遍启动判定，这样「升级完是否进应用」只有 main() 一处逻辑。
-            boot_log("[uf2] DONE %u/%u 块，复位进应用\n",
-                     boot_uf2_written_blocks(), boot_uf2_total_blocks());
             led_write(true, true);
             bsp_delay_ms(300u);
             NVIC_SystemReset();
@@ -228,27 +221,10 @@ static void uf2_run(void) {
         // is_done() 的提交动作可能刚刚置位错误，重新取一次
         error = boot_uf2_error();
         if (error != BOOT_UF2_OK) {
-            if (error != last_error) {
-                last_error = error;
-                boot_log("[uf2] ERROR %u（%s），安静 2 s 后自动复位会话，可直接重拖\n",
-                         error, boot_uf2_error_text(error));
-            }
             led_error_service(error);
             blink_start = BOOT_SYSTICK_CNTL;
             blink_on = false;
             continue;
-        }
-        last_error = 0u;
-
-        {
-            uint32_t written = boot_uf2_written_blocks();
-            uint32_t total = boot_uf2_total_blocks();
-
-            // 进度：每 8 块一行（107 块的话只打十几行，不刷屏）
-            if (total != 0u && (written / 8u) != (last_reported / 8u)) {
-                last_reported = written;
-                boot_log("[uf2] RX %u/%u 块\n", written, total);
-            }
         }
 
         {
@@ -277,38 +253,19 @@ int main(void) {
     bsp_delay_init();
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_1);
 
-    boot_log_init();
-    boot_log("\n[boot] uDap UF2 bootloader %u.%u.%u\n",
-             BOOT_VERSION_MAJOR, BOOT_VERSION_MINOR, BOOT_VERSION_PATCH);
-
     led_gpio_init();
     button_gpio_init();
 
     // 应用通过软复位传过来的记录（读走即清，见 src/boot_info.h）：
     //   REQUEST_UF2 -> 留在 UF2
-    //   APP_STAGE / APP_PANIC -> 上一次应用运行到哪里 / 崩在哪（诊断用）
-    if (boot_info_take(&reason, &arg)) {
-        if (reason == BOOT_INFO_REASON_REQUEST_UF2) {
-            need_uf2 = true;
-            boot_log("[boot] 复位原因：应用请求进 UF2\n");
-        } else if (reason == BOOT_INFO_REASON_APP_STAGE) {
-            boot_log("[boot] 上次应用停在 stage %u%s\n", arg,
-                     arg == 0xFFu ? "（已进入主循环）" : "");
-        } else if (reason == BOOT_INFO_REASON_APP_PANIC) {
-            boot_log("[boot] 上次应用崩溃: mepc=0x%06x mcause=%u\n",
-                     arg & 0x00FFFFFFu, (arg >> 24) & 0xFFu);
-        } else {
-            boot_log("[boot] 上次应用的记录: reason=%u arg=0x%08x\n", reason, arg);
-        }
-    } else {
-        boot_log("[boot] 上次应用没留下记录（启动阶段就死了）\n");
+    //   APP_STAGE / APP_PANIC -> 只清掉记录，不再输出诊断信息
+    if (boot_info_take(&reason, &arg) && reason == BOOT_INFO_REASON_REQUEST_UF2) {
+        need_uf2 = true;
     }
+    (void)arg;
 
     if (button_held_at_boot()) {
         need_uf2 = true;
-        boot_log("[boot] 上电时按住按键 >%u ms\n", BOOT_BUTTON_HOLD_MS);
-    } else {
-        boot_log("[boot] 上电时没有按键\n");
     }
 
     if (need_uf2) {
@@ -317,11 +274,9 @@ int main(void) {
 
     if (!boot_app_is_valid()) {
         // 空片 / 上一次升级没写完：留在 UF2，至少可以拖固件进去
-        boot_log("[boot] 应用区无效（空片或升级没写完）-> 留在 UF2\n");
         uf2_run(); /* 不返回 */
     }
 
-    boot_log("[boot] 应用有效，跳转到 0x%08x\n", (uint32_t)BOOT_APP_START);
     jump_to_app();
     return 0;
 }

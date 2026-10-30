@@ -7,7 +7,7 @@
  *
  * 只用来量很短的间隔（LED 闪烁、等待主机、写完后的常亮），
  *   * 比较用无符号相减，32 位计数回绕（48 MHz 下约 89 s）也能正确处理；
- *   * 不引 64 位除法（__udivdi3 约 900 B，对 20 KiB 的 bootloader 太贵）。
+ *   * 不引 64 位除法（__udivdi3 约 900 B，对 16 KiB 的 bootloader 太贵）。
  */
 
 extern uint32_t SystemCoreClock;

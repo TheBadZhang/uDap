@@ -1,12 +1,23 @@
 #include "boot_uf2.h"
 
-#include <stddef.h>
 #include <string.h>
 
 #include "boot_config.h"
 #include "boot_flash.h"
 #include "boot_time.h"
-#include "bootuf2.h"
+
+/* 与 microsoft/uf2 的官方头文件对齐：设备侧解析用的块结构与打包用的
+ * uf2conv.py（来自 third_party/uf2）必须描述同一个格式。谁的布局改了都会在
+ * 固件构建时直接编不过，而不是等到拖文件时才发现。 */
+#include "uf2.h"
+
+_Static_assert(sizeof(UF2_Block) == 512, "UF2_Block must be one 512-byte sector");
+_Static_assert(UF2_MAGIC_START0 == 0x0A324655u, "UF2 magic start0 mismatch");
+_Static_assert(UF2_MAGIC_START1 == 0x9E5D5157u, "UF2 magic start1 mismatch");
+_Static_assert(UF2_MAGIC_END == 0x0AB16F30u, "UF2 magic end mismatch");
+_Static_assert(UF2_FLAG_FAMILY_ID == 0x00002000u, "UF2 family flag mismatch");
+_Static_assert(UF2_FLAG_NOFLASH == 0x00000001u, "UF2 noflash flag mismatch");
+_Static_assert(UF2_FLAG_MD5_CHKSUM == 0x00004000u, "UF2 MD5 flag mismatch");
 
 /* 临界区：保护「待写页」缓冲不被 USB 中断改掉。
  * 固件里用 core_riscv.h 的 __disable_irq()/__enable_irq()；主机测试（没有中断）
@@ -24,25 +35,10 @@
 #define boot_irq_enable()  __enable_irq()
 #endif
 
-/* 与 microsoft/uf2 的官方头文件对齐：设备侧解析用的块结构（来自 CherryDAP
- * 的 bootuf2）与打包用的 uf2conv.py（来自 third_party/uf2）必须描述同一个格式。
- * 谁的布局改了都会在固件构建时直接编不过，而不是等到拖文件时才发现。 */
-#include "uf2.h"
-
-_Static_assert(sizeof(UF2_Block) == 512, "UF2_Block must be one 512-byte sector");
-_Static_assert(sizeof(struct bootuf2_BLOCK) == 512, "bootuf2 block must be 512 bytes");
-_Static_assert(offsetof(UF2_Block, targetAddr) == offsetof(struct bootuf2_BLOCK, TargetAddress),
-               "UF2 target address offset mismatch");
-_Static_assert(offsetof(UF2_Block, data) == offsetof(struct bootuf2_BLOCK, Data),
-               "UF2 payload offset mismatch");
-_Static_assert(UF2_MAGIC_START0 == BOOTUF2_MAGIC_START0, "UF2 magic start0 mismatch");
-_Static_assert(UF2_MAGIC_START1 == BOOTUF2_MAGIC_START1, "UF2 magic start1 mismatch");
-_Static_assert(UF2_MAGIC_END == BOOTUF2_MAGIC_END, "UF2 magic end mismatch");
-_Static_assert(UF2_FLAG_FAMILY_ID == BOOTUF2_FLAG_FAMILID_PRESENT, "UF2 family flag mismatch");
-_Static_assert(UF2_FLAG_NOFLASH == BOOTUF2_FLAG_NOT_MAIN_FLASH, "UF2 noflash flag mismatch");
-
-#define BOOT_UF2_BLOCK_BITS ((BOOTUF2_BLOCKSMAX + 7u) / 8u)
-#define BOOT_UF2_PAGE_COUNT (BOOT_APP_SIZE / BOOT_FLASH_PAGE_SIZE)
+#define BOOT_UF2_SECTOR_SIZE 512u
+#define BOOT_UF2_BLOCKS_MAX  (BOOT_APP_SIZE / BOOT_FLASH_PAGE_SIZE)
+#define BOOT_UF2_BLOCK_BITS  ((BOOT_UF2_BLOCKS_MAX + 7u) / 8u)
+#define BOOT_UF2_PAGE_COUNT  (BOOT_APP_SIZE / BOOT_FLASH_PAGE_SIZE)
 
 typedef struct {
     uint32_t total;      /* 本轮拷贝的总块数（0 = 还没有开始） */
@@ -115,21 +111,6 @@ void boot_uf2_init(void) {
 
 uint8_t boot_uf2_error(void) {
     return s_sess.error;
-}
-
-const char *boot_uf2_error_text(uint8_t error) {
-    switch (error) {
-    case BOOT_UF2_OK:
-        return "无错";
-    case BOOT_UF2_ERR_FLASH:
-        return "Flash 擦写/校验失败";
-    case BOOT_UF2_ERR_CONFLICT:
-        return "同一页被两个不同的块覆盖";
-    case BOOT_UF2_ERR_COMMIT:
-        return "提交入口页失败";
-    default:
-        return "未知错误";
-    }
 }
 
 uint32_t boot_uf2_written_blocks(void) {
@@ -209,41 +190,42 @@ void boot_uf2_service(void) {
 
 /* 合法的 UF2 块 -> true，并给出它对应的 Flash 页地址 */
 static bool block_decode(const uint8_t *raw, uint32_t *out_address) {
-    const struct bootuf2_BLOCK *block = (const struct bootuf2_BLOCK *)raw;
+    const UF2_Block *block = (const UF2_Block *)raw;
 
-    if (block->MagicStart0 != BOOTUF2_MAGIC_START0 ||
-        block->MagicStart1 != BOOTUF2_MAGIC_START1 ||
-        block->MagicEnd != BOOTUF2_MAGIC_END) {
+    if (block->magicStart0 != UF2_MAGIC_START0 ||
+        block->magicStart1 != UF2_MAGIC_START1 ||
+        block->magicEnd != UF2_MAGIC_END) {
         return false;
     }
     // 不带 family 的块、非主 Flash 的块、带 MD5 的块都不处理
-    if ((block->Flags & BOOTUF2_FLAG_FAMILID_PRESENT) == 0u ||
-        (block->Flags & (BOOTUF2_FLAG_NOT_MAIN_FLASH | BOOTUF2_FLAG_MD5_PRESENT)) != 0u) {
+    if ((block->flags & UF2_FLAG_FAMILY_ID) == 0u ||
+        (block->flags & (UF2_FLAG_NOFLASH | UF2_FLAG_MD5_CHKSUM)) != 0u) {
         return false;
     }
-    if (block->FamilyID != BOOT_UF2_FAMILY_ID) {
+    // UF2 头里第 8 个 32 位字：有 family 标志时是 family ID
+    if (block->reserved != BOOT_UF2_FAMILY_ID) {
         return false;
     }
     // 只接受整页块：这样每次落盘都是一次擦+写，且地址天然 256 B 对齐
-    if (block->PayloadSize != BOOT_FLASH_PAGE_SIZE) {
+    if (block->payloadSize != BOOT_FLASH_PAGE_SIZE) {
         return false;
     }
     // 块号先卡在位图能表示的范围内（这是防越界写的关键一条）
-    if (block->NumberOfBlock == 0u || block->NumberOfBlock > BOOTUF2_BLOCKSMAX) {
+    if (block->numBlocks == 0u || block->numBlocks > BOOT_UF2_BLOCKS_MAX) {
         return false;
     }
-    if (block->BlockIndex >= block->NumberOfBlock) {
+    if (block->blockNo >= block->numBlocks) {
         return false;
     }
-    if ((block->TargetAddress & (BOOT_FLASH_PAGE_SIZE - 1u)) != 0u) {
+    if ((block->targetAddr & (BOOT_FLASH_PAGE_SIZE - 1u)) != 0u) {
         return false;
     }
-    if (block->TargetAddress < BOOT_APP_START ||
-        block->TargetAddress > BOOT_APP_END - BOOT_FLASH_PAGE_SIZE) {
+    if (block->targetAddr < BOOT_APP_START ||
+        block->targetAddr > BOOT_APP_END - BOOT_FLASH_PAGE_SIZE) {
         return false;
     }
 
-    *out_address = block->TargetAddress;
+    *out_address = block->targetAddr;
     return true;
 }
 
@@ -261,8 +243,8 @@ int boot_uf2_write_sector(uint32_t start_sector, const uint8_t *buffer, uint32_t
     (void)start_sector; /* 落盘地址由 UF2 块自己带，与磁盘扇区号无关 */
 
     for (uint32_t i = 0u; i < sector_count; ++i) {
-        const uint8_t *raw = buffer + i * CONFIG_BOOTUF2_SECTOR_SIZE;
-        const struct bootuf2_BLOCK *block = (const struct bootuf2_BLOCK *)raw;
+        const uint8_t *raw = buffer + i * BOOT_UF2_SECTOR_SIZE;
+        const UF2_Block *block = (const UF2_Block *)raw;
         uint32_t page;
 
         if (!block_decode(raw, &address)) {
@@ -274,30 +256,30 @@ int boot_uf2_write_sector(uint32_t start_sector, const uint8_t *buffer, uint32_t
         }
         s_sess.last_rx = BOOT_SYSTICK_CNTL;
 
-        if (s_sess.total != block->NumberOfBlock) {
+        if (s_sess.total != block->numBlocks) {
             // 新一轮拷贝（第一次，或者主机重来了另一份文件）
-            session_start(block->NumberOfBlock);
+            session_start(block->numBlocks);
         }
-        if (bit_test(s_sess.blocks, block->BlockIndex)) {
+        if (bit_test(s_sess.blocks, block->blockNo)) {
             continue; /* 同一轮里的重复块（主机重发 WRITE 命令） */
         }
-        bit_set(s_sess.blocks, block->BlockIndex);
+        bit_set(s_sess.blocks, block->blockNo);
 
         page = (address - BOOT_APP_START) / BOOT_FLASH_PAGE_SIZE;
 
         if (address == BOOT_APP_START) {
             // 入口页最后写：先暂存，整份文件落盘后才提交（见 session_commit）
-            memcpy(s_sess.first_page, block->Data, BOOT_FLASH_PAGE_SIZE);
+            memcpy(s_sess.first_page, block->data, BOOT_FLASH_PAGE_SIZE);
             s_sess.first_page_pending = true;
         } else if (bit_test(s_sess.pages, page)) {
             // 同一页被两个块覆盖：只有内容一致才算正常（例如主机重试）
-            if (!page_content_matches(address, block->Data)) {
+            if (!page_content_matches(address, block->data)) {
                 s_sess.error = BOOT_UF2_ERR_CONFLICT;
                 continue;
             }
         } else if (s_pending_valid && s_pending_address == address) {
             // 该页已经在等待写入（块号已去重，正常不会走到这里）
-            if (memcmp(s_pending_page, block->Data, BOOT_FLASH_PAGE_SIZE) != 0) {
+            if (memcmp(s_pending_page, block->data, BOOT_FLASH_PAGE_SIZE) != 0) {
                 s_sess.error = BOOT_UF2_ERR_CONFLICT;
                 continue;
             }
@@ -307,7 +289,7 @@ int boot_uf2_write_sector(uint32_t start_sector, const uint8_t *buffer, uint32_t
             if (!flush_pending()) {
                 continue;
             }
-            memcpy(s_pending_page, block->Data, BOOT_FLASH_PAGE_SIZE);
+            memcpy(s_pending_page, block->data, BOOT_FLASH_PAGE_SIZE);
             s_pending_address = address;
             s_pending_valid = true;
         }

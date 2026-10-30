@@ -1,13 +1,14 @@
 /*
- * UF2 接收路径的主机端测试（不需要硬件）。
+ * UF2 接收路径 + 虚拟 U 盘的主机端测试（不需要硬件）。
  *
  * 被测试的是**固件里真正在用的那份逻辑**：
- *   src/boot_uf2.c   UF2 块校验 + 去重 + 落盘顺序 + 完成判定
- *   third_party/.../bootuf2.c  虚拟 FAT16 的读路径（主机枚举/列目录用）
+ *   src/boot_uf2.c    UF2 块校验 + 去重 + 落盘顺序 + 完成判定
+ *   src/boot_disk.c   只读 FAT16（主机枚举/列目录，只有一个小写 index.htm）
  *
  * 硬件相关的部分（Flash 擦写、SysTick）由本文件用模拟实现替代。
  *
  * 用例：
+ *   0. 虚拟 U 盘      —— BPB/FAT/根目录自洽，只有一个 index.htm，小写显示
  *   1. 正常路径      —— 落盘内容与 firmware.bin 逐字节一致，且报告「完成」
  *   2. 错误 family   —— 一页都不写，不报告完成
  *   3. 越界块号      —— 该块被忽略，其余正常写，不报告完成（不会越界写位图）
@@ -26,8 +27,8 @@
 #include <string.h>
 
 #include "boot_config.h"
+#include "boot_disk.h"
 #include "boot_uf2.h"
-#include "bootuf2.h"
 
 /* ------------------------------------------------------------------------- */
 /* 模拟硬件                                                                  */
@@ -97,17 +98,6 @@ bool boot_flash_page_matches(uint32_t address, const uint8_t *data) {
         return false;
     }
     return memcmp(&s_flash[offset], data, BOOT_FLASH_PAGE_SIZE) == 0;
-}
-
-/* 上游 bootuf2.c 里那份不用的写路径仍引用这两个符号（见 src/boot_flash.c） */
-void boot2uf2_flash_init(void) {
-}
-
-int bootuf2_flash_write(uint32_t address, const uint8_t *data, size_t size) {
-    (void)address;
-    (void)data;
-    (void)size;
-    return -1;
 }
 
 /* 与固件里 boot_app_is_valid() 等价的判定（固件版本读的是绝对地址） */
@@ -200,6 +190,158 @@ static bool flash_matches_bin(const uint8_t *bin, size_t bin_size) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* 虚拟 U 盘                                                                  */
+/* ------------------------------------------------------------------------- */
+
+static uint16_t read_u16(const uint8_t *p) {
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t read_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static bool test_disk(void) {
+    uint8_t sector[BOOT_DISK_SECTOR_SIZE];
+    uint16_t bytes_per_sector;
+    uint16_t root_entries;
+    uint16_t fat_sectors;
+    uint8_t fat_count;
+    uint8_t sectors_per_cluster;
+    uint32_t total_sectors;
+    uint32_t root_start;
+    uint32_t root_sectors;
+    uint32_t data_start;
+    uint32_t clusters;
+    const uint8_t *entry;
+    uint16_t cluster;
+    uint32_t size;
+    bool found = false;
+
+    boot_disk_init();
+    if (boot_disk_sector_size() != 512u) {
+        fprintf(stderr, "FAIL[0]: sector size = %u\n", boot_disk_sector_size());
+        return false;
+    }
+    total_sectors = boot_disk_sector_count();
+    if (total_sectors != 4132u) {
+        fprintf(stderr, "FAIL[0]: sector count = %u，期望 4132（2 MiB 盘）\n", total_sectors);
+        return false;
+    }
+
+    boot_disk_read_sector(0u, sector, 1u);
+    if (sector[510] != 0x55u || sector[511] != 0xAAu) {
+        fprintf(stderr, "FAIL[0]: DBR 缺少 0x55AA\n");
+        return false;
+    }
+    bytes_per_sector = read_u16(&sector[11]);
+    sectors_per_cluster = sector[13];
+    fat_count = sector[16];
+    root_entries = read_u16(&sector[17]);
+    fat_sectors = read_u16(&sector[22]);
+    if (bytes_per_sector != 512u || sectors_per_cluster != 1u || fat_count != 2u ||
+        root_entries != 16u || read_u16(&sector[19]) != total_sectors ||
+        memcmp(&sector[54], "FAT16   ", 8u) != 0) {
+        fprintf(stderr, "FAIL[0]: BPB 参数不对\n");
+        return false;
+    }
+
+    clusters = (total_sectors - 1u - (uint32_t)fat_count * fat_sectors -
+                (uint32_t)root_entries * 32u / bytes_per_sector) /
+               sectors_per_cluster;
+    if (clusters < 4085u) {
+        fprintf(stderr, "FAIL[0]: 只有 %u 簇，主机会判成 FAT12\n", clusters);
+        return false;
+    }
+
+    /* FAT[0]/FAT[1] 必须是保留项；index.htm 的簇链必须结束在 EOC */
+    boot_disk_read_sector(1u, sector, 1u);
+    if (sector[0] != 0xF8u || sector[1] != 0xFFu || sector[2] != 0xFFu || sector[3] != 0xFFu) {
+        fprintf(stderr, "FAIL[0]: FAT 保留项不对\n");
+        return false;
+    }
+
+    root_start = 1u + (uint32_t)fat_count * fat_sectors;
+    root_sectors = (uint32_t)root_entries * 32u / bytes_per_sector;
+    data_start = root_start + root_sectors;
+
+    for (uint32_t s = 0u; s < root_sectors && !found; ++s) {
+        boot_disk_read_sector(root_start + s, sector, 1u);
+        for (uint32_t i = 0u; i < bytes_per_sector / 32u; ++i) {
+            entry = &sector[i * 32u];
+            if (memcmp(entry, "INDEX   HTM", 11u) == 0) {
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        fprintf(stderr, "FAIL[0]: 根目录里没有 INDEX   HTM\n");
+        return false;
+    }
+
+    /* 名字按 FAT 规范存大写，NT 标志 0x18 = 基本名 + 扩展名都按小写显示 */
+    if (entry[11] != 0x20u || entry[12] != 0x18u) {
+        fprintf(stderr, "FAIL[0]: index.htm 的属性/大小写标志不对（attr=0x%02x nt=0x%02x）\n",
+                entry[11], entry[12]);
+        return false;
+    }
+    cluster = read_u16(&entry[26]);
+    size = read_u32(&entry[28]);
+    if (cluster != 2u || size == 0u || size > 4096u) {
+        fprintf(stderr, "FAIL[0]: index.htm 的起始簇/大小不对（cluster=%u size=%u）\n",
+                cluster, size);
+        return false;
+    }
+
+    /* 紧跟其后的目录项必须是 0x00（目录结束）—— 盘里只有这一个文件 */
+    if (((entry - sector) / 32u) + 1u >= bytes_per_sector / 32u || entry[32] != 0x00u) {
+        fprintf(stderr, "FAIL[0]: 根目录里还有别的文件\n");
+        return false;
+    }
+
+    /* 文件内容：sector data_start 起，必须是跳转页；超出 FileSize 的部分为 0 */
+    boot_disk_read_sector(data_start, sector, 1u);
+    if (memcmp(sector, "<!doctype html>", 15u) != 0) {
+        fprintf(stderr, "FAIL[0]: index.htm 内容不是预期的跳转页\n");
+        return false;
+    }
+    if (size < bytes_per_sector) {
+        for (uint32_t i = size; i < bytes_per_sector; ++i) {
+            if (sector[i] != 0u) {
+                fprintf(stderr, "FAIL[0]: index.htm 尾部的第 %u 字节不是 0\n", i);
+                return false;
+            }
+        }
+    }
+
+    /* 簇链：index.htm 用到的簇必须一路 next，最后一簇 EOC */
+    {
+        uint32_t last = cluster + (size + bytes_per_sector - 1u) / bytes_per_sector - 1u;
+
+        for (uint32_t c = cluster; c <= last; ++c) {
+            uint32_t fat_offset = c * 2u;
+            uint16_t value;
+
+            boot_disk_read_sector(1u + fat_offset / bytes_per_sector, sector, 1u);
+            value = read_u16(&sector[fat_offset % bytes_per_sector]);
+            if (c < last && value != (uint16_t)(c + 1u)) {
+                fprintf(stderr, "FAIL[0]: 簇 %u 应指向 %u，实际 0x%04x\n", c, c + 1u, value);
+                return false;
+            }
+            if (c == last && value != 0xFFFFu) {
+                fprintf(stderr, "FAIL[0]: 最后一簇 %u 不是 EOC（0x%04x）\n", c, value);
+                return false;
+            }
+        }
+    }
+
+    printf("OK[0]: 虚拟盘 2 MiB FAT16，只有一个 index.htm（小写显示，%u B）\n", size);
+    return true;
+}
+
+/* ------------------------------------------------------------------------- */
 
 int main(int argc, char **argv) {
     uint8_t *uf2;
@@ -226,6 +368,11 @@ int main(int argc, char **argv) {
     }
     blocks = uf2_size / 512u;
     printf("用例输入：%zu 块 UF2，%zu B bin\n", blocks, bin_size);
+
+    /* ---- 0. 虚拟 U 盘 ---- */
+    if (!test_disk()) {
+        goto out;
+    }
 
     /* ---- 1. 正常路径 ---- */
     flash_model_reset();

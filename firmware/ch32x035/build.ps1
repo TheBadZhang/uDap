@@ -6,10 +6,10 @@
 #                        传 -Wchlink y 编成双模式固件，运行中双击 PB3 切换。
 #
 # UF2 bootloader：
-#   默认一起构建（同一份 xmake.lua 里的 bootloader target），应用链接到 0x5000，
+#   默认一起构建（同一份 xmake.lua 里的 bootloader target），应用链接到 0x4000，
 #   产物 firmware.uf2 可以直接拖进 bootloader 的 U 盘里升级；
 #   firmware_full.bin 是 bootloader + 应用的合并镜像（整片烧录用）。
-#   双模式固件约 57 KiB，62 KiB Flash 里放不下 20 KiB 的 bootloader，
+#   双模式固件约 57 KiB，62 KiB Flash 里放不下 16 KiB 的 bootloader，
 #   所以 -Wchlink y 时自动退回「应用从 0x0 起、只走 SWD 烧录」的老布局。
 #
 # 用法:
@@ -39,7 +39,7 @@ param(
     [ValidateSet('release', 'debug')]
     [string]$Mode = 'release',
 
-    # 用芯片出厂 UID（ESIG 区，96 位）作 CMSIS-DAP 的 USB 序列号，对应
+    # 用芯片出厂 UID（ESIG 区，64 位）作 CMSIS-DAP 的 USB 序列号，对应
     # xmake.lua 的 option("esig_sn")。**默认 y** —— 每颗芯片唯一，多块板子
     # 同时插在一台机器上才能被主机区分；传 n 退回固定的 "DEADBEEF"。
     # 注意：xmake 会把选项值持久化到本地配置。所以这里每次都显式传
@@ -59,7 +59,7 @@ param(
     [ValidateSet('pa5_pa7', 'pa5_pa6', 'pa2_pa3')]
     [string]$SwdPins = 'pa5_pa6',
 
-    # 是否按「UF2 bootloader 布局」构建应用（应用从 0x5000 起），对应
+    # 是否按「UF2 bootloader 布局」构建应用（应用从 0x4000 起），对应
     # xmake.lua 的 option("bootloader")。它同时决定是否构建 bootloader target。
     # 双模式固件会自动忽略它。
     [ValidateSet('y', 'n')]
@@ -74,36 +74,61 @@ $ErrorActionPreference = 'Stop'
 # WCH RISC-V 工具链（MounRiver Studio 2 自带）
 # toolchains/wch-riscv/xmake.lua 只会自动探测 C:/MounRiver/MounRiver_Studio2/...，
 # 这里再显式指定常见安装位置，找不到时交给 xmake 默认探测。
-foreach ($candidate in @(
-        'D:\program\wch\MounRiver_Studio2\resources\app\resources\win32\components\WCH\Toolchain\RISC-V Embedded GCC12',
-        'C:\MounRiver\MounRiver_Studio2\resources\app\resources\win32\components\WCH\Toolchain\RISC-V Embedded GCC12')) {
-    if (Test-Path $candidate) {
-        $env:WCH_TOOLCHAIN_ROOT = $candidate
-        break
+# 版本优先 GCC15（-Os 下 bootloader/应用都更小），其次 GCC12；
+# 已经设了 WCH_TOOLCHAIN_ROOT 环境变量时以环境变量为准（想固定用某个版本就设它）。
+$toolchainRoot = $env:WCH_TOOLCHAIN_ROOT
+if (-not $toolchainRoot) {
+    $toolchainBases = @(
+        'D:\program\wch\MounRiver_Studio2\resources\app\resources\win32\components\WCH\Toolchain',
+        'C:\MounRiver\MounRiver_Studio2\resources\app\resources\win32\components\WCH\Toolchain')
+
+    foreach ($version in @('RISC-V Embedded GCC15', 'RISC-V Embedded GCC12')) {
+        foreach ($base in $toolchainBases) {
+            $candidate = Join-Path $base $version
+            if (Test-Path $candidate) {
+                $toolchainRoot = $candidate
+                break
+            }
+        }
+        if ($toolchainRoot) { break }
     }
+    if ($toolchainRoot) { $env:WCH_TOOLCHAIN_ROOT = $toolchainRoot }
 }
 
 Push-Location $PSScriptRoot
 try {
-    # 双模式固件（约 57 KiB）放不下 20 KiB 的 bootloader，xmake 里也会自动关掉；
+    # 双模式固件（约 57 KiB）放不下 16 KiB 的 bootloader，xmake 里也会自动关掉；
     # 这里先算出来，好让打印的布局与实际一致。
     $useBootloader = ($Bootloader -eq 'y') -and ($Wchlink -ne 'y')
 
     $snLabel = if ($EsigSn -eq 'y') { '芯片 ESIG UID（每颗唯一）' } else { '固定 DEADBEEF' }
     $dbgLabel = if ($Wchlink -eq 'y') { '双模式（CMSIS-DAP + WCH-Link，运行中双击 PB3 切换）' } else { 'CMSIS-DAP only（-Wchlink y 可加编 WCH-Link）' }
     $layoutLabel = if ($useBootloader) {
-        'UF2 bootloader @0x0 + 应用 @0x5000（可拖 firmware.uf2 升级）'
+        'UF2 bootloader @0x0 + 应用 @0x4000（可拖 firmware.uf2 升级）'
     } elseif ($Wchlink -eq 'y') {
         '应用 @0x0（双模式固件放不下 bootloader，只走 SWD 烧录）'
     } else {
         '应用 @0x0（不带 bootloader，只走 SWD 烧录）'
     }
 
-    Write-Host "工具链   : $env:WCH_TOOLCHAIN_ROOT" -ForegroundColor DarkGray
+    Write-Host "工具链   : $(if ($toolchainRoot) { $toolchainRoot } else { '交给 xmake 自动探测' })" -ForegroundColor DarkGray
     Write-Host "调试器   : $dbgLabel" -ForegroundColor Yellow
     Write-Host "布局     : $layoutLabel" -ForegroundColor Yellow
     Write-Host "SWD 引脚 : $SwdPins" -ForegroundColor DarkGray
     Write-Host "序列号   : $snLabel (-EsigSn $EsigSn)" -ForegroundColor DarkGray
+
+    # 换编译器必须重编：xmake 的对象依赖里没有编译器版本，切了工具链却不清缓存，
+    # 会继续拿旧编译器编出来的 .o 去链接（现象：打印的路径变了，尺寸却一点没变）。
+    $stampFile = Join-Path $PSScriptRoot 'build\.toolchain-root'
+    if ($toolchainRoot) {
+        $previousRoot = if (Test-Path $stampFile) { (Get-Content -Path $stampFile -Raw).Trim() } else { '' }
+        if ($previousRoot -and ($previousRoot -ne $toolchainRoot)) {
+            Write-Host "==> 工具链已从 $previousRoot 换成 $toolchainRoot，先清缓存" -ForegroundColor Yellow
+            $Clean = $true
+        }
+        New-Item -ItemType Directory -Force -Path (Split-Path $stampFile -Parent) | Out-Null
+        Set-Content -Path $stampFile -Value $toolchainRoot -NoNewline
+    }
 
     if ($Clean) {
         Write-Host '==> xmake clean --all' -ForegroundColor Cyan
@@ -128,7 +153,7 @@ try {
     xmake -r -P $PSScriptRoot
     if ($LASTEXITCODE -ne 0) { throw 'xmake 构建失败' }
 
-    # ===== 合并镜像：bootloader(0x0) + 应用(0x5000) =====
+    # ===== 合并镜像：bootloader(0x0) + 应用(0x4000) =====
     #
     # 用途：没有调试器（RVSWD/WCH-Link 烧不了）时，用「整片烧录」的方式一次写进去。
     # 常见工具都接受「一个 bin + 起始地址 0x0」：
@@ -141,14 +166,14 @@ try {
         if ((Test-Path $bootBin) -and (Test-Path $appBin)) {
             $boot = [System.IO.File]::ReadAllBytes($bootBin)
             $app = [System.IO.File]::ReadAllBytes($appBin)
-            if ($boot.Length -gt 0x5000) {
-                throw "bootloader.bin 有 $($boot.Length) 字节，超过 20 KiB 的 bootloader 区"
+            if ($boot.Length -gt 0x4000) {
+                throw "bootloader.bin 有 $($boot.Length) 字节，超过 16 KiB 的 bootloader 区"
             }
 
-            $full = New-Object byte[] (0x5000 + $app.Length)
+            $full = New-Object byte[] (0x4000 + $app.Length)
             [Array]::Fill($full, [byte]0xFF)
             [Array]::Copy($boot, 0, $full, 0, $boot.Length)
-            [Array]::Copy($app, 0, $full, 0x5000, $app.Length)
+            [Array]::Copy($app, 0, $full, 0x4000, $app.Length)
 
             $fullPath = Join-Path $PSScriptRoot "build\$Mode\firmware_full.bin"
             [System.IO.File]::WriteAllBytes($fullPath, $full)

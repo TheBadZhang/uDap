@@ -2,8 +2,8 @@
 --
 -- 两个 target 放在同一个工程里（不再有 bootloader/xmake.lua 那种「自成一家」）：
 --
---   target("bootloader")  Flash 0x0000..0x4FFF（20 KiB），只做 UF2 拖拽升级
---   target("firmware")    应用；带 bootloader 布局时链接到 0x5000
+--   target("bootloader")  Flash 0x0000..0x3FFF（16 KiB），只做 UF2 拖拽升级
+--   target("firmware")    应用；带 bootloader 布局时链接到 0x4000
 --
 -- 两者共用同一套工具链/编译选项/SDK，只有链接脚本、需要的 CherryUSB 类
 -- （bootloader 只要 MSC）和入口代码不同，所以放在一个文件里更好对照。
@@ -41,12 +41,13 @@ local app_src = "application"
 local sdk = "sdk"
 local third_party = "../third_party"
 
--- CherryDAP 里的 UF2 / 虚拟 FAT16 实现（Apache-2.0），bootloader 复用它的读路径
-local cherrydap_bootuf2 = third_party .. "/cherrydap/projects/HSLink-Pro/bootloader/bootuf2"
+-- UF2 格式头文件来自 third_party/uf2（microsoft/uf2）；虚拟 U 盘与写路径都由
+-- bootloader/src 自己实现（省掉上游的 malloc/INFO_UF2 逻辑，见 boot_disk.c）
+local uf2_include = third_party .. "/uf2"
 
 local esig_sn_enabled = has_config("esig_sn")
 local wchlink_enabled = has_config("wchlink")
--- 双模式固件（约 57 KiB）放不下 20 KiB 的 bootloader，只能退回应用独占 Flash
+-- 双模式固件（约 57 KiB）放不下 16 KiB 的 bootloader，只能退回应用独占 Flash
 local use_bootloader = has_config("bootloader") and not wchlink_enabled
 
 local function format_size(bytes)
@@ -67,13 +68,14 @@ local function parse_berkeley_size(size_output)
             }
         end
     end
-    raise("failed to parse berkeley size output")
+    os.raise("failed to parse berkeley size output")
 end
 
 local function parse_sysv_section_sizes(size_output)
     local sections = {}
     for line in size_output:gmatch("[^\r\n]+") do
-        local name, size = line:match("^%s*(%S+)%s+(%d+)%s+0x%x+%s*$")
+        -- size 的 addr 列在 GCC12 里是 0x...，GCC15 改成十进制；这里只关心名字和大小
+        local name, size = line:match("^%s*(%S+)%s+(%d+)%s+%S+%s*$")
         if name and size then
             sections[name] = tonumber(size)
         end
@@ -86,7 +88,7 @@ local function sum_section_sizes(sections, names)
     for _, name in ipairs(names) do
         local size = sections[name]
         if size == nil then
-            raise("missing section in sysv size output: " .. name)
+            os.raise("missing section in sysv size output: " .. name)
         end
         total = total + size
     end
@@ -148,11 +150,11 @@ end
 -- 传 --wchlink=y 得到「双模式」固件：两套调试器同编一份，运行中双击 PB3 切换
 -- （见 src/main.c）。这种构建放不下 bootloader，自动退回应用 @0x0。
 
--- 用芯片出厂 UID（ESIG 区，96 位、每颗唯一）作为 CMSIS-DAP 的 USB 序列号。
+-- 用芯片出厂 UID（ESIG 区，64 位、每颗唯一）作为 CMSIS-DAP 的 USB 序列号。
 option("esig_sn")
     set_default(true)
     set_showmenu(true)
-    set_description("Use the chip ESIG UID (96-bit, unique per chip) as the USB serial number")
+    set_description("Use the chip ESIG UID (64-bit, unique per chip) as the USB serial number")
 option_end()
 
 -- SWD 引脚方案（对应 src/swd_pin_map.h 的 SWD_PIN_VARIANT）
@@ -170,15 +172,15 @@ option("wchlink")
     set_description("Also build the WCH-Link (RVSWD) debugger mode (dual-mode firmware, ~6 KiB RAM)")
 option_end()
 
--- 是否按「UF2 bootloader 布局」构建（应用从 0x5000 起 + 同时构建 bootloader）
+-- 是否按「UF2 bootloader 布局」构建（应用从 0x4000 起 + 同时构建 bootloader）
 option("bootloader")
     set_default(true)
     set_showmenu(true)
-    set_description("Build the UF2 bootloader and put the app at 0x5000 (auto-disabled with --wchlink=y)")
+    set_description("Build the UF2 bootloader and put the app at 0x4000 (auto-disabled with --wchlink=y)")
 option_end()
 
 -- ===========================================================================
--- target: bootloader（0x0000..0x4FFF）
+-- target: bootloader（0x0000..0x3FFF）
 -- ===========================================================================
 if use_bootloader then
     target("bootloader")
@@ -191,7 +193,7 @@ if use_bootloader then
         set_targetdir("build/$(mode)")
         set_filename("bootloader.elf")
 
-        -- bootloader 自己的源码
+        -- bootloader 自己的源码（含虚拟 U 盘 boot_disk.c）
         add_files("bootloader/src/*.c")
 
         -- 与应用共用的启动握手区（src/boot_info.h）在这里必须真的读写那块 RAM；
@@ -217,17 +219,14 @@ if use_bootloader then
         add_files(third_party .. "/cherryusb/core/usbd_core.c",
                   third_party .. "/cherryusb/class/msc/usbd_msc.c")
 
-        -- UF2 解析 + 虚拟 FAT16（CherryDAP 子模块）
-        -- 只复用它的**读**路径（DBR/FAT/目录）。上游那份写路径不复用：状态无法复位、
-        -- 块号上限判断还会越界写位图（见 bootloader/src/boot_uf2.c 的说明）。
-        -- 这里在编译期改名，避免和我们的 boot_uf2_write_sector() 撞符号。
-        add_files(cherrydap_bootuf2 .. "/bootuf2.c",
-                  {defines = {"bootuf2_write_sector=bootuf2_write_sector_unused"}})
+        -- UF2 解析 + 虚拟 FAT16 全在 bootloader/src 里：
+        --   boot_uf2.c  写路径（块校验/去重/入口页最后提交）
+        --   boot_disk.c 只读 FAT16（主机枚举/列目录，只有 index.htm）
 
         -- 头文件搜索路径。**顺序有意义**：bootloader/src 必须排在最前，
-        -- 它提供自己的 usb_config.h / bootuf2_config.h。
-        add_includedirs("bootloader/src", app_src, cherrydap_bootuf2, {public = true})
-        add_includedirs(third_party .. "/uf2", {public = true})
+        -- 它提供自己的 usb_config.h。
+        add_includedirs("bootloader/src", app_src, {public = true})
+        add_includedirs(uf2_include, {public = true})
         add_sysincludedirs(sdk .. "/Core", sdk .. "/Peripheral/inc", sdk .. "/Debug",
                            third_party .. "/cherryusb/core",
                            third_party .. "/cherryusb/common",
@@ -255,17 +254,17 @@ if use_bootloader then
         before_build(function (target)
             local required = {"bootloader/src/main.c",
                               "bootloader/src/boot_config.h",
+                              "bootloader/src/boot_disk.c",
                               "bootloader/src/boot_flash.c",
-                              "bootloader/src/boot_log.c",
                               "bootloader/src/boot_uf2.c",
                               "bootloader/src/boot_usb.c",
                               "bootloader/ld/Link_bootloader.ld"}
             for _, req in ipairs(required) do
                 if not os.isfile(req) then
-                    raise("missing required source: " .. req)
+                    os.raise("missing required source: " .. req)
                 end
             end
-            cprint("${cyan}bootloader:${clear} 20 KiB @0x0000 (UF2 drag-and-drop)")
+            cprint("${cyan}bootloader:${clear} 16 KiB @0x0000 (UF2 drag-and-drop)")
         end)
 
         after_build(function (target)
@@ -277,15 +276,15 @@ if use_bootloader then
 
             os.execv(prefix .. "objcopy", {"-O", "binary", targetfile, binfile})
 
-            -- 链接脚本里 FLASH 只有 20 KiB，超了 ld 会直接报错；这里再按 .bin
+            -- 链接脚本里 FLASH 只有 16 KiB，超了 ld 会直接报错；这里再按 .bin
             -- 实际长度兜底检查一次（.bin 更接近真实占用）。
             local binsize = os.filesize(binfile)
-            if binsize > 0x5000 then
-                raise(string.format("bootloader.bin is %d B, exceeds the 20 KiB bootloader region",
+            if binsize > 0x4000 then
+                os.raise(string.format("bootloader.bin is %d B, exceeds the 16 KiB bootloader region",
                                     binsize))
             end
-            print(string.format("Bootloader size: %d B / 20480 B (%.1f%% free)",
-                                binsize, 100.0 * (20480 - binsize) / 20480.0))
+            print(string.format("Bootloader size: %d B / 16384 B (%.1f%% free)",
+                                binsize, 100.0 * (16384 - binsize) / 16384.0))
         end)
 
         after_clean(function (target)
@@ -353,7 +352,7 @@ target("firmware")
 
     -- 链接脚本（application/ld/）：
     --   双模式                    Link_highcode_nv_256B_dual.ld（应用 0x0 起，带 OVERLAY）
-    --   单模式 + UF2 bootloader    Link_highcode_nv_256B_uf2.ld（应用 0x5000 起，
+    --   单模式 + UF2 bootloader    Link_highcode_nv_256B_uf2.ld（应用 0x4000 起，
     --                             RAM 前 16 B 留给启动握手区）
     --   单模式、不要 bootloader    Link_highcode_nv_256B.ld（应用 0x0 起）
     local ld_dir = app_src .. "/ld"
@@ -435,7 +434,7 @@ target("firmware")
         end
         for _, req in ipairs(required) do
             if not os.isfile(req) then
-                raise("missing required source: " .. req)
+                os.raise("missing required source: " .. req)
             end
         end
 
@@ -448,7 +447,7 @@ target("firmware")
             and "CMSIS-DAP + WCH-Link (dual mode, double-click the button at runtime to switch)"
             or "CMSIS-DAP only (--wchlink=y to add WCH-Link)")
         cprint("${cyan}Layout:${clear} %s", use_bootloader
-            and "UF2 bootloader + app at 0x5000 (drag firmware.uf2 to upgrade)"
+            and "UF2 bootloader + app at 0x4000 (drag firmware.uf2 to upgrade)"
             or (wchlink_enabled
                 and "app at 0x0000 (dual-mode firmware does not fit behind the bootloader)"
                 or "app at 0x0000 (no bootloader, SWD flashing only)"))
@@ -472,10 +471,10 @@ target("firmware")
 
         -- OVERLAY 段的 LMA 不受 FLASH 区域长度约束，超了 ld 也不报错，只会静默
         -- 生成一个装不进芯片的 .bin，所以按 .bin 实际长度兜底检查。
-        local flash_limit = use_bootloader and (63232 - 20480) or 63232
+        local flash_limit = use_bootloader and (63232 - 16384) or 63232
         local binsize = os.filesize(binfile)
         if binsize > flash_limit then
-            raise(string.format("firmware.bin is %d B, exceeds the %d B application region " ..
+            os.raise(string.format("firmware.bin is %d B, exceeds the %d B application region " ..
                                 "(OVERLAY LMAs are not bounded by the FLASH region)",
                                 binsize, flash_limit))
         end
@@ -483,7 +482,7 @@ target("firmware")
         if use_bootloader then
             -- family ID 与起始地址必须和 bootloader/src/boot_config.h 一致
             local uf2_family = "0x75446170"
-            local uf2_base = "0x5000"
+            local uf2_base = "0x4000"
             local uf2conv = path.join(os.scriptdir(), "..", "third_party", "uf2", "utils", "uf2conv.py")
             local uf2file = path.join(bindir, "firmware.uf2")
             local python = find_program("python") or find_program("py") or find_program("python3")
@@ -498,7 +497,7 @@ target("firmware")
                 cprint("${yellow}skip UF2:${clear} 找不到 python 或 third_party/uf2（先 git submodule update --init）")
             end
         else
-            -- 非 bootloader 布局：删掉上次留下的 firmware.uf2（地址按 0x5000 算，拖进去没用）
+            -- 非 bootloader 布局：删掉上次留下的 firmware.uf2（地址按 0x4000 算，拖进去没用）
             os.rm(path.join(bindir, "firmware.uf2"))
         end
 

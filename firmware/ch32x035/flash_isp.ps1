@@ -1,7 +1,7 @@
 ﻿# 不用调试器，通过 WCH 芯片自带的 BOOT 区（系统 ISP，走 USB）烧录整片镜像
 #
 # 适用场景：板子上没有 SWD/SDI 可接，或者手头没有 WCH-Link。
-# 烧写内容：build\<mode>\firmware_full.bin（bootloader@0x0 + 应用@0x5000），
+# 烧写内容：build\<mode>\firmware_full.bin（bootloader@0x0 + 应用@0x4000），
 #           起始地址 0x00000000。
 #
 # 用法:
@@ -84,7 +84,7 @@ $bin = (Resolve-Path $File).Path
 $size = (Get-Item $bin).Length
 
 Write-Host "文件    : $bin（$size 字节）" -ForegroundColor DarkGray
-Write-Host "烧录地址: 0x00000000（bootloader 0x0 + 应用 0x5000 的合并镜像）" -ForegroundColor DarkGray
+Write-Host "烧录地址: 0x00000000（bootloader 0x0 + 应用 0x4000 的合并镜像）" -ForegroundColor DarkGray
 
 $exe = Find-Wchisp
 if (-not $exe) {
@@ -114,4 +114,3 @@ Write-Host ''
 Write-Host '烧录完成。断电重新上电（或按复位）：' -ForegroundColor Green
 Write-Host '  * 不按键 -> 直接进应用（CMSIS-DAP + 串口）；' -ForegroundColor DarkGray
 Write-Host '  * 按住 PB3 再上电 -> 进 UF2，把 firmware.uf2 拖进 U 盘即可升级应用。' -ForegroundColor DarkGray
-Write-Host '  * 串口日志：PB0(TX) 115200 8N1，bootloader 会打印启动判定与升级进度。' -ForegroundColor DarkGray

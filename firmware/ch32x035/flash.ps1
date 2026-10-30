@@ -7,15 +7,15 @@
 # 烧 build\release\firmware_full.bin（bootloader + 应用的合并镜像）。
 #
 # 用法:
-#   .\flash.ps1                          # 烧 bootloader@0x0 + firmware@0x5000（UF2 布局）
+#   .\flash.ps1                          # 烧 bootloader@0x0 + firmware@0x4000（UF2 布局）
 #   .\flash.ps1 -SkipBootloader          # 只更新应用（bootloader 已经在板子上）
 #   .\flash.ps1 -NoBootloader            # 老布局：只烧 firmware@0x0（-Wchlink y 或 -Bootloader n 的构建）
 #   .\flash.ps1 -File ..\..\x.bin        # 烧指定文件
 #   .\flash.ps1 -NoVerify                # 跳过校验（更快，不建议）
 #
 # 地址约定（见 bootloader/src/boot_config.h 与 sdk/Ld/Link_highcode_nv_256B_uf2.ld）：
-#   0x0000..0x4FFF  bootloader（20 KiB）
-#   0x5000..0xF6FF  应用固件
+#   0x0000..0x3FFF  bootloader（16 KiB）
+#   0x4000..0xF6FF  应用固件
 #   0xF700..0xF7FF  预留（NV 配置页）
 #
 # 烧完 bootloader 后就可以不再用 SWD：上电按住 PB3 进 UF2，把 firmware.uf2
@@ -28,8 +28,8 @@ param(
     # bootloader 的 bin（与应用在同一份 xmake 工程里，产物同目录）
     [string]$BootloaderFile = 'build\release\bootloader.bin',
 
-    # 应用固件的烧录地址。带 bootloader 的构建是 0x5000。
-    [string]$AppBase = '0x00005000',
+    # 应用固件的烧录地址。带 bootloader 的构建是 0x4000。
+    [string]$AppBase = '0x00004000',
 
     # 只烧应用，不动 bootloader（bootloader 已在板子上、且没有改动时用）
     [switch]$SkipBootloader,

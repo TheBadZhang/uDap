@@ -1,15 +1,15 @@
 /*
  * 带 UF2 bootloader 的单模式应用链接脚本。
  *
- *   0x0000..0x4FFF   bootloader（见 bootloader/src/boot_config.h）
- *   0x5000..0xF6FF   应用（本脚本：62 KiB - 256 B NV - 20 KiB）
+ *   0x0000..0x3FFF   bootloader（16 KiB，见 bootloader/src/boot_config.h）
+ *   0x4000..0xF6FF   应用（本脚本：62 KiB - 256 B NV - 16 KiB）
  *   0xF700..0xF7FF   预留给 NV 配置页
  *
  * RAM 起始的 16 字节（0x20000000..0x2000000F）留给应用与 bootloader 之间的
  * 启动握手区（见 src/boot_info.h），所以 RAM 区域的 ORIGIN 后移 16 字节。
  * 不预留的话 .highcode 会直接盖住它。
  *
- * 双模式（CMSIS-DAP + WCH-Link）约 56 KiB，放不进 0x5000 起的应用区，
+ * 双模式（CMSIS-DAP + WCH-Link）约 56 KiB，放不进 0x4000 起的应用区，
  * 那种构建用的是 Link_highcode_nv_256B_dual.ld（应用从 0x0 起，不带 bootloader）。
  */
 ENTRY(_start)
@@ -20,7 +20,7 @@ PROVIDE(_stack_size = __stack_size);
 
 MEMORY
 {
-    FLASH (rx)  : ORIGIN = 0x00005000, LENGTH = 62K - 256 - 20K
+    FLASH (rx)  : ORIGIN = 0x00004000, LENGTH = 62K - 256 - 16K
     RAM   (xrw) : ORIGIN = 0x20000010, LENGTH = 20K - 16
 }
 

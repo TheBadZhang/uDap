@@ -389,27 +389,29 @@ const uint8_t hid_custom_report_desc[HID_CUSTOM_REPORT_DESC_SIZE] = {
 };
 
 // USB 序列号。默认是固定的 "DEADBEEF"；打开 ESIG_SN 时会被芯片出厂 UID 覆盖。
-// 36 字节足够放 24 个 UID 十六进制字符（+ 结束符）。
-char serial_number_dynamic[36] = "DEADBEEF";
+// 17 字节足够放 16 个 UID 十六进制字符（+ 结束符）。
+char serial_number_dynamic[17] = "DEADBEEF";
 
 #if ESIG_SN
 // ---------------------------------------------------------------------------
 // 序列号改用芯片出厂 UID（ESIG，Electronic Signature）
 // ---------------------------------------------------------------------------
 // 默认的固定串对所有板子都一样，多块插在同一台机器上无法区分（VID:PID 也相同）。
-// ESIG 区的 96 位 UID 出厂烧录、只读、对每颗芯片唯一，适合做产品序列号。
+// ESIG 区的 UID 出厂烧录、只读、对每颗芯片唯一，适合做产品序列号。
 // 寄存器定义见 CH32X035 应用手册第 19 章「电子签名（ESIG）」：
 //   0x1FFFF7E8  R32_ESIG_UNIID1  U_ID[31:0]
 //   0x1FFFF7EC  R32_ESIG_UNIID2  U_ID[63:32]
 //   0x1FFFF7F0  R32_ESIG_UNIID3  U_ID[95:64]
+//
+// 实测 CH32X035 的 UNIID3（0x1FFFF7F0）读出 0xFFFFFFFF，不能作为唯一值；
+// 因此序列号只拼 UNIID1/UNIID2（64 位、16 个十六进制字符），忽略最后 32 位。
 //
 // 注意：USB 序列号参与主机侧的设备枚举与驱动匹配，换了序列号等于换了设备实例，
 // 首次插入需要重新匹配一次驱动（本设备是 WinUSB，靠 MS OS 2.0 描述符自动匹配，
 // 无需手工安装）。这是预期行为，不是故障。
 #define ESIG_UNIID1_ADDR 0x1FFFF7E8u /* U_ID[31:0]  */
 #define ESIG_UNIID2_ADDR 0x1FFFF7ECu /* U_ID[63:32] */
-#define ESIG_UNIID3_ADDR 0x1FFFF7F0u /* U_ID[95:64] */
-#define ESIG_SN_HEX_LEN  24u         /* 96 位 -> 24 个十六进制字符 */
+#define ESIG_SN_HEX_LEN  16u         /* 64 位 -> 16 个十六进制字符 */
 
 // 一个 32 位字 -> 8 个大写十六进制字符（高位在前）
 static void esig_sn_put_word(uint32_t value, char *out) {
@@ -436,8 +438,8 @@ static bool esig_sn_uid_is_plausible(void) {
     return !(all_zero || all_ff);
 }
 
-// 按 UNIID1 -> UNIID2 -> UNIID3 拼接（与沁恒例程的打印顺序一致；顺序只是约定，
-// 唯一性不受影响）。三个地址逐个显式读取（虽然是相邻的 +0/+4/+8），这样每个
+// 按 UNIID1 -> UNIID2 拼接（与沁恒例程的打印顺序一致；顺序只是约定，
+// 唯一性不受影响）。两个地址逐个显式读取（虽然是相邻的 +0/+4），这样每个
 // 地址都能在自己那一行独立对照手册，不必依赖「它们相邻」这个隐含前提。
 static void esig_sn_apply(void) {
     static const char fallback[] = "DEADBEEF";
@@ -446,8 +448,6 @@ static void esig_sn_apply(void) {
                      &serial_number_dynamic[0]);
     esig_sn_put_word(*(const volatile uint32_t *)ESIG_UNIID2_ADDR,
                      &serial_number_dynamic[8]);
-    esig_sn_put_word(*(const volatile uint32_t *)ESIG_UNIID3_ADDR,
-                     &serial_number_dynamic[16]);
     serial_number_dynamic[ESIG_SN_HEX_LEN] = '\0';
 
     // 全 0 或全 FF 表示没读到有效 UID（地址不对、ESIG 不可读、总线返回未初始化值）。

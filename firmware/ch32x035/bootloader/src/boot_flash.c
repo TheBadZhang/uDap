@@ -5,7 +5,6 @@
 #include <ch32x035.h>
 
 #include "boot_config.h"
-#include "boot_log.h"
 #include "boot_time.h"
 
 /*
@@ -71,7 +70,7 @@ BOOT_RAMCODE static void flash_lock(void) {
     FLASH->CTLR |= FLASH_CTLR_LOCK;
 }
 
-/* 擦一页（256 B）。page 是逻辑地址（0x5000 起），内部换算成别名。
+/* 擦一页（256 B）。page 是逻辑地址（0x4000 起），内部换算成别名。
  * 调用方必须已经关中断。 */
 BOOT_RAMCODE static bool flash_erase_page(uint32_t page) {
     uint32_t stat;
@@ -155,9 +154,6 @@ bool boot_flash_invalidate_app(void) {
     ok = flash_erase_page(BOOT_APP_START);
     __enable_irq();
 
-    if (!ok) {
-        boot_log("[flash] 擦除入口页失败 @0x%08x\n", BOOT_APP_START);
-    }
     return ok;
 }
 
@@ -178,7 +174,6 @@ static bool verify_page(uint32_t address, uint32_t *out_offset) {
 }
 
 bool boot_flash_write_page(uint32_t address, const uint8_t *data) {
-    uint32_t offset = 0u;
     uint32_t attempt;
 
     if (data == NULL || !address_in_app(address)) {
@@ -193,25 +188,17 @@ bool boot_flash_write_page(uint32_t address, const uint8_t *data) {
     // 升级作废划算得多；真的坏块第二次仍然会失败。
     for (attempt = 0u; attempt < 2u; ++attempt) {
         if (flash_erase_page(address) && flash_program_page(address) &&
-            verify_page(address, &offset)) {
+            verify_page(address, 0)) {
             s_last_write_tick = BOOT_SYSTICK_CNTL;
             return true;
         }
     }
 
-    // 两次都失败：把差异打出来 —— flash=0xFF 表示根本没写进去；flash 是期望值的
-    // 子集（按位与）表示页没擦干净；与期望完全无关表示数据在排队阶段被改坏了
-    {
-        const volatile uint8_t *flash = (const volatile uint8_t *)flash_alias(address);
-
-        boot_log("[flash] 校验失败 @0x%08x +%u: flash=0x%02x want=0x%02x\n",
-                 address, offset, (uint32_t)flash[offset], (uint32_t)s_stage[offset]);
-    }
     return false;
 }
 
 bool boot_app_is_valid(void) {
-    // 应用入口页（0x5000）的布局：
+    // 应用入口页（0x4000）的布局：
     //   +0  byte0 : .init 的第一条指令（j handle_reset），不应是擦除态/0
     //   +4  word  : .vector 的第一项 = _start 地址，必须落在应用区内
     // 只查这两处，既能挡住「空片」，也能挡住「只写了一半、入口还没到位」。

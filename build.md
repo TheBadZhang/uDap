@@ -43,10 +43,10 @@ xmake -P . -r bootloader   # 只编 bootloader（默认布局下才存在）
 
 | 文件 | 说明 |
 | --- | --- |
-| `build\<mode>\firmware.elf` / `.bin` / `.map` | 应用固件（默认链接到 `0x5000`） |
+| `build\<mode>\firmware.elf` / `.bin` / `.map` | 应用固件（默认链接到 `0x4000`） |
 | `build\<mode>\firmware.uf2` | 拖进 UF2 bootloader 的升级包（family `0x75446170`） |
 | `build\<mode>\firmware_full.bin` | **bootloader + 应用的合并镜像**，从 `0x0` 整片烧录（没有调试器时用） |
-| `build\<mode>\bootloader.elf` / `.bin` / `.map` | bootloader（链接到 `0x0`，20 KiB 上限） |
+| `build\<mode>\bootloader.elf` / `.bin` / `.map` | bootloader（链接到 `0x0`，16 KiB 上限，实际约 14.5 KiB） |
 
 构建结束后除打印 Flash / RAM 占用外，还会按 `.bin` 实际长度兜底检查应用区是否超过
 42 752 B（= 63 232 - 20 480；链接脚本的 `OVERLAY` 段 LMA 不受 `FLASH` 区域约束，
@@ -57,7 +57,7 @@ xmake -P . -r bootloader   # 只编 bootloader（默认布局下才存在）
 
 ```powershell
 cd firmware\ch32x035
-.\flash.ps1                   # 有 WCH-Link/SDI：bootloader@0x0 + 应用@0x5000
+.\flash.ps1                   # 有 WCH-Link/SDI：bootloader@0x0 + 应用@0x4000
 .\flash.ps1 -SkipBootloader    # 只更新应用
 .\flash.ps1 -NoBootloader      # 老布局：只写应用@0x0（-Wchlink y 或 -Bootloader n 的构建）
 
@@ -75,9 +75,6 @@ cd firmware\ch32x035
 之后升级应用就不用接线了：上电长按 PB3 → 出现 U 盘 → 拖 `firmware.uf2`。
 也可以由上位机发 vendor command `ENTER_UF2` 直接进 bootloader。
 
-bootloader 的串口日志在 **PB0（TX）115200 8N1** 上，能直接看到「为什么停在
-bootloader / 收到多少块 / 哪个地址写失败」。
-
 > ⚠️ xmake 会把 option 值持久化到本地配置，构建脚本每次都显式传全部选项；
 > 直接敲 xmake 时也请显式指定，否则结果会被上一次的配置决定。
 >
@@ -85,5 +82,5 @@ bootloader / 收到多少块 / 哪个地址写失败」。
 > 主机侧会当成**另一台设备**，需要重新匹配一次驱动（WinUSB 自动匹配，无需手工装）。
 >
 > ⚠️ **UF2 拖拽升级只适用于单模式（CMSIS-DAP）构建**：双模式固件约 57 KiB，
-> 62 KiB Flash 放不下 20 KiB 的 bootloader，`--wchlink=y` 会自动关掉
+> 62 KiB Flash 放不下 16 KiB 的 bootloader，`--wchlink=y` 会自动关掉
 > `--bootloader` 的布局（打印里能看到 `Layout:` 一行）。

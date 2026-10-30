@@ -7,9 +7,12 @@
 
 | 区域 | 地址 | 大小 |
 | --- | --- | --- |
-| bootloader（本工程） | `0x00000000..0x00004FFF` | 20 KiB（实际约 16 KiB） |
-| 应用固件 | `0x00005000..0x0000F6FF` | 41.75 KiB |
+| bootloader（本工程） | `0x00000000..0x00003FFF` | 16 KiB（GCC15 下实际约 **14.5 KiB**） |
+| 应用固件 | `0x00004000..0x0000F6FF` | 45.75 KiB |
 | NV 配置（预留） | `0x0000F700..0x0000F7FF` | 256 B |
+
+> bootloader 实际占 14.5 KiB（GCC15 release 构建 14 828 B；GCC12 是 15 640 B），
+> 16 KiB 区间还剩约 1.5 KiB（GCC12 只剩约 0.7 KiB）。
 
 应用侧必须用 `../application/ld/Link_highcode_nv_256B_uf2.ld` 链接（`--bootloader=y`，默认）。
 **双模式固件（`--wchlink=y`）约 57 KiB，放不下 bootloader**，那种构建退回应用
@@ -34,18 +37,15 @@ bootloader 因此只判断「是否一直按到超时」，逻辑最简单，也
 
 ## UF2 接收与落盘（`src/boot_uf2.c`）
 
-虚拟 FAT16（DBR / FAT / 目录 / INFO_UF2.TXT）复用 CherryDAP 子模块里那份实现：
-
-```
-third_party/cherrydap/projects/HSLink-Pro/bootloader/bootuf2/bootuf2.c
-```
-
-但**写路径是本工程自己的**（`src/boot_uf2.c`）。原因：
+虚拟 FAT16 由本工程自己实现（`src/boot_disk.c`），**不再依赖 CherryDAP 子模块里的
+`bootuf2.c`**。原因：
 
 * 上游的接收状态是静态的、`bootuf2_init()` 不清位图 —— 一轮拷贝之后再也回不到初始态，
   「拖失败了直接再拖一次」永远成功不了；
 * 上游把 `CONFIG_BOOTUF2_FLASHMAX`（字节数）当块号上限用（`BlockIndex < block_max`），
-  而位图只有 `BLOCKSMAX/8+1` 字节，畸形块会越界写 `.bss`。
+  而位图只有 `BLOCKSMAX/8+1` 字节，畸形块会越界写 `.bss`；
+* 上游为了生成 `INFO_UF2.TXT` 拉进了 `malloc/free/strstr` 一整套代码，而盘里只需要
+  一个小写的 `index.htm`。
 
 本工程的实现：
 
@@ -56,11 +56,11 @@ third_party/cherrydap/projects/HSLink-Pro/bootloader/bootuf2/bootuf2.c
 | 每页「擦 + 写 + 回读校验」（`src/boot_flash.c`） | 写失败立刻知道，不会假设成功；FPEC **必须用 `0x0800_0000` 别名地址**（见下） |
 | 页写是**原子且不可重入**的 | 搬数据 + 擦 + 写 + 校验整段关中断（约 3–5 ms）。否则 USB 中断会在擦写的几毫秒里改掉源缓冲/重入进来，表现为随机的「校验失败 @0x…」（实测在 0x6100 踩过） |
 | 每页失败重试一次 | 电源抖动/时序偶发失败不至于让整份升级作废 |
-| **入口页最后提交**：开始拷贝时先擦掉 `0x5000`，整份文件落盘后才写它 | 中途断开时设备仍停在 bootloader，不会跳进半截固件 |
+| **入口页最后提交**：开始拷贝时先擦掉 `0x4000`，整份文件落盘后才写它 | 中途断开时设备仍停在 bootloader，不会跳进半截固件 |
 | 出错后主机安静 2 s 自动复位会话 | 可以直接再拖一次，不必拔线/断电 |
 | 同页内容冲突检测 | 畸形 UF2 不会互相覆盖 |
 
-落盘地址只接受 `0x5000..0xF6FF`（256 B 对齐），越界块直接丢弃。
+落盘地址只接受 `0x4000..0xF6FF`（256 B 对齐），越界块直接丢弃。
 
 > ⚠️ **地址别名**：代码/数据按 `0x0000_0000` 起链接，但 CH32X035 的 FPEC
 > （`FLASH_ROM_ERASE` / `FLASH_ROM_WRITE`）**只接受 `0x0800_0000` 别名区**的地址
@@ -73,12 +73,12 @@ U 盘里的文件：
 
 | 文件 | 说明 |
 | --- | --- |
-| `INFO_UF2.TXT` | 产品名 / 板名 / 进入 bootloader 的原因 |
-| `75446170ID` | family ID 标记（空文件，UF2 惯例） |
-| `INDEX   HTM` / `JOIN    HTM` | 指向项目主页的小网页（可选） |
+| `index.htm` | 指向项目主页的小网页；FAT 目录项里存 `INDEX   HTM`，用 NT 大小写标志（`NTReserved=0x18`）显示成小写 |
 
+> 盘里**只有这一个文件**，没有 `INFO_UF2.TXT` / `JOIN.HTM` / family ID 标记。
+>
 > 拖拽路径不依赖文件名：写入的每个扇区都会被当作 UF2 候选块解析，
-> 所以主机把文件写进任何空闲簇都会生效（虚拟盘是 64 MB FAT16）。
+> 所以主机把 `.uf2` 写进任何空闲簇都会生效（虚拟盘是 2 MiB FAT16，4096 簇）。
 
 ### LED 指示
 
@@ -89,52 +89,10 @@ U 盘里的文件：
 | 快闪 N 次 + 长停 | 出错，N = 错误码：`2` 擦写/校验失败、`3` 同页内容冲突、`4` 提交入口页失败 |
 | 常亮 300 ms 后重启 | 升级成功 |
 
-### 串口日志（推荐用来排查）
-
-灯在板子上很难看清，所以 bootloader 会同时把状态打到串口：
-
-| 项目 | 值 |
-| --- | --- |
-| 引脚 | **PB0 = TX**（就是应用里桥接串口 1 的 TX），GND 共地 |
-| 参数 | **115200 8N1**，无流控 |
-| 内容 | 启动判定（为什么进/不进 UF2）、USB 枚举事件、每 8 块的进度、每条错误（带 Flash 地址）、完成 |
-
-> 日志是 UTF-8 编码的中文 + ASCII 关键字。终端按 UTF-8 打开最清楚；用 GBK 终端时
-> 中文会乱码，但 `[boot]` / `[uf2]` / `[flash]`、块计数和 `0x…` 地址这些 ASCII
-> 部分仍然可读。
-
-典型输出：
-
-```
-[boot] uDap UF2 bootloader 1.2.0
-[boot] 上电时按住按键 >1200 ms
-[uf2] MSC 模式已启动，等待主机拖 firmware.uf2
-[usb] 总线复位
-[usb] 已配置（主机认到 U 盘）
-[uf2] RX 8/107 块
-...
-[uf2] RX 104/107 块
-[uf2] DONE 107/107 块，复位进应用
-[boot] uDap UF2 bootloader 1.2.0
-[boot] 上电时没有按键
-[boot] 应用有效，跳转到 0x00005000
-```
-
-失败时会具体到原因，例如：
-
-```
-[flash] 回读校验失败 @0x0000a300
-[uf2] ERROR 2（Flash 擦写/校验失败），安静 2 s 后自动复位会话，可直接重拖
-```
-
-> PB0 与应用里桥接串口 1 的 TX 是同一根脚：上电瞬间目标板会收到这几行日志字节。
-> 这属于正常现象（目标板一般不会因为收到 ASCII 就出问题）；要避免就把 bootloader
-> 的 `boot_log_init()` 调用去掉后重编。
-
 ### 没有调试器时怎么烧（手动烧录）
 
 `..\build.ps1` 会额外生成 **`build\<mode>\firmware_full.bin`**：bootloader（`0x0`）
-+ 应用（`0x5000`）的合并镜像，从 **`0x00000000`** 整片烧进去就行，不需要先有
++ 应用（`0x4000`）的合并镜像，从 **`0x00000000`** 整片烧进去就行，不需要先有
 bootloader、也不需要调试器。
 
 ```powershell
@@ -161,17 +119,15 @@ cd ..
 
 ```
 bootloader/                 # 构建入口是上一级的 ../xmake.lua（target: bootloader）
-  ld/Link_bootloader.ld   FLASH = 20 KiB @0x0；RAM 前 16 B 留给启动握手区
-  src/main.c              启动判定、按键、LED、主循环、串口日志
+  ld/Link_bootloader.ld   FLASH = 16 KiB @0x0；RAM 前 16 B 留给启动握手区
+  src/main.c              启动判定、按键、LED、主循环
   src/boot_config.h       Flash 布局 / family ID / USB VID:PID / 按键超时
   src/boot_time.h         SysTick 时间基准（不做除法）
-  src/boot_log.c          日志串口（USART4 PB0，115200 8N1）+ 极简 printf
   src/boot_system.c       最小 SystemInit（48 MHz，省掉 GPIO_IPD_Unused）
-  src/boot_alloc.c        极简 bump 分配器（替掉 newlib malloc，省约 1 KiB）
+  src/boot_disk.c         只读 FAT16（DBR/FAT/目录），盘里只有 index.htm
   src/boot_flash.c        Flash 页擦写（在 RAM 执行）+ 回读校验 + 应用有效性判断
   src/boot_uf2.c          UF2 块校验 / 去重 / 入口页最后提交 / 完成判定
   src/boot_usb.c          MSC 描述符 / 字符串 / 扇区回调
-  src/bootuf2_config.h    bootuf2 的编译期配置
   test/                   主机端仿真测试（不需要硬件）
 ```
 
@@ -188,11 +144,13 @@ cd ..
 xmake -P . -r bootloader
 
 # 主机端仿真：把 firmware.uf2 逐扇区喂给固件里真正在用的那份逻辑，
-# 覆盖正常/错 family/越界块号/重复下发/中断拷贝五个用例
+# 覆盖虚拟 U 盘（BPB/FAT/目录/小写 index.htm）+ 正常/错 family/越界块号/
+# 重复下发/中断拷贝六个用例
 cd test
 .\run.ps1
 ```
 
-产物：`build/<mode>/bootloader.elf` / `.bin` / `.map`（`after_build` 会检查不超过 20 KiB）。
+产物：`build/<mode>/bootloader.elf` / `.bin` / `.map`（`after_build` 会检查不超过
+16 KiB；当前 release 构建约 **14.5 KiB**（GCC15），GCC12 编译会涨到约 15.3 KiB）。
 上层的 `..\build.ps1` 还会生成 `..\build\<mode>\firmware_full.bin`（bootloader +
 应用的合并镜像），用于「没有调试器」时整片烧录。

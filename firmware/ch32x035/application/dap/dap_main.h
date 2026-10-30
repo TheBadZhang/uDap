@@ -80,7 +80,7 @@
 extern "C" {
 #endif
 
-extern char serial_number_dynamic[36];
+extern char serial_number_dynamic[17];
 
 extern struct usbd_interface hid_intf;
 

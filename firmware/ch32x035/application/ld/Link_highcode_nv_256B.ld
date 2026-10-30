@@ -7,7 +7,7 @@ PROVIDE(_stack_size = __stack_size);
 MEMORY
 {
     /* 无 bootloader 的布局：应用独占 0x0..0xF6FF（末尾 256 B 留给 NV 配置）。
-     * 带 UF2 bootloader 时改用 Link_highcode_nv_256B_uf2.ld（应用从 0x5000 起）。 */
+     * 带 UF2 bootloader 时改用 Link_highcode_nv_256B_uf2.ld（应用从 0x4000 起）。 */
     FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 62K - 256
     RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = 20K
 }

@@ -3,8 +3,8 @@
  *
  * 与应用固件的 sdk/Ld/Link_highcode_nv_256B.ld 有两处**必须不同**：
  *
- *   1. FLASH 只有 20 KiB —— 应用从 0x2000 开始（见 src/boot_config.h）。
- *      超出 20 KiB 会在这里直接报 region overflow，而不是悄悄压到应用区上。
+ *   1. FLASH 只有 16 KiB —— 应用从 0x4000 开始（见 src/boot_config.h）。
+ *      超出 16 KiB 会在这里直接报 region overflow，而不是悄悄压到应用区上。
  *
  *   2. RAM 的 ORIGIN 后移 16 字节 —— 起始的 0x20000000..0x2000000F 是
  *      bootloader 与应用之间的启动握手区（见 src/boot_info.h）。应用固件的
@@ -20,7 +20,7 @@ PROVIDE(_stack_size = __stack_size);
 
 MEMORY
 {
-    FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 20K
+    FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 16K
     /* 前 16 B 留给 boot_info（启动握手），不参与分配 */
     RAM   (xrw) : ORIGIN = 0x20000010, LENGTH = 20K - 16
 }
