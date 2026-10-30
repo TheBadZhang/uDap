@@ -4,7 +4,7 @@
 | 项目 | 选型 |
 | --- | --- |
 | 构建系统 | **xmake**（应用与 bootloader 是**同一个工程里的两个 target**） |
-| WCH 编译器 | WCH RISC-V Embedded GCC 12 |
+| WCH 编译器 | WCH RISC-V Embedded GCC 15（MounRiver Studio 2 自带；没装时自动回退 GCC 12。GCC15 的 `-Os` 更省：bootloader 14.5 KiB vs 15.3 KiB，应用 25.8 KiB vs 26.7 KiB） |
 | 编译选项 | `-march=rv32imacxw -mabi=ilp32 -msmall-data-limit=8 -mno-save-restore`，`-Wall -std=gnu11` |
 | 优化 | LTO + `--gc-sections`；`.highcode` 段启动时从 Flash 搬到 RAM 执行。必须用 `-Os`：`-O3` 会让 `.highcode` 膨胀到 18.5 KiB（Flash/RAM 都装不下），`-Og`/`-O0` 又装不进 Flash —— debug 也是 `-Os` + LTO，只额外带调试符号 |
 | UF2 打包 | `third_party/uf2`（microsoft/uf2 子模块）里的 `utils/uf2conv.py` |
@@ -22,14 +22,15 @@ cd firmware\ch32x035
 .\build.ps1 -EsigSn n              # 固定序列号 DEADBEEF（所有板子相同）
 .\build.ps1 -Wchlink y             # 双模式（+ WCH-Link）；这个构建不支持 UF2
 .\build.ps1 -Bootloader n          # 不要 bootloader，应用从 0x0 起
-.\build.ps1 -Clean                 # 先清理再构建
+.\build.ps1 -Clean                 # 先清理再构建（换编译器版本时会自动做一次）
 
 # 也可以走 cmd 包装（参数原样透传，优先 pwsh，只有 5.1 时也能跑）
 build.bat
 build.bat -Wchlink y
 
 # 或直接用 xmake（记得显式传选项，xmake 会记住上次的值）
-$env:WCH_TOOLCHAIN_ROOT = "D:\program\wch\MounRiver_Studio2\resources\app\resources\win32\components\WCH\Toolchain\RISC-V Embedded GCC12"
+# 工具链优先 GCC15，其次是 GCC12；也可以自己指定任意版本/安装路径
+$env:WCH_TOOLCHAIN_ROOT = "C:\MounRiver\MounRiver_Studio2\resources\app\resources\win32\components\WCH\Toolchain\RISC-V Embedded GCC15"
 xmake f -m release --esig_sn=y --wchlink=n --swd_pins=pa5_pa6 --bootloader=y -y
 xmake -P . -r              # 两个 target 都编：bootloader → firmware
 xmake -P . -r firmware     # 只编应用
@@ -38,6 +39,12 @@ xmake -P . -r bootloader   # 只编 bootloader（默认布局下才存在）
 
 > `-P .` 不能省：仓库根目录也有一个只含 task 的 `xmake.lua`，不给 `-P` 时 xmake
 > 会认成那个工程，报 `not a valid target name`。
+>
+> 换编译器版本（GCC12 ↔ GCC15）后**必须重编**：xmake 的对象依赖里没有编译器版本，
+> 只改 `WCH_TOOLCHAIN_ROOT` 不清缓存，会继续拿旧编译器编出来的 `.o` 去链接
+> （现象：打印的工具链路径变了，尺寸却一点没变）。`build.ps1` 把上次用的工具链
+> 记在 `build\.toolchain-root`，发现变了会自动 `xmake clean --all`；直接敲 xmake
+> 的话请自己先 `xmake clean --all`。
 
 产物：
 
@@ -46,10 +53,10 @@ xmake -P . -r bootloader   # 只编 bootloader（默认布局下才存在）
 | `build\<mode>\firmware.elf` / `.bin` / `.map` | 应用固件（默认链接到 `0x4000`） |
 | `build\<mode>\firmware.uf2` | 拖进 UF2 bootloader 的升级包（family `0x75446170`） |
 | `build\<mode>\firmware_full.bin` | **bootloader + 应用的合并镜像**，从 `0x0` 整片烧录（没有调试器时用） |
-| `build\<mode>\bootloader.elf` / `.bin` / `.map` | bootloader（链接到 `0x0`，16 KiB 上限，实际约 14.5 KiB） |
+| `build\<mode>\bootloader.elf` / `.bin` / `.map` | bootloader（链接到 `0x0`，16 KiB 上限，GCC15 下实际约 14.5 KiB） |
 
 构建结束后除打印 Flash / RAM 占用外，还会按 `.bin` 实际长度兜底检查应用区是否超过
-42 752 B（= 63 232 - 20 480；链接脚本的 `OVERLAY` 段 LMA 不受 `FLASH` 区域约束，
+46 848 B（= 63 232 - 16 384；链接脚本的 `OVERLAY` 段 LMA 不受 `FLASH` 区域约束，
 超了 ld 不会报错）。UF2 打包依赖 `python`，找不到时只打印一行提示并跳过（`.bin`
 仍然可用）。
 
