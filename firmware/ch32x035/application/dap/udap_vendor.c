@@ -31,7 +31,7 @@
 static uint8_t vendor_capabilities(void) {
     uint8_t flags = UDAP_CAP_LED_MODES;
 
-#if !WCHLINK_ENABLE
+#if !WCHLINK_ENABLE && UART_ENABLE
     // 双模式固件串口固定为单串口（见 drv_uart_mode_init），不支持切换
     flags |= UDAP_CAP_UART_DUAL;
 #endif
@@ -64,7 +64,11 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response) {
         response[3] = UDAP_FIRMWARE_VERSION_MAJOR;
         response[4] = UDAP_FIRMWARE_VERSION_MINOR;
         response[5] = UDAP_FIRMWARE_VERSION_PATCH;
+#if UART_ENABLE
         response[6] = (uint8_t)drv_uart_mode_get();
+#else
+        response[6] = 0u; /* --uart=n：没有串口，恒报「单串口」 */
+#endif
         response[7] = (uint8_t)drv_led_mode();
         response[8] = (uint8_t)drv_control_runtime_mode();
         response[9] = vendor_capabilities();
@@ -81,6 +85,11 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response) {
         }
 #if WCHLINK_ENABLE
         // 双模式固件串口固定单串口（放不下双串口，手势也让给了调试器模式切换）
+        response[1] = UDAP_STATUS_UNSUPPORTED;
+        break;
+#endif
+#if !UART_ENABLE
+        // --uart=n 的固件里根本没有串口
         response[1] = UDAP_STATUS_UNSUPPORTED;
         break;
 #endif

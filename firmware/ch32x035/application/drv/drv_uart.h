@@ -4,6 +4,20 @@
 #include <stdint.h>
 
 /*
+ * 是否编入串口桥（USB CDC + USART）。
+ *
+ *   y（默认）  两个 USB 接口块：CMSIS-DAP + CDC（单串口或双串口）
+ *   n          只有 CMSIS-DAP 的 vendor bulk 接口，固件里没有 CDC、没有 USART、
+ *              没有 DMA 环形缓冲（--uart=n）。用于「只要最快 SWD」的场景：
+ *              主机不会再轮询那几组 CDC 端点，主循环里也没有串口服务。
+ *
+ * 由 xmake 的 option("uart") 定义；头文件里给默认值，别的编译方式下也不会漏。
+ */
+#ifndef UART_ENABLE
+#define UART_ENABLE 1
+#endif
+
+/*
  * 串口驱动（两路 UART + 流控脚 + 串口模式 + CDC 回调）——**单一入口**。
  *
  * 这一对文件（drv_uart.h / drv_uart.c）取代了原来的 6 个模块：

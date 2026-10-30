@@ -15,6 +15,7 @@
 # 用法:
 #   .\build.ps1               # release 构建（默认用芯片 ESIG UID 作序列号）
 #   .\build.ps1 -Board ch32x033   # 编 uDap-CH32X033（引脚表换一份，代码不分叉）
+#   .\build.ps1 -Uart n       # 只留 SWD：USB 里没有 CDC、固件里没有 USART/DMA
 #   .\build.ps1 -Wchlink y    # 把 WCH-Link（RVSWD）也编进去（双模式，无 UF2）
 #   .\build.ps1 -EsigSn n     # 退回固定串 DEADBEEF（所有板子相同）
 #   .\build.ps1 -SwdPins pa5_pa6   # 换 SWD 引脚方案（默认 board = 板级表的默认值）
@@ -73,6 +74,13 @@ param(
     [ValidateSet('y', 'n')]
     [string]$Bootloader = 'y',
 
+    # 是否编入串口桥（USB CDC + USART），对应 xmake.lua 的 option("uart")。
+    #   y（默认）CMSIS-DAP + 串口（单串口/双串口）
+    #   n       只有 CMSIS-DAP：USB 里没有 CDC、没有 USART/DMA，SWD 吞吐最高
+    # 与 -Wchlink y 互斥。
+    [ValidateSet('y', 'n')]
+    [string]$Uart = 'y',
+
     [switch]$Clean,
     [switch]$Reconfigure
 )
@@ -122,6 +130,7 @@ try {
     Write-Host "工具链   : $(if ($toolchainRoot) { $toolchainRoot } else { '交给 xmake 自动探测' })" -ForegroundColor DarkGray
     Write-Host "板卡     : $Board" -ForegroundColor Yellow
     Write-Host "调试器   : $dbgLabel" -ForegroundColor Yellow
+    Write-Host "串口     : $(if ($Uart -eq 'y') { 'USB CDC + USART（单串口/双串口）' } else { '无（只有 CMSIS-DAP，SWD 最快）' })" -ForegroundColor Yellow
     Write-Host "布局     : $layoutLabel" -ForegroundColor Yellow
     Write-Host "SWD 引脚 : $SwdPins" -ForegroundColor DarkGray
     Write-Host "序列号   : $snLabel (-EsigSn $EsigSn)" -ForegroundColor DarkGray
@@ -151,7 +160,7 @@ try {
     # 应用与 bootloader 现在**同一个工程**（本目录的 xmake.lua 里两个 target），
     # 所以这里只配置/构建一次，xmake 会把 bootloader 排在前、firmware 排在后。
     $configArgs = @('f', '-P', $PSScriptRoot, '-m', $Mode, "--esig_sn=$EsigSn",
-                    "--wchlink=$Wchlink", "--swd_pins=$SwdPins", "--board=$Board",
+                    "--wchlink=$Wchlink", "--uart=$Uart", "--swd_pins=$SwdPins", "--board=$Board",
                     "--bootloader=$Bootloader", '-y')
     if ($Reconfigure) { $configArgs += '-c' }
     Write-Host "==> xmake $($configArgs -join ' ')" -ForegroundColor Cyan

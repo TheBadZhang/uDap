@@ -103,9 +103,12 @@ static void service_button(void) {
         (void)drv_control_request(DRV_CONTROL_APPLY_DEBUGGER, (uint32_t)next);
     }
 #else
+#if UART_ENABLE
     usbd_deinitialize(0u);
     drv_uart_mode_toggle();
     chry_dap_usb_start();
+#endif
+    // --uart=n：没有串口，双击不做任何事（长按进 UF2 仍由 bootloader 负责）
 #endif
 }
 
@@ -190,7 +193,7 @@ int main(void) {
     bsp_delay_ms(10u);
     boot_info_stage(2u);
 
-    // 两颗状态灯（板级表的 BOARD_LED_*）统一由 drv_led 管；必须在 drv_uart_mode_init()
+    // 两颗状态灯（板级表的 BOARD_LED_*）统一由 drv_led 管；必须在串口模式初始化
     // 之前初始化 —— 后者会把「是否双串口」告诉 LED 模块。
     drv_led_init();
     if (drv_mode_store_load_led_mode(&led_mode)) {
@@ -200,14 +203,20 @@ int main(void) {
 
     // COM1 <-> 板级表的 BOARD_UART1_*，默认 115200；
     // 主机改 CDC 行编码时波特率会跟着变
+    // （--uart=n 的构建里没有串口，整块跳过）
+#if UART_ENABLE
     drv_uart_init(0u);
+#endif
     boot_info_stage(4u);
 
     // 按键：上拉输入 + 复位去抖/双击状态机
     drv_mode_button_init();
 
-    // PA2/PA3 的用途（DTR/RTS 或 USART2）+ 从选项字恢复串口模式
+    // 第二路串口/流控脚的用途 + 从选项字恢复串口模式
+#if UART_ENABLE
     drv_uart_mode_init();
+#endif
+    // --uart=n：没有串口，串口灯自然保持熄灭（s_uart_dual 恒为 false）
     boot_info_stage(5u);
 
     // 调试器模式：上电默认 CMSIS-DAP，用户选择字 Data0 里有有效记录就按记录走。

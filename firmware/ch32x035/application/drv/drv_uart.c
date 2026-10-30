@@ -17,6 +17,11 @@
 #include "drv/drv_led.h"
 #include "drv/drv_mode_store.h"
 
+/* --uart=n（UART_ENABLE=0）时整份驱动不编：既没有 CDC 字符设备要服务，
+ * 也没有 USART/DMA 需要初始化。把头文件里的声明留着，调用点由各自的
+ * #if 决定是否使用。 */
+#if UART_ENABLE
+
 // ===========================================================================
 // 本文件 = 全部串口相关驱动（原来分散在 6 对文件里）：
 //
@@ -988,3 +993,5 @@ void usbd_cdc_acm_set_rts(uint8_t busid, uint8_t intf, bool rts) {
     }
     drv_flow_pins_set_rts(rts);
 }
+
+#endif /* UART_ENABLE */

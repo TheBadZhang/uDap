@@ -20,6 +20,7 @@ cd firmware\ch32x035
 # 一键构建（默认）：bootloader + 应用 + firmware.uf2 + firmware_full.bin
 .\build.ps1
 .\build.ps1 -Board ch32x033        # uDap-CH32X033 的引脚表（同一份代码）
+.\build.ps1 -Uart n                # 只留 SWD：没有 CDC/USART/DMA，USB 里只剩 DAP 接口
 .\build.ps1 -EsigSn n              # 固定序列号 DEADBEEF（所有板子相同）
 .\build.ps1 -Wchlink y             # 双模式（+ WCH-Link）；这个构建不支持 UF2
 .\build.ps1 -Bootloader n          # 不要 bootloader，应用从 0x0 起
@@ -33,11 +34,32 @@ build.bat -Board ch32x033
 # 或直接用 xmake（记得显式传选项，xmake 会记住上次的值）
 # 工具链优先 GCC15，其次是 GCC12；也可以自己指定任意版本/安装路径
 $env:WCH_TOOLCHAIN_ROOT = "C:\MounRiver\MounRiver_Studio2\resources\app\resources\win32\components\WCH\Toolchain\RISC-V Embedded GCC15"
-xmake f -m release --board=ch32x035 --esig_sn=y --wchlink=n --swd_pins=board --bootloader=y -y
+xmake f -m release --board=ch32x035 --esig_sn=y --wchlink=n --uart=y --swd_pins=board --bootloader=y -y
 xmake -P . -r              # 两个 target 都编：bootloader → firmware
 xmake -P . -r firmware     # 只编应用
 xmake -P . -r bootloader   # 只编 bootloader（默认布局下才存在）
 ```
+
+> `--uart=n` 编出「只有 SWD」的固件：USB 里只剩 CMSIS-DAP 的 vendor bulk 接口
+> （接口 0：2 个 bulk 端点）+ 一个 0 端点的占位接口（接口 1），两者同属一个 IAD。
+> 固件里没有 CDC、USART、DMA 与串口服务。x033 板上实测：Flash 25.29 → **20.98 KiB**，
+> RAM 18.43 → **14.16 KiB**。
+> 为什么还留两个接口：Windows 的 WinUSB 兼容 ID（MS OS 2.0）是**按接口**给的，
+> 由 `usbccgp` 在创建接口子设备节点时才套上去，而 `usbccgp` 只为**组合设备**
+> （多接口或 IAD）加载。单接口设备只有一个设备节点，`USB\MS_COMP_WINUSB` 无处可套
+>  —— 现象就是「设备出现了（能看到 uDAP CMSIS-DAP）但代码 28：没有兼容驱动」。
+> 实测验证过：单接口 + 无 IAD 的版本即使把 bcdDevice 换成 0x0101（强制重新取
+> MS OS 描述符、绕开缓存）**仍然**报代码 28，且硬件 ID 里没有 `&MI_00`，
+> 说明它压根没被当成组合设备 —— 这个多接口结构是必需的，不是缓存问题。
+> 占位接口没有端点，OpenOCD/pyOCD 按「vendor class + 2 个 bulk 端点」筛选时会跳过它。
+> 调试时曾用「按构建改 bcdDevice」强制 Windows 重取 MS OS 描述符（`usbflags` 按
+> VID+PID+bcdDevice 建键），后来证实那次 Code 28 是描述符结构问题、与缓存无关，
+> 所以**两种构建的 bcdDevice 现在都是 0x0100**；若改描述符后主机仍沿用旧绑定，
+> 在设备管理器里卸载一次设备即可。
+> 为什么更快：主机不再轮询 CDC 端点，主循环里也没有 `chry_dap_cdc_bridge()`
+> （它在每条 DAP 命令之后都会被调一次）。SWD 的位时序本身不受串口代码影响。
+> 它和 `--wchlink=y` 互斥（WCH-Link 模式的 CDC 桥也依赖串口驱动），同时给会直接报错。
+
 
 > `--board` 选板卡引脚表（`application/board/board_<名字>.h`）：`ch32x035`（默认，
 > uDap-CH32X035F8U6）或 `ch32x033`（uDap-CH32X033）。它只决定 `BOARD_VARIANT` 宏，

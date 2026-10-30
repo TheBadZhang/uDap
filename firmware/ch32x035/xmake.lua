@@ -51,6 +51,7 @@ local uf2_include = third_party .. "/uf2"
 
 local esig_sn_enabled = has_config("esig_sn")
 local wchlink_enabled = has_config("wchlink")
+local uart_enabled = has_config("uart")
 -- 板卡引脚表：只影响 BOARD_VARIANT 宏（见 application/board_pin_map.h）
 local board = get_config("board") or "ch32x035"
 -- 双模式固件（约 57 KiB）放不下 16 KiB 的 bootloader，只能退回应用独占 Flash
@@ -191,6 +192,17 @@ option("wchlink")
     set_default(false)
     set_showmenu(true)
     set_description("Also build the WCH-Link (RVSWD) debugger mode (dual-mode firmware, ~6 KiB RAM)")
+option_end()
+
+-- 是否编入串口桥（USB CDC + USART）。
+--   y（默认）CMSIS-DAP + 串口（单串口或双串口）
+--   n       只有 CMSIS-DAP：USB 里没有 CDC、固件里没有 USART/DMA，主机不再轮询
+--           那几组 CDC 端点，主循环也没有串口服务 —— 给「只追求最快 SWD」用。
+-- 与 --wchlink=y 互斥（WCH-Link 模式的 CDC 桥同样依赖串口驱动）。
+option("uart")
+    set_default(true)
+    set_showmenu(true)
+    set_description("Build the USB CDC + USART bridge (set n for an SWD-only firmware)")
 option_end()
 
 -- 是否按「UF2 bootloader 布局」构建（应用从 0x4000 起 + 同时构建 bootloader）
@@ -345,6 +357,7 @@ target("firmware")
     add_includedirs(app_src, app_src .. "/port")
     add_defines("ESIG_SN=" .. (esig_sn_enabled and 1 or 0))
     add_defines("WCHLINK_ENABLE=" .. (wchlink_enabled and 1 or 0))
+    add_defines("UART_ENABLE=" .. (uart_enabled and 1 or 0))
     add_defines("UDAP_UF2_BOOTLOADER=" .. (use_bootloader and 1 or 0))
 
     -- 板卡引脚表 -> BOARD_VARIANT（application/board_pin_map.h 选 board_<name>.h）
@@ -435,6 +448,9 @@ target("firmware")
 
     -- 打印当前模式、工具链与布局（before_build 是脚本作用域，可以用 raise）
     before_build(function (target)
+        if not uart_enabled and wchlink_enabled then
+            os.raise("--uart=n 只能和单模式 CMSIS-DAP 一起用（WCH-Link 模式的 CDC 桥依赖串口驱动）")
+        end
         local required = {app_src .. "/board_pin_map.h",
                           app_src .. "/board/board_ch32x035f8u6.h",
                           app_src .. "/board/board_ch32x033.h",
@@ -478,6 +494,9 @@ target("firmware")
         cprint("${cyan}Debugger:${clear} %s", wchlink_enabled
             and "CMSIS-DAP + WCH-Link (dual mode, double-click the button at runtime to switch)"
             or "CMSIS-DAP only (--wchlink=y to add WCH-Link)")
+        cprint("${cyan}UART:${clear} %s", uart_enabled
+            and "USB CDC + USART bridge (single/dual UART)"
+            or "none (SWD only: no CDC interface, no USART/DMA)")
         cprint("${cyan}Layout:${clear} %s", use_bootloader
             and "UF2 bootloader + app at 0x4000 (drag firmware.uf2 to upgrade)"
             or (wchlink_enabled

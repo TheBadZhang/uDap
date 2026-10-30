@@ -271,12 +271,20 @@ static const uint8_t device_descriptor[] = {
     USB_DEVICE_DESCRIPTOR_INIT(USB_2_1, 0xEF, 0x02, 0x01, USBD_VID, USBD_PID, 0x0100, 0x01),
 };
 
-/* 两套描述符共用的部分：DAP 接口 + 串口 1（CDC1） */
-#define USB_CONFIG_BODY_COMMON                                                                                     \
+/* DAP 接口 + 两个 bulk 端点（--uart=n 时描述符里只有这一块） */
+
+/* DAP 接口 + 两个 bulk 端点（--uart=n 时描述符里只有这一块） */
+#define USB_CONFIG_BODY_DAP                                                                                        \
     /* Interface 0：CMSIS-DAP vendor bulk */                                                                       \
     USB_INTERFACE_DESCRIPTOR_INIT(0x00, 0x00, 0x02, 0xFF, 0x00, 0x00, 0x02),                                      \
     USB_ENDPOINT_DESCRIPTOR_INIT(DAP_OUT_EP, USB_ENDPOINT_TYPE_BULK, DAP_PACKET_SIZE, 0x00),                       \
-    USB_ENDPOINT_DESCRIPTOR_INIT(DAP_IN_EP, USB_ENDPOINT_TYPE_BULK, DAP_PACKET_SIZE, 0x00),                        \
+    USB_ENDPOINT_DESCRIPTOR_INIT(DAP_IN_EP, USB_ENDPOINT_TYPE_BULK, DAP_PACKET_SIZE, 0x00)
+
+#if UART_ENABLE
+
+/* 两套描述符共用的部分：DAP 接口 + 串口 1（CDC1） */
+#define USB_CONFIG_BODY_COMMON                                                                                     \
+    USB_CONFIG_BODY_DAP,                                                                                           \
     /* 串口 1：CDC1 <-> COM1（串口实例与引脚见 board_pin_map.h） */                                                 \
     CDC_ACM_DESCRIPTOR_INIT(0x01, CDC_INT_EP, CDC_OUT_EP, CDC_IN_EP, DAP_PACKET_SIZE, 0x00)
 
@@ -353,6 +361,65 @@ _Static_assert(sizeof(other_speed_config_descriptor_single) == USB_CONFIG_SIZE_S
                "other_speed_config_descriptor_single size mismatch");
 _Static_assert(sizeof(other_speed_config_descriptor_dual) == USB_CONFIG_SIZE_DUAL,
                "other_speed_config_descriptor_dual size mismatch");
+
+#else /* !UART_ENABLE：--uart=n，USB 里只有 CMSIS-DAP 的 vendor bulk 接口 */
+
+#if CONFIG_CHERRYDAP_USE_CUSTOM_HID || CONFIG_CHERRYDAP_USE_MSC || USBD_WEBUSB_ENABLE
+#error "--uart=n 的极简描述符只实现了 CMSIS-DAP 接口"
+#endif
+
+#define USB_CONFIG_SIZE_DAP_ONLY (9 + 8 + CMSIS_DAP_INTERFACE_SIZE + 9)
+#define INTF_NUM_DAP_ONLY        2
+
+/* Windows 只在「组合设备」上取 MS OS 2.0 兼容 ID（WinUSB），再套到组合设备的
+ * **接口子节点**上。因此单接口固件也必须让主机看到多接口 + IAD，否则只剩一个
+ * 普通设备节点、compatible ID 无处可套 —— 现象是「设备在，但代码 28：没有兼容
+ * 驱动」。这里放两个接口（第二个 0 端点、仅用于凑成组合设备），并让它们同属
+ * 一个 IAD，于是 usbccgp 只建 **一个** 子节点，驱动仍只绑一次。
+ *
+ * 第二个接口刻意不给端点：OpenOCD/pyOCD 找 CMSIS-DAP 时按「vendor class +
+ * 2 个 bulk 端点」筛选，会跳过它。 */
+#define USB_CONFIG_BODY_DAP_IAD                                                                                    \
+    USB_IAD_DESCRIPTOR_INIT(0x00, 0x02, 0xFF, 0x00, 0x00),                                                         \
+    USB_CONFIG_BODY_DAP,                                                                                           \
+    USB_INTERFACE_DESCRIPTOR_INIT(0x01, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00)
+
+/* 没有串口就没有「单/双串口」之分，四个名字内容相同 —— 保留它们是为了让
+ * config_descriptor_callback 与下面的静态断言在两种构建里长得一样。 */
+static const uint8_t config_descriptor_single[] = {
+    USB_CONFIG_DESCRIPTOR_INIT(USB_CONFIG_SIZE_DAP_ONLY, INTF_NUM_DAP_ONLY, 0x01,
+                               USB_CONFIG_BUS_POWERED, USBD_MAX_POWER),
+    USB_CONFIG_BODY_DAP_IAD,
+};
+
+static const uint8_t config_descriptor_dual[] = {
+    USB_CONFIG_DESCRIPTOR_INIT(USB_CONFIG_SIZE_DAP_ONLY, INTF_NUM_DAP_ONLY, 0x01,
+                               USB_CONFIG_BUS_POWERED, USBD_MAX_POWER),
+    USB_CONFIG_BODY_DAP_IAD,
+};
+
+static const uint8_t other_speed_config_descriptor_single[] = {
+    USB_CONFIG_DESCRIPTOR_INIT(USB_CONFIG_SIZE_DAP_ONLY, INTF_NUM_DAP_ONLY, 0x01,
+                               USB_CONFIG_BUS_POWERED, USBD_MAX_POWER),
+    USB_CONFIG_BODY_DAP_IAD,
+};
+
+static const uint8_t other_speed_config_descriptor_dual[] = {
+    USB_CONFIG_DESCRIPTOR_INIT(USB_CONFIG_SIZE_DAP_ONLY, INTF_NUM_DAP_ONLY, 0x01,
+                               USB_CONFIG_BUS_POWERED, USBD_MAX_POWER),
+    USB_CONFIG_BODY_DAP_IAD,
+};
+
+_Static_assert(sizeof(config_descriptor_single) == USB_CONFIG_SIZE_DAP_ONLY,
+               "config_descriptor_single size does not match USB_CONFIG_SIZE_DAP_ONLY");
+_Static_assert(sizeof(config_descriptor_dual) == USB_CONFIG_SIZE_DAP_ONLY,
+               "config_descriptor_dual size does not match USB_CONFIG_SIZE_DAP_ONLY");
+_Static_assert(sizeof(other_speed_config_descriptor_single) == USB_CONFIG_SIZE_DAP_ONLY,
+               "other_speed_config_descriptor_single size mismatch");
+_Static_assert(sizeof(other_speed_config_descriptor_dual) == USB_CONFIG_SIZE_DAP_ONLY,
+               "other_speed_config_descriptor_dual size mismatch");
+
+#endif /* UART_ENABLE */
 
 /*!< custom hid report descriptor */
 const uint8_t hid_custom_report_desc[HID_CUSTOM_REPORT_DESC_SIZE] = {
@@ -487,9 +554,14 @@ __WEAK const uint8_t *device_descriptor_callback(uint8_t speed) {
 
 // 枚举时按当前串口模式挑描述符：串口 1 + 流控 -> 只有 COM1；双串口 -> COM1 + COM2。
 // 运行期双击切换模式后必须重新枚举，否则主机看到的还是旧布局。
+// --uart=n 时两套内容相同（都只有 DAP），不需要按模式选。
 __WEAK const uint8_t *config_descriptor_callback(uint8_t speed) {
     (void)speed;
+#if UART_ENABLE
     return drv_uart_mode_is_dual() ? config_descriptor_dual : config_descriptor_single;
+#else
+    return config_descriptor_single;
+#endif
 }
 
 __WEAK const uint8_t *device_quality_descriptor_callback(uint8_t speed) {
@@ -499,8 +571,12 @@ __WEAK const uint8_t *device_quality_descriptor_callback(uint8_t speed) {
 
 __WEAK const uint8_t *other_speed_config_descriptor_callback(uint8_t speed) {
     (void)speed;
+#if UART_ENABLE
     return drv_uart_mode_is_dual() ? other_speed_config_descriptor_dual
                                    : other_speed_config_descriptor_single;
+#else
+    return other_speed_config_descriptor_single;
+#endif
 }
 
 __WEAK const char *string_descriptor_callback(uint8_t speed, uint8_t index) {
@@ -545,6 +621,8 @@ static uint16_t USB_RespSize[DAP_PACKET_COUNT] DAP_PRIVATE_SECTION;             
 #define CDC_OUT_BUFFER_SIZE DAP_PACKET_SIZE
 #define CDC_IN_BUFFER_SIZE  512u
 
+#if UART_ENABLE
+
 static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t cdc_out_buffer[CDC_OUT_BUFFER_SIZE] DAP_PRIVATE_SECTION;
 static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t cdc_in_buffer[CDC_IN_BUFFER_SIZE] DAP_PRIVATE_SECTION;
 static volatile uint8_t cdc_tx_busy;
@@ -558,6 +636,8 @@ static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t cdc2_out_buffer[CDC_OUT_BU
 static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t cdc2_in_buffer[CDC_IN_BUFFER_SIZE] DAP_PRIVATE_SECTION;
 static volatile uint8_t cdc2_tx_busy;
 static volatile uint8_t cdc2_out_stalled;
+
+#endif /* UART_ENABLE */
 
 // ---------------------------------------------------------------------------
 // 关于 COM 口波特率：不再设上限
@@ -595,6 +675,8 @@ static volatile uint8_t cdc2_out_stalled;
 // 端点既然没挂就永远不会再有中断，「FIFO 已排空」只能在主循环里察觉 ——
 // 少了这一半，背压会把 OUT 端点永久停摆（比丢字节更糟）。
 // IN 那一支不能在 UART 中断里做，因为 usbd_ep_start_write 不是中断安全的。
+#if UART_ENABLE
+
 // COM1 <-> USART4 的两个方向
 static void cdc1_bridge(void) {
     uint32_t length;
@@ -668,13 +750,23 @@ void chry_dap_cdc_bridge(void) {
     cdc2_bridge();
 }
 
+#else /* !UART_ENABLE：没有 CDC 端点，这里什么都不用做 */
+
+// 保留函数名：主循环与 chry_dap_handle() 的调用点不用加 #if
+void chry_dap_cdc_bridge(void) {
+}
+
+#endif /* UART_ENABLE */
+
 void usbd_event_handler(uint8_t busid, uint8_t event) {
     (void)busid;
     switch (event) {
         case USBD_EVENT_RESET:
             // 复位后端点重新枚举，发送状态一并清零
+#if UART_ENABLE
             cdc_tx_busy = 0U;
             cdc2_tx_busy = 0U;
+#endif
             break;
         case USBD_EVENT_CONNECTED:
             break;
@@ -687,6 +779,7 @@ void usbd_event_handler(uint8_t busid, uint8_t event) {
         case USBD_EVENT_CONFIGURED:
             /* setup first out ep read transfer */
             USB_RequestIdle = 0U;
+#if UART_ENABLE
             cdc_tx_busy = 0U;
             cdc_out_stalled = 0U;
             cdc2_tx_busy = 0U;
@@ -697,6 +790,9 @@ void usbd_event_handler(uint8_t busid, uint8_t event) {
             if (drv_uart_mode_is_dual()) {
                 usbd_ep_start_read(0, CDC2_OUT_EP, cdc2_out_buffer, sizeof(cdc2_out_buffer));
             }
+#else
+            usbd_ep_start_read(0, DAP_OUT_EP, USB_Request[0], DAP_PACKET_SIZE);
+#endif
 
             break;
         case USBD_EVENT_SET_REMOTE_WAKEUP:
@@ -745,6 +841,8 @@ void dap_in_callback(uint8_t busid, uint8_t ep, uint32_t nbytes) {
         USB_ResponseIdle = 1U;
     }
 }
+
+#if UART_ENABLE
 
 void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes) DAP_HIGHCODE_SECTION __attribute__((noinline));
 void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes) {
@@ -818,6 +916,8 @@ void usbd_cdc_acm2_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes) {
     cdc2_tx_busy = 0U;
 }
 
+#endif /* UART_ENABLE */
+
 struct usbd_endpoint dap_out_ep = {
     .ep_addr = DAP_OUT_EP,
     .ep_cb = dap_out_callback};
@@ -826,6 +926,7 @@ struct usbd_endpoint dap_in_ep = {
     .ep_addr = DAP_IN_EP,
     .ep_cb = dap_in_callback};
 
+#if UART_ENABLE
 struct usbd_endpoint cdc_out_ep = {
     .ep_addr = CDC_OUT_EP,
     .ep_cb = usbd_cdc_acm_bulk_out};
@@ -841,6 +942,7 @@ struct usbd_endpoint cdc2_out_ep = {
 struct usbd_endpoint cdc2_in_ep = {
     .ep_addr = CDC2_IN_EP,
     .ep_cb = usbd_cdc_acm2_bulk_in};
+#endif /* UART_ENABLE */
 
 #if CONFIG_CHERRYDAP_USE_CUSTOM_HID
 struct usbd_endpoint hid_custom_in_ep = {
@@ -855,11 +957,16 @@ struct usbd_endpoint hid_custom_out_ep = {
 #endif
 
 struct usbd_interface dap_intf;
+#if UART_ENABLE
 struct usbd_interface intf1;
 struct usbd_interface intf2;
 // 第二个 CDC（COM2，双串口模式）的控制接口与数据接口
 struct usbd_interface cdc2_ctrl_intf;
 struct usbd_interface cdc2_data_intf;
+#else
+// --uart=n：描述符里的第二个接口（0 端点，仅用于让 Windows 按组合设备枚举）
+struct usbd_interface dap_stub_intf;
+#endif
 #if CONFIG_CHERRYDAP_USE_CUSTOM_HID
 struct usbd_interface hid_intf;
 #endif
@@ -905,7 +1012,8 @@ void chry_dap_usb_start(void) {
     usbd_add_endpoint(0, &dap_out_ep);
     usbd_add_endpoint(0, &dap_in_ep);
 
-    /*!< cdc acm：串口 1 <-> USART4 */
+#if UART_ENABLE
+    /*!< cdc acm：串口 1 <-> COM1 */
     usbd_add_interface(0, usbd_cdc_acm_init_intf(0, &intf1));
     usbd_add_interface(0, usbd_cdc_acm_init_intf(0, &intf2));
     usbd_add_endpoint(0, &cdc_out_ep);
@@ -919,6 +1027,12 @@ void chry_dap_usb_start(void) {
         usbd_add_endpoint(0, &cdc2_out_ep);
         usbd_add_endpoint(0, &cdc2_in_ep);
     }
+#else
+    // --uart=n：描述符里的第二个接口（0 端点）。注册它只是为了让
+    // 「注册的接口数」与描述符里的 bNumInterfaces 一致；它没有类处理函数，
+    // 标准接口请求由 CherryUSB 通用路径应答。
+    usbd_add_interface(0, &dap_stub_intf);
+#endif /* UART_ENABLE */
 
 #if CONFIG_CHERRYDAP_USE_CUSTOM_HID
     /*!< hid */

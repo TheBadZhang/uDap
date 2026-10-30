@@ -56,12 +56,14 @@ static void control_reset_now(void) {
 
 static void control_execute(void) {
     switch (s_action) {
+#if UART_ENABLE
     case DRV_CONTROL_APPLY_UART_MODE:
         // 接口数变了，必须重新枚举：先断开，再按新模式注册描述符/接口/端点
         usbd_deinitialize(0u);
         (void)drv_uart_mode_set((drv_uart_mode_t)s_arg);
         chry_dap_usb_start();
         break;
+#endif
 
     case DRV_CONTROL_SOFT_RESET:
         control_reset_now();
