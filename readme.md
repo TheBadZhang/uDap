@@ -72,6 +72,26 @@ flowchart LR
 | UART 灯 | PB12 | 低电平点亮；默认 = 亮表示双串口模式（也可由 vendor command 切换用途） |
 | USB | PC16 = DPDM / PC17 = DP | 固定复用 |
 
+### uDap-CH32X033
+
+与 uDap-CH32X035F8U6 **同一份固件**（CH32X033 的 SDK/外设与 X035 相同，差别只有引脚
+与 USB PD/CC 外设），换一张板级表就行：
+
+```powershell
+.\build.ps1 -Board ch32x033
+```
+
+| 信号 | 引脚 | 说明 |
+| --- | --- | --- |
+| SWCLK / SWDIO | PA1 / PA0 | CMSIS-DAP + WCH-Link（互斥），默认方案 `pa0_pa1` |
+| nRESET | PA9 | 目标复位，低有效（开漏模拟） |
+| RX1 / TX1 | PA3 / PA2 | 串口1，USART2 默认引脚 |
+| TX2 / RX2 | PA10 / PA11 | 串口2，USART1 + `USART1_RM = 01` |
+| 模式按键 | PC3 | 上拉输入，按下接地；长按进 UF2，双击切模式 |
+| LED（DAP / UART） | PB7 / PB1 | 低电平点亮 |
+| USB | PC16 = DPDM / PC17 = DP | 固定复用 |
+| DTR / RTS | 无 | 本板没有这两个脚，默认串口模式为双串口 |
+
 ### uDap-CH32V203F8U6
 
 ### uDap-CH572

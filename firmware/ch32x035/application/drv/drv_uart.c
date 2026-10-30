@@ -21,15 +21,19 @@
 // 本文件 = 全部串口相关驱动（原来分散在 6 对文件里）：
 //
 //   RX 的 DMA 环形引擎（两路共用，本文件 internal）
-//   PA2 = DTR / PA3 = RTS（低有效输出）
-//   drv_uart.c       COM1：USART4（PB0 / PB1）
-//   COM2：USART2（PA2 / PA3，仅双串口模式）
+//   DTR / RTS 输出（低有效；板级可选，见 BOARD_AUX_FLOW_PINS）
+//   COM1：桥接串口 1（引脚/实例见板级表的 BOARD_UART1_*）
+//   COM2：桥接串口 2（板级表的 BOARD_AUX_UART_*，仅双串口模式）
 //   串口模式切换 + 选项字持久化
 //   CDC ACM 行编码 / DTR / RTS 回调
 //
-// 合并的理由：这几块共用同一组引脚（PA2/PA3）、同一套 DMA 引擎、同一份
-// 「谁在占用引脚」的约定（drv_uart_mode），拆开时改动一处往往要同步改三四处；
-// 合成一对文件后，引脚归属与模式切换的因果链在同一个 TU 里可见。
+// 合并的理由：这几块共用同一组引脚（有 DTR/RTS 的板子上 COM2 与流控脚是同一对）、
+// 同一套 DMA 引擎、同一份「谁在占用引脚」的约定（drv_uart_mode），拆开时改动
+// 一处往往要同步改三四处；合成一对文件后，引脚归属与模式切换的因果链在同一个
+// TU 里可见。
+//
+// 具体是哪个 USART / 哪个 DMA 通道 / 哪两个脚，全部由板级表
+// （application/board_pin_map.h）决定，本文件里没有一处写死。
 //
 // 分节顺序即依赖顺序：DMA 引擎 -> 流控脚 -> COM1 -> COM2 -> 模式 -> CDC 回调。
 // ===========================================================================
@@ -271,11 +275,17 @@ static void uart_dma_rx_isr(uart_dma_t *u) {
 
 
 // ===========================================================================
-// 第 2 节：PA2 / PA3 的 DTR + RTS 输出
+// 第 2 节：DTR / RTS 输出（板级可选）
 // ===========================================================================
+//
+// 引脚来自板级表（application/board_pin_map.h 的 BOARD_AUX_FLOW_PINS）：
+//   uDap-CH32X035F8U6  有：PA2 = DTR / PA3 = RTS（双串口模式下让给 USART2）
+//   uDap-CH32X033      无：整段编成空操作（CDC 的 DTR/RTS 不下发到板上）
+//
+// 低有效（FT232 的 DTR#/RTS# 习惯），所以断言 -> BCR 拉低、释放 -> BSHR 置高。
 
-// DTR/RTS 是「低有效」输出（FT232 的 DTR#/RTS# 习惯），所以：
-//   断言 -> BCR 拉低      释放 -> BSHR 置高
+#if BOARD_AUX_FLOW_PINS
+
 static bool s_dtr;
 static bool s_rts;
 static bool s_enabled;
@@ -341,24 +351,40 @@ bool drv_flow_pins_rts(void) {
     return s_enabled && s_rts;
 }
 
+#else /* !BOARD_AUX_FLOW_PINS：本板没有 DTR/RTS 脚 */
+
+// 空实现：调用方（模式切换、CDC 回调）不需要分支
+void drv_flow_pins_release(void) {}
+void drv_flow_pins_enable(void) {}
+void drv_flow_pins_set_dtr(bool asserted) { (void)asserted; }
+void drv_flow_pins_set_rts(bool asserted) { (void)asserted; }
+bool drv_flow_pins_dtr(void) { return false; }
+bool drv_flow_pins_rts(void) { return false; }
+
+#endif /* BOARD_AUX_FLOW_PINS */
+
 
 // ===========================================================================
-// COM1：USART4（PB0 = TX / PB1 = RX）  (原 drv_uart.c)
+// COM1：桥接串口 1（引脚/实例见 application/board_pin_map.h 的 BOARD_UART1_*）
 // ===========================================================================
-
-// USART4 挂在 APB1，波特率由 USART_Init() 通过 RCC_GetClocksFreq() 自动换算，
-// 本工程 APB1 = SYSCLK = 48 MHz（见 system_ch32x035.c 的 SetSysClockTo48_HSI）。
-// 引脚定义见 src/board_pin_map.h（PB0 = TX、PB1 = RX）。
+//
+// 波特率由 USART_Init() 通过 RCC_GetClocksFreq() 自动换算（本工程 APB1/APB2 都是
+// SYSCLK = 48 MHz，见 system_ch32x035.c 的 SetSysClockTo48_HSI），所以换成
+// USART2（uDap-CH32X033 用的那个）不需要改任何波特率代码。
 #define UART_INSTANCE   BOARD_UART1_INSTANCE
 #define UART_IRQN       BOARD_UART1_IRQN
 #define UART_GPIO       BOARD_UART1_PORT
 #define UART_GPIO_CLK   BOARD_UART1_PORT_CLK
-#define UART_CLK        BOARD_UART1_CLK
 #define UART_TX_PIN     BOARD_UART1_TX_PIN
 #define UART_RX_PIN     BOARD_UART1_RX_PIN
 
 // ===========================================================================
-// RX 走 DMA（USART4_RX = DMA1_Channel8，见本文件开头的 DMA 引擎小节），TX 仍用 TXE 中断
+// RX 走 DMA（具体通道由板级表给，uart_dma_hw_t 见本文件开头的 DMA 引擎小节），
+// TX 仍用 TXE 中断
+//
+// 通道是硬件固定的（参考手册的 DMA 请求映射表）：
+//   USART4_RX = Ch8，USART2_RX = Ch6，USART1_RX = Ch5
+// 所以换串口实例时通道必须跟着变 —— 这就是它放在板级表里的原因。
 //
 // RX 是丢数据的那一侧：1 Mbaud 下逐字节中断每秒 10 万次，又会被 USB 中断抢占，
 // 来不及读 DATAR 时硬件置 ORE 直接丢字节 —— 这部分交给 DMA 之后只剩「每半个
@@ -382,22 +408,14 @@ bool drv_flow_pins_rts(void) {
 
 static uint8_t uart_rx_dma_buf[UART_RX_DMA_SIZE];
 
-// TX FIFO：生产者是 USB 中断（CDC OUT 回调），消费者是 USART4 中断
+// TX FIFO：生产者是 USB 中断（CDC OUT 回调），消费者是串口中断
 static uint8_t uart_tx_pool[UART_TX_FIFO_SIZE];
 static chry_ringbuffer_t uart_tx_fifo;
 
 static uart_dma_t uart_dma;
 
-static const uart_dma_hw_t uart_dma_hw = {
-    .rx_ch = DMA1_Channel8,
-    .rx_irqn = DMA1_Channel8_IRQn,
-    .rx_ht_it = DMA1_IT_HT8,
-    .rx_tc_it = DMA1_IT_TC8,
-    .rx_te_it = DMA1_IT_TE8,
-    .rx_ht_flag = DMA1_FLAG_HT8,
-    .rx_tc_flag = DMA1_FLAG_TC8,
-    .rx_te_flag = DMA1_FLAG_TE8,
-};
+/* RX DMA 通道/中断/标志位：由板级表按串口实例给出 */
+static const uart_dma_hw_t uart_dma_hw = BOARD_UART1_RX_DMA_HW;
 
 static uint32_t uart_baudrate = UART_DEFAULT_BAUDRATE;
 static volatile uint32_t uart_tx_overflow;
@@ -422,18 +440,22 @@ void drv_uart_init(uint32_t baudrate) {
     NVIC_InitTypeDef nvic = {0};
 
     RCC_APB2PeriphClockCmd(UART_GPIO_CLK, ENABLE);
-    RCC_APB1PeriphClockCmd(UART_CLK, ENABLE);
+    BOARD_UART1_CLK_ENABLE();
 
-    // PB0 = USART4_TX，复用推挽
+    // 串口 TX：复用推挽
     gpio.GPIO_Pin = UART_TX_PIN;
     gpio.GPIO_Speed = GPIO_Speed_50MHz;
     gpio.GPIO_Mode = GPIO_Mode_AF_PP;
     GPIO_Init(UART_GPIO, &gpio);
 
-    // PB1 = USART4_RX，上拉输入：不接目标时也不会收到悬空噪声
+    // 串口 RX：上拉输入，不接目标时也不会收到悬空噪声
     gpio.GPIO_Pin = UART_RX_PIN;
     gpio.GPIO_Mode = GPIO_Mode_IPU;
     GPIO_Init(UART_GPIO, &gpio);
+
+    // uDap-CH32X033 上 COM1 就接在 SWD 那一对脚（PA2/PA3）旁边同 port 的 CFGLR 上：
+    // GPIO_Init 改过 CFGLR，SWD 的方向切换影子必须重建，否则会被旧值覆盖。
+    board_swd_cfglr_resync();
 
     (void)chry_ringbuffer_init(&uart_tx_fifo, uart_tx_pool, sizeof(uart_tx_pool));
     uart_tx_overflow = 0u;
@@ -527,11 +549,12 @@ void drv_uart_rx_resync(void) {
     uart_dma_rx_restart(&uart_dma);
 }
 
-// USART4 中断：只处理 TXE（RX 由 DMA 负责）。
+// 桥接串口 1 的中断：只处理 TXE（RX 由 DMA 负责）。
 // 用 USART_GetFlagStatus 而不是 USART_GetITStatus：后者会把「中断使能位」与
 // 「状态标志」相与（见 SDK 实现），使能位状态会干扰标志判读。
-void USART4_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
-void USART4_IRQHandler(void) {
+// 服务函数名由板级表给（USART4_IRQHandler / USART2_IRQHandler）。
+void BOARD_UART1_IRQ_HANDLER(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void BOARD_UART1_IRQ_HANDLER(void) {
     if (USART_GetFlagStatus(UART_INSTANCE, USART_FLAG_TXE) != RESET) {
         uint8_t byte;
 
@@ -553,23 +576,24 @@ void USART4_IRQHandler(void) {
     }
 }
 
-// USART4 的 RX DMA 中断（半/全传输、传输错误）
-void DMA1_Channel8_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
-void DMA1_Channel8_IRQHandler(void) {
+// 桥接串口 1 的 RX DMA 中断（半/全传输、传输错误）
+void BOARD_UART1_RX_DMA_ISR(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void BOARD_UART1_RX_DMA_ISR(void) {
     uart_dma_rx_isr(&uart_dma);
 }
 
 
 // ===========================================================================
-// 第 4 节：COM2 —— USART2（PA2 = TX2 / PA3 = RX2，仅双串口模式）
+// 第 4 节：COM2 —— 第二路桥接串口（引脚/实例见板级表的 BOARD_AUX_UART_*）
 // ===========================================================================
-
-// USART2 挂在 APB1，波特率由 USART_Init() 通过 RCC_GetClocksFreq() 自动换算
-// （本工程 APB1 = SYSCLK = 48 MHz，与 USART4 相同）。
-// 引脚见 src/board_pin_map.h：PA2 = USART2_TX（TX2）、PA3 = USART2_RX（RX2）。
+//   uDap-CH32X035F8U6  USART2，PA2 = TX2 / PA3 = RX2（与 DTR/RTS 共用这两个脚）
+//   uDap-CH32X033      USART1，PA10 = TX2 / PA11 = RX2（USART1_RM = 01）
+//
+// 波特率由 USART_Init() 通过 RCC_GetClocksFreq() 自动换算（本工程 APB1/APB2 都是
+// SYSCLK = 48 MHz），所以实例从 USART2 换成 USART1 也不用改波特率代码。
 //
 // ===========================================================================
-// RX 走 DMA（USART2_RX = DMA1_Channel6），TX 用 TXE 中断
+// RX 走 DMA（通道由板级表给：USART2_RX = Ch6，USART1_RX = Ch5），TX 用 TXE 中断
 // ===========================================================================
 // 与 COM1（drv_uart.c）的分工一致：
 //   RX —— DMA 环形缓冲（1 KB，零拷贝），只有「每半个缓冲一次」的中断，
@@ -582,22 +606,14 @@ void DMA1_Channel8_IRQHandler(void) {
 
 static uint8_t uart2_rx_dma_buf[UART2_RX_DMA_SIZE];
 
-// TX FIFO：生产者是 USB 中断（CDC OUT 回调），消费者是 USART2 中断
+// TX FIFO：生产者是 USB 中断（CDC OUT 回调），消费者是第二路串口中断
 static uint8_t uart2_tx_pool[UART2_TX_FIFO_SIZE];
 static chry_ringbuffer_t uart2_tx_fifo;
 
 static uart_dma_t uart2_dma;
 
-static const uart_dma_hw_t uart2_dma_hw = {
-    .rx_ch = DMA1_Channel6,
-    .rx_irqn = DMA1_Channel6_IRQn,
-    .rx_ht_it = DMA1_IT_HT6,
-    .rx_tc_it = DMA1_IT_TC6,
-    .rx_te_it = DMA1_IT_TE6,
-    .rx_ht_flag = DMA1_FLAG_HT6,
-    .rx_tc_flag = DMA1_FLAG_TC6,
-    .rx_te_flag = DMA1_FLAG_TE6,
-};
+/* RX DMA 通道/中断/标志位：由板级表按串口实例给出 */
+static const uart_dma_hw_t uart2_dma_hw = BOARD_AUX_UART_RX_DMA_HW;
 
 static uint32_t uart2_baudrate = UART2_DEFAULT_BAUDRATE;
 static volatile uint32_t uart2_tx_overflow;
@@ -631,15 +647,16 @@ void drv_uart2_init(uint32_t baudrate) {
     }
 
     RCC_APB2PeriphClockCmd(BOARD_AUX_PORT_CLK, ENABLE);
-    RCC_APB1PeriphClockCmd(BOARD_AUX_UART_CLK, ENABLE);
+    BOARD_AUX_UART_CLK_ENABLE();
+    BOARD_AUX_UART_REMAP_ENABLE(); /* 默认映射的板子上是空操作 */
 
-    // PA2 = USART2_TX，复用推挽
+    // TX2：复用推挽
     gpio.GPIO_Pin = BOARD_AUX_UART_TX_PIN;
     gpio.GPIO_Speed = GPIO_Speed_50MHz;
     gpio.GPIO_Mode = GPIO_Mode_AF_PP;
     GPIO_Init(BOARD_AUX_PORT, &gpio);
 
-    // PA3 = USART2_RX，上拉输入：不接目标时也不会收到悬空噪声
+    // RX2：上拉输入，不接目标时也不会收到悬空噪声
     gpio.GPIO_Pin = BOARD_AUX_UART_RX_PIN;
     gpio.GPIO_Mode = GPIO_Mode_IPU;
     GPIO_Init(BOARD_AUX_PORT, &gpio);
@@ -650,12 +667,12 @@ void drv_uart2_init(uint32_t baudrate) {
 
     uart2_apply_baudrate(baudrate != 0u ? baudrate : UART2_DEFAULT_BAUDRATE);
 
-    // RX 交给 DMA（引擎内部会开 RX 的 DMA 请求并挂 Ch6 中断），这里只留 TXE 中断。
+    // RX 交给 DMA（引擎内部会开 RX 的 DMA 请求并挂对应通道的中断），这里只留 TXE 中断。
     USART_Cmd(BOARD_AUX_UART_INSTANCE, ENABLE);
     uart_dma_rx_start(&uart2_dma, &uart2_dma_hw, BOARD_AUX_UART_INSTANCE,
                       uart2_rx_dma_buf, UART2_RX_DMA_SIZE);
 
-    // 与 USART4 同级：USB 中断优先级 1，这里 2，保证 UART 中断不会打断 USB
+    // 与 COM1 同级：USB 中断优先级 1，这里 2，保证 UART 中断不会打断 USB
     nvic.NVIC_IRQChannel = BOARD_AUX_UART_IRQN;
     nvic.NVIC_IRQChannelPreemptionPriority = 2;
     nvic.NVIC_IRQChannelSubPriority = 0;
@@ -680,14 +697,15 @@ void drv_uart2_deinit(void) {
         nvic.NVIC_IRQChannelCmd = DISABLE;
         NVIC_Init(&nvic);
 
-        RCC_APB1PeriphClockCmd(BOARD_AUX_UART_CLK, DISABLE);
+        BOARD_AUX_UART_CLK_DISABLE();
 
         uart2_initialized = false;
         drv_uart2_reset();
     }
 
-    // 无论是否初始化过都把 PA2/PA3 交出去：调用方指望本函数之后这两个脚
-    // 不再由 USART2 驱动（随后由 drv_flow_pins_enable() 接管成 DTR/RTS）
+    // 无论是否初始化过都把 TX2/RX2 交出去：调用方指望本函数之后这两个脚
+    // 不再由串口驱动（有 DTR/RTS 脚的板子上随后由 drv_flow_pins_enable() 接管；
+    // 没有流控脚的板子上这句是空操作，引脚保持浮空输入/上拉输入即可）
     drv_flow_pins_release();
 }
 
@@ -755,9 +773,10 @@ void drv_uart2_rx_resync(void) {
     uart_dma_rx_restart(&uart2_dma);
 }
 
-// USART2 中断：只处理 TXE（RX 由 DMA 负责）
-void USART2_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
-void USART2_IRQHandler(void) {
+// 第二路串口的中断：只处理 TXE（RX 由 DMA 负责）
+// 服务函数名由板级表给（USART2_IRQHandler / USART1_IRQHandler）
+void BOARD_AUX_UART_IRQ_HANDLER(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void BOARD_AUX_UART_IRQ_HANDLER(void) {
     // 用 USART_GetFlagStatus 而不是 USART_GetITStatus：后者会把「中断使能位」
     // 与「状态标志」相与（见 SDK 实现），使能位状态会干扰标志判读。
     if (USART_GetFlagStatus(BOARD_AUX_UART_INSTANCE, USART_FLAG_TXE) != RESET) {
@@ -776,23 +795,24 @@ void USART2_IRQHandler(void) {
     }
 }
 
-// USART2 的 RX DMA 中断（半/全传输、传输错误）
-void DMA1_Channel6_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
-void DMA1_Channel6_IRQHandler(void) {
+// 第二路串口的 RX DMA 中断（半/全传输、传输错误）
+void BOARD_AUX_UART_RX_DMA_ISR(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void BOARD_AUX_UART_RX_DMA_ISR(void) {
     uart_dma_rx_isr(&uart2_dma);
 }
 
 
 // ===========================================================================
-// 第 5 节：串口工作模式（单串口+DTR/RTS <-> 双串口）
+// 第 5 节：串口工作模式（单串口 [+DTR/RTS] <-> 双串口）
 // ===========================================================================
-// 状态灯不在这里驱动：PB12 的语义随 LED 模式变化（见 src/drv/drv_led.h），
+// 状态灯不在这里驱动：串口灯的语义随 LED 模式变化（见 src/drv/drv_led.h），
 // 这里只把「当前是不是双串口」告诉 drv_led。
 
 static drv_uart_mode_t s_mode = DRV_UART_MODE_FLOW;
 
-// 把 PA2/PA3 交给对应功能，并同步「双串口」状态给 LED 模块。
-// 两个分支都先让「下一个使用者」之外的功能退场，避免两边抢同一组 CFGLR 位。
+// 把「第二路串口 / DTR+RTS」这一对引脚交给对应功能，并同步「双串口」状态给
+// LED 模块。两个分支都先让「下一个使用者」之外的功能退场，避免两边抢同一组
+// CFGLR 位；没有 DTR/RTS 脚的板子上 drv_flow_pins_* 是空操作。
 static void uart_mode_apply(drv_uart_mode_t mode) {
     if (mode == DRV_UART_MODE_DUAL) {
         drv_flow_pins_release();                    // 先交出 GPIO
@@ -807,15 +827,18 @@ static void uart_mode_apply(drv_uart_mode_t mode) {
 }
 
 void drv_uart_mode_init(void) {
-    drv_uart_mode_t mode = DRV_UART_MODE_FLOW;
+    // 选项字无效时的默认模式由板级表决定（BOARD_UART_DEFAULT_DUAL）：
+    //   有 DTR/RTS 脚的板子（uDap-CH32X035F8U6）-> 单串口 + DTR/RTS
+    //   没有的（uDap-CH32X033）                -> 双串口
+    drv_uart_mode_t mode = BOARD_UART_DEFAULT_DUAL ? DRV_UART_MODE_DUAL : DRV_UART_MODE_FLOW;
 
 #if WCHLINK_ENABLE
     // 双模式固件（CMSIS-DAP + WCH-Link）串口固定为「单串口 + DTR/RTS」：
     //   * 那个构建的 RAM 只剩一百多字节余量，双串口不值得再占；
-    //   * 切换串口模式的手势（双击 PB3）已经让给调试器模式切换（见 src/main.c）。
+    //   * 切换串口模式的手势（双击按键）已经让给调试器模式切换（见 src/main.c）。
     // 选项字里的历史记录不再影响它。
 #else
-    // 选项字里的记录无效（全新芯片 / 擦除态 / 校验失败）时保持默认的 DTR/RTS 模式
+    // 选项字里的记录无效（全新芯片 / 擦除态 / 校验失败）时保持上面的默认模式
     (void)drv_mode_store_load_uart_mode(&mode);
 #endif
 
@@ -923,7 +946,7 @@ void usbd_cdc_acm_set_line_coding(uint8_t busid, uint8_t intf,
 
     memcpy(cdc_line_coding_for(intf), line_coding, sizeof(struct cdc_line_coding));
 
-    // COM2 在非双串口模式下 USART2 是关的，drv_uart2_set_baudrate 会直接返回；
+    // COM2 在非双串口模式下是关的，drv_uart2_set_baudrate 会直接返回；
     // 等切到双串口模式时 drv_uart2_init 会带上这里存下的速率
     if (intf == CDC_INTF_COM2) {
         drv_uart2_set_baudrate(line_coding->dwDTERate);
@@ -944,9 +967,10 @@ void usbd_cdc_acm_get_line_coding(uint8_t busid, uint8_t intf,
 
 // DTR / RTS 只来自 COM1：COM2 是给第二路串口用的，它的控制线没有对应引脚。
 //
-// 电平是**低有效**（FT232 的 DTR#/RTS# 习惯）：主机断言时 PA2/PA3 输出低。
-// 只有「串口 1 + DTR/RTS 流控」模式下这两个脚才是 GPIO；双串口模式下它们
-// 已经交给 USART2，drv_flow_pins_set_* 会自动变成空操作（引脚已释放）。
+// 电平是**低有效**（FT232 的 DTR#/RTS# 习惯）：主机断言时输出低。
+// 只有「有 DTR/RTS 脚的板子 + 单串口模式」下才是 GPIO；双串口模式下这两个脚
+// 已经交给 COM2 的串口外设，drv_flow_pins_set_* 会自动变成空操作（引脚已释放）。
+// 没有流控脚的板子（uDap-CH32X033）上整段都是空操作。
 void usbd_cdc_acm_set_dtr(uint8_t busid, uint8_t intf, bool dtr) {
     (void)busid;
 

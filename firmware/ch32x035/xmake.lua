@@ -9,10 +9,14 @@
 -- （bootloader 只要 MSC）和入口代码不同，所以放在一个文件里更好对照。
 --
 -- 用法:
---   xmake f -P . -m release --esig_sn=y --wchlink=n --swd_pins=pa5_pa6 --bootloader=y -y
+--   xmake f -P . -m release --board=ch32x035 --esig_sn=y --wchlink=n --swd_pins=board --bootloader=y -y
 --   xmake -P . -r                  # 两个 target 都编（bootloader 在前）
 --   xmake -P . -r firmware         # 只编应用
 --   xmake -P . -r bootloader       # 只编 bootloader（默认布局下才存在）
+--
+-- --board 选择引脚表（application/board/board_<name>.h）：
+--   ch32x035  uDap-CH32X035F8U6（默认）
+--   ch32x033  uDap-CH32X033（同一颗芯片的 SDK，只是引脚不同）
 --
 -- 注意 `-P .` 不能省：仓库根目录也有一个只含 task 的 xmake.lua，不给 -P 时
 -- xmake 会认成那个工程（报 not a valid target name）。
@@ -47,6 +51,8 @@ local uf2_include = third_party .. "/uf2"
 
 local esig_sn_enabled = has_config("esig_sn")
 local wchlink_enabled = has_config("wchlink")
+-- 板卡引脚表：只影响 BOARD_VARIANT 宏（见 application/board_pin_map.h）
+local board = get_config("board") or "ch32x035"
 -- 双模式固件（约 57 KiB）放不下 16 KiB 的 bootloader，只能退回应用独占 Flash
 local use_bootloader = has_config("bootloader") and not wchlink_enabled
 
@@ -147,8 +153,8 @@ end
 -- 默认只编 CMSIS-DAP：WCH-Link 的代码占数 KiB Flash、数据占约 6 KiB RAM（overlay
 -- 段），把这两样省下来才能放得下双串口（第二个 CDC + USART2 + 两路 FIFO）。
 --
--- 传 --wchlink=y 得到「双模式」固件：两套调试器同编一份，运行中双击 PB3 切换
--- （见 src/main.c）。这种构建放不下 bootloader，自动退回应用 @0x0。
+-- 传 --wchlink=y 得到「双模式」固件：两套调试器同编一份，运行中双击按键切换
+-- （见 application/main.c）。这种构建放不下 bootloader，自动退回应用 @0x0。
 
 -- 用芯片出厂 UID（ESIG 区，64 位、每颗唯一）作为 CMSIS-DAP 的 USB 序列号。
 option("esig_sn")
@@ -158,11 +164,26 @@ option("esig_sn")
 option_end()
 
 -- SWD 引脚方案（对应 src/swd_pin_map.h 的 SWD_PIN_VARIANT）
+-- board = 用板级表的默认值（application/board/*.h 的 BOARD_SWD_DEFAULT_PIN_VARIANT），
+--         一般不用管；显式给值只用于 A/B 对照（例如同一块板换脚飞线）。
+-- 注意不能用 "auto" 当值：xmake 会把 --opt=auto 当成保留值，直接报
+-- "cannot set readonly config"。
 option("swd_pins")
-    set_default("pa5_pa6")
-    set_values({"pa5_pa7", "pa5_pa6", "pa2_pa3"})
+    set_default("board")
+    set_values({"board", "pa5_pa7", "pa5_pa6", "pa2_pa3", "pa0_pa1"})
     set_showmenu(true)
-    set_description("SWD pin variant: pa5_pa6 (default), pa5_pa7 or pa2_pa3 (legacy)")
+    set_description("SWD pin variant: board (default from the board table), pa5_pa6, pa5_pa7, pa2_pa3 or pa0_pa1")
+option_end()
+
+-- 板卡引脚表（application/board/board_<name>.h）
+--   ch32x035  uDap-CH32X035F8U6（初版板）
+--   ch32x033  uDap-CH32X033（芯片/SDK 相同，只是引脚换了）
+-- 它只决定 BOARD_VARIANT 宏，不改变任何编译/链接选项。
+option("board")
+    set_default("ch32x035")
+    set_values({"ch32x035", "ch32x033"})
+    set_showmenu(true)
+    set_description("Board pin map: ch32x035 (uDap-CH32X035F8U6, default) or ch32x033 (uDap-CH32X033)")
 option_end()
 
 -- 是否把 WCH-Link（RVSWD）调试器一起编进固件
@@ -199,6 +220,9 @@ if use_bootloader then
         -- 与应用共用的启动握手区（src/boot_info.h）在这里必须真的读写那块 RAM；
         -- 不定义这个宏时头文件里的访问会编译成空操作。
         add_defines("UDAP_UF2_BOOTLOADER=1")
+
+        -- 板卡引脚表：bootloader 也用 BOARD_LED_* / BOARD_BTN_*（LED 与「按住上电」按键）
+        add_defines("BOARD_VARIANT=BOARD_" .. string.upper(board))
 
         -- 复用的应用侧公共源码。
         -- 不取 src/system_ch32x035.c：bootloader 用自己的最小 SystemInit
@@ -323,9 +347,14 @@ target("firmware")
     add_defines("WCHLINK_ENABLE=" .. (wchlink_enabled and 1 or 0))
     add_defines("UDAP_UF2_BOOTLOADER=" .. (use_bootloader and 1 or 0))
 
-    -- SWD 引脚方案 -> SWD_PIN_VARIANT
-    local swd_pins = get_config("swd_pins") or "pa5_pa6"
-    add_defines("SWD_PIN_VARIANT=SWD_PIN_VARIANT_" .. string.upper(swd_pins))
+    -- 板卡引脚表 -> BOARD_VARIANT（application/board_pin_map.h 选 board_<name>.h）
+    add_defines("BOARD_VARIANT=BOARD_" .. string.upper(board))
+
+    -- SWD 引脚方案 -> SWD_PIN_VARIANT（board 时由板级表给默认值，这里不定义）
+    local swd_pins = get_config("swd_pins") or "board"
+    if swd_pins ~= "board" then
+        add_defines("SWD_PIN_VARIANT=SWD_PIN_VARIANT_" .. string.upper(swd_pins))
+    end
 
     -- 串口驱动（全部串口相关代码都在这一对文件里，见 application/drv/drv_uart.h 的说明）
     --   COM1 <-> USART4 (PB0/PB1)     两模式都可用
@@ -407,6 +436,8 @@ target("firmware")
     -- 打印当前模式、工具链与布局（before_build 是脚本作用域，可以用 raise）
     before_build(function (target)
         local required = {app_src .. "/board_pin_map.h",
+                          app_src .. "/board/board_ch32x035f8u6.h",
+                          app_src .. "/board/board_ch32x033.h",
                           app_src .. "/swd_pin_map.h",
                           app_src .. "/usb_config.h",
                           app_src .. "/boot_info.h",
@@ -442,7 +473,8 @@ target("firmware")
         cprint("${cyan}Using mode:${clear} %s", get_config("mode") or "debug")
         cprint("${cyan}Using toolchain:${clear} %s", toolchain:get("toolchain_root"))
         cprint("${cyan}Using SDK:${clear} sdk/")
-        cprint("${cyan}SWD pins:${clear} %s", swd_pins)
+        cprint("${cyan}Board:${clear} %s (BOARD_VARIANT=BOARD_%s)", board, string.upper(board))
+        cprint("${cyan}SWD pins:${clear} %s", swd_pins == "board" and "board default" or swd_pins)
         cprint("${cyan}Debugger:${clear} %s", wchlink_enabled
             and "CMSIS-DAP + WCH-Link (dual mode, double-click the button at runtime to switch)"
             or "CMSIS-DAP only (--wchlink=y to add WCH-Link)")

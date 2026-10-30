@@ -7,8 +7,8 @@
 #include "board_pin_map.h"
 
 /*
- * 模式按键：PB3，一端接 GND，内部上拉 —— **按下 = 低电平**（引脚定义见
- * src/board_pin_map.h，要改脚只改那里的 BOARD_BTN_*）。
+ * 模式按键（引脚见 application/board_pin_map.h 的 BOARD_BTN_*，一端接 GND，
+ * 内部上拉）—— **按下 = 低电平**。
  *
  * 手势（见 src/main.c）：
  *   - **双击**  单模式固件：切换桥接串口模式（串口1+DTR/RTS <-> 双串口）
@@ -21,7 +21,7 @@
  * 本来就空着；用它切调试器比「上电时按住」自然得多（不用断电、也不用和
  * bootloader 的长按抢同一个按键）。
  *
- * 上电时长按 PB3 = 进 UF2 bootloader，由 bootloader 自己判定，与这里无关。
+ * 上电时长按按键 = 进 UF2 bootloader，由 bootloader 自己判定，与这里无关。
  */
 
 #define DRV_MODE_BUTTON_PORT       BOARD_BTN_PORT

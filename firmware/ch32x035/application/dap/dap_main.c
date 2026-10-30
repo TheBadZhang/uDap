@@ -277,10 +277,10 @@ static const uint8_t device_descriptor[] = {
     USB_INTERFACE_DESCRIPTOR_INIT(0x00, 0x00, 0x02, 0xFF, 0x00, 0x00, 0x02),                                      \
     USB_ENDPOINT_DESCRIPTOR_INIT(DAP_OUT_EP, USB_ENDPOINT_TYPE_BULK, DAP_PACKET_SIZE, 0x00),                       \
     USB_ENDPOINT_DESCRIPTOR_INIT(DAP_IN_EP, USB_ENDPOINT_TYPE_BULK, DAP_PACKET_SIZE, 0x00),                        \
-    /* 串口 1：CDC1 <-> USART4（PB0/PB1） */                                                                       \
+    /* 串口 1：CDC1 <-> COM1（串口实例与引脚见 board_pin_map.h） */                                                 \
     CDC_ACM_DESCRIPTOR_INIT(0x01, CDC_INT_EP, CDC_OUT_EP, CDC_IN_EP, DAP_PACKET_SIZE, 0x00)
 
-/* 只有双串口模式才追加的部分：串口 2（CDC2）<-> USART2（PA2/PA3） */
+/* 只有双串口模式才追加的部分：串口 2（CDC2）<-> COM2（见 board_pin_map.h） */
 #define USB_CONFIG_BODY_CDC2                                                                                       \
     CDC_ACM_DESCRIPTOR_INIT_NO_NOTIFY(0x03, CDC2_OUT_EP, CDC2_IN_EP, DAP_PACKET_SIZE, 0x00)
 
@@ -530,7 +530,7 @@ static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t USB_Request[DAP_PACKET_COU
 static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t USB_Response[DAP_PACKET_COUNT][DAP_PACKET_SIZE] DAP_PRIVATE_SECTION;  // Response Buffer
 static uint16_t USB_RespSize[DAP_PACKET_COUNT] DAP_PRIVATE_SECTION;                                                          // Response Size
 
-// COM 口现在是 USART4 (PB0=TX, PB1=RX) 的双向桥。
+// COM 口现在是 COM1（USART4/PB0/PB1 或 USART2/PA2/PA3，见板级表）的双向桥。
 //
 // 两个方向的缓冲大小取值不同，原因在 USB 端口层的完成判据
 // （x035_usb_complete_noncontrol_out）：

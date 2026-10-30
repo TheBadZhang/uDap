@@ -11,17 +11,20 @@
 // vs 1a86:8010 厂商接口），换模式必然重新枚举，所以切完就软复位重来。
 //
 // 切换手势：
-//   * 上电时长按 PB3 超过 1.2 s -> 进 UF2 bootloader（拖 firmware.uf2 升级），
+//   * 上电时长按板上按键超过 1.2 s -> 进 UF2 bootloader（拖 firmware.uf2 升级），
 //     由 bootloader 自己判定（见 bootloader/src/main.c）
-//   * 运行期双击 PB3 -> 切串口模式（单模式固件）/ 切调试器模式（双模式固件，
+//   * 运行期双击按键 -> 切串口模式（单模式固件）/ 切调试器模式（双模式固件，
 //     见下方 service_button）
+//
+// 按键/LED/SWD/串口的引脚都由 application/board_pin_map.h 的板级表决定
+// （--board=ch32x035 / ch32x033），这里不出现具体引脚名。
 //
 // mode_overlay.h 给出各模式私有代码/数据段的属性宏（只有双模式才有 overlay 段）。
 #include "mode_overlay.h"
 
 #include "boot_info.h"
 
-// CDC（COM1 <-> USART4，PB0=TX / PB1=RX；COM2 <-> USART2，PA2/PA3）由
+// CDC（COM1 / COM2 各接哪个 USART、哪两个脚见板级表）由
 // drv_uart_init() / drv_uart_mode_init() 配置，之后由各自的周期性服务推进。
 #include "drv/drv_uart.h"
 
@@ -130,7 +133,7 @@ static void __attribute__((noinline, optimize("O2"))) cherrydap_process(void) {
 
 #if WCHLINK_ENABLE
 static void wchlink_process(void) {
-    // RVSWD 物理层（PA5=SWCLK、PA6=SWDIO）先配置好，再启动 USB。
+    // RVSWD 物理层（引脚见 application/swd_pin_map.h）先配置好，再启动 USB。
     // 本板没有 MUX / 状态灯 / 目标电源开关，对应 glue 是空实现。
     // wchlink_overlay_init() 同样必须由 main() 调用（rvswd_phy_gpio_* 在 overlay 里）。
     rvswd_phy_gpio_init();
@@ -187,7 +190,7 @@ int main(void) {
     bsp_delay_ms(10u);
     boot_info_stage(2u);
 
-    // 两颗状态灯（PB11 / PB12）统一由 drv_led 管；必须在 drv_uart_mode_init()
+    // 两颗状态灯（板级表的 BOARD_LED_*）统一由 drv_led 管；必须在 drv_uart_mode_init()
     // 之前初始化 —— 后者会把「是否双串口」告诉 LED 模块。
     drv_led_init();
     if (drv_mode_store_load_led_mode(&led_mode)) {
@@ -195,7 +198,7 @@ int main(void) {
     }
     boot_info_stage(3u);
 
-    // COM1 <-> USART4 (PB0=TX, PB1=RX)，默认 115200；
+    // COM1 <-> 板级表的 BOARD_UART1_*，默认 115200；
     // 主机改 CDC 行编码时波特率会跟着变
     drv_uart_init(0u);
     boot_info_stage(4u);
@@ -214,7 +217,7 @@ int main(void) {
 
 #if WCHLINK_ENABLE
     // 双模式固件：两种调试器都在，按选项字记录的走。
-    // 切换方式是**运行期双击 PB3**（见 service_button）—— 不再用「上电时按住」，
+    // 切换方式是**运行期双击按键**（见 service_button）—— 不再用「上电时按住」，
     // 因为那个手势已经归 bootloader 的「长按进 UF2」了。
 #else
     // 只编了 CMSIS-DAP：忽略可能是 WCH-Link 的历史记录

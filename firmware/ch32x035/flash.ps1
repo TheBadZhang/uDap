@@ -1,4 +1,4 @@
-﻿# 用 WCH-Link + WCH 官方 OpenOCD 烧录 CH32X035（本板 = DAP 自身）
+# 用 WCH-Link + WCH 官方 OpenOCD 烧录 CH32X035（本板 = DAP 自身）
 #
 # 走 SDI 传输（adapter driver wlinke），接在板子的 DIO/DCK 两脚上。
 # 与 SWD 测速用的那个 CMSIS-DAP 探针**不能同时**接：同一对引脚。
@@ -18,7 +18,7 @@
 #   0x4000..0xF6FF  应用固件
 #   0xF700..0xF7FF  预留（NV 配置页）
 #
-# 烧完 bootloader 后就可以不再用 SWD：上电按住 PB3 进 UF2，把 firmware.uf2
+# 烧完 bootloader 后就可以不再用 SWD：上电按住板上按键进 UF2，把 firmware.uf2
 # 拖进出现的 U 盘即可升级应用。
 
 [CmdletBinding()]
@@ -109,7 +109,7 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ""
 Write-Host '烧录完成，并已复位运行。' -ForegroundColor Green
-Write-Host '  - WCH-Link 走板子独立的 SDI 调试口，与 PA5/PA6 上的 SWD 目标互不影响。' -ForegroundColor DarkGray
+Write-Host '  - WCH-Link 走板子独立的 SDI 调试口，与 SWD 目标口（默认 PA5/PA6 或 PA1/PA0，见 --board）上的目标互不影响。' -ForegroundColor DarkGray
 if (-not $SkipBootloader) {
-    Write-Host '  - 之后升级应用不必再接线：上电按住 PB3 进 UF2，把 firmware.uf2 拖进 U 盘。' -ForegroundColor DarkGray
+    Write-Host '  - 之后升级应用不必再接线：上电按住板上按键进 UF2，把 firmware.uf2 拖进 U 盘。' -ForegroundColor DarkGray
 }

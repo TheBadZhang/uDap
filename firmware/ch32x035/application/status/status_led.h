@@ -8,7 +8,7 @@
  * 表示会话进展。这里保留完全一致的接口，实现为空操作，
  * 这样 src/wchlink 可以原样复用而不必改动调用点。
  *
- * 注意：本板的 PB12 是 LED_CONNECTED_OUT（CMSIS-DAP 的连通指示），
+ * 注意：本板的串口灯（BOARD_LED_UART_PIN）是 LED_CONNECTED_OUT（CMSIS-DAP 的连通指示），
  * 与参考工程的「目标电源开关」同引脚但含义不同，因此这里**不能**去驱动它。
  */
 

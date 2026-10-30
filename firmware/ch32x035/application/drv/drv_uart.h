@@ -9,28 +9,35 @@
  * 这一对文件（drv_uart.h / drv_uart.c）取代了原来的 6 个模块：
  *
  *   drv_uart_dma      RX 的 DMA 环形引擎（两路共用，现已 internal）
- *   drv_flow_pins     PA2 = DTR / PA3 = RTS（低有效输出）
- *   drv_uart          COM1：USART4（PB0 = TX / PB1 = RX）
- *   drv_uart2         COM2：USART2（PA2 = TX2 / PA3 = RX2，仅双串口模式）
- *   drv_uart_mode     串口模式切换 + PB12 指示灯 + 选项字持久化
+ *   drv_flow_pins     DTR / RTS 输出（低有效；板级可选）
+ *   drv_uart          COM1：桥接串口 1
+ *   drv_uart2         COM2：桥接串口 2（仅双串口模式）
+ *   drv_uart_mode     串口模式切换 + 串口灯 + 选项字持久化
  *   drv_cdc_line      CDC ACM 行编码 / DTR / RTS 回调（两种调试器模式共用）
  *
- * 合并的理由：这几块共用同一组引脚（PA2/PA3）、同一套 DMA 引擎、同一份
- * 「谁在占用引脚」的约定（drv_uart_mode），拆开时改一处往往要同步改三四处。
+ * 合并的理由：这几块共用同一组引脚（有 DTR/RTS 的板子上 COM2 与流控脚是同一对）、
+ * 同一套 DMA 引擎、同一份「谁在占用引脚」的约定（drv_uart_mode），拆开时改一处
+ * 往往要同步改三四处。
  *
  * ---------------------------------------------------------------------------
- * 引脚与模式（详见 src/board_pin_map.h 与下方 drv_uart_mode_*）
+ * 引脚与模式（具体是哪两个脚见 application/board_pin_map.h 的板级表）
  * ---------------------------------------------------------------------------
- *   COM1   USART4  PB0 = TX / PB1 = RX                    两模式都可用
- *   COM2   USART2  PA2 = TX2 / PA3 = RX2                  仅双串口模式
- *   PA2/PA3 复用：单串口模式下它们是 DTR / RTS（低有效输出）
+ *   COM1   UART1 板级表 BOARD_UART1_*
+ *          uDap-CH32X035F8U6：USART4  PB0 = TX / PB1 = RX
+ *          uDap-CH32X033    ：USART2  PA2 = TX / PA3 = RX
+ *   COM2   板级表 BOARD_AUX_UART_*（仅双串口模式）
+ *          uDap-CH32X035F8U6：USART2  PA2 = TX2 / PA3 = RX2
+ *          uDap-CH32X033    ：USART1  PA10 = TX2 / PA11 = RX2
+ *   DTR/RTS  板级可选（BOARD_AUX_FLOW_PINS）：只有 uDap-CH32X035F8U6 有，
+ *            就是 PA2/PA3，与 COM2 复用；uDap-CH32X033 没有流控脚。
  *
  * ---------------------------------------------------------------------------
  * 收发实现
  * ---------------------------------------------------------------------------
- *   两路 RX 都走 DMA 环形缓冲（USART4_RX = Ch8，USART2_RX = Ch6，各 1 KB，
- *   零拷贝）：逐字节 RXNE 中断在高波特率下会因 ISR 延迟来不及读 DATAR，硬件置
- *   ORE 直接丢字节；改成 DMA 后只剩「每半个缓冲一次」的中断。
+ *   两路 RX 都走 DMA 环形缓冲（通道由板级表给：USART4_RX = Ch8、
+ *   USART2_RX = Ch6、USART1_RX = Ch5，各 1 KB，零拷贝）：逐字节 RXNE 中断在
+ *   高波特率下会因 ISR 延迟来不及读 DATAR，硬件置 ORE 直接丢字节；改成 DMA
+ *   后只剩「每半个缓冲一次」的中断。
  *
  *   两路 TX 都用逐字节 TXE 中断 + CherryRB 环形 FIFO。TX 挂 DMA 在本芯片上实测
  *   会让串口卡死（原因未定位），所以保持中断。
@@ -40,10 +47,12 @@
  */
 
 /* ===========================================================================
- * COM1：USART4（PB0 = TX / PB1 = RX）
+ * COM1：桥接串口 1（引脚/实例由板级表 BOARD_UART1_* 决定）
+ *   uDap-CH32X035F8U6：USART4，PB0 = TX / PB1 = RX
+ *   uDap-CH32X033    ：USART2，PA2 = TX / PA3 = RX
  * =========================================================================== */
 
-/* 初始化 USART4 与引脚，并启动 RX 的 DMA。baudrate 传 0 用默认 115200。 */
+/* 初始化 COM1 的串口外设与引脚，并启动 RX 的 DMA。baudrate 传 0 用默认 115200。 */
 void drv_uart_init(uint32_t baudrate);
 
 /* 运行时改波特率（主机设置 CDC 行编码时调用） */
@@ -80,13 +89,16 @@ uint32_t drv_uart_tx_overflow_count(void);
 void drv_uart_rx_resync(void);
 
 /* ===========================================================================
- * COM2：USART2（PA2 = TX2 / PA3 = RX2，仅双串口模式）
+ * COM2：桥接串口 2（引脚/实例由板级表 BOARD_AUX_UART_* 决定，仅双串口模式）
+ *   uDap-CH32X035F8U6：USART2，PA2 = TX2 / PA3 = RX2
+ *   uDap-CH32X033    ：USART1，PA10 = TX2 / PA11 = RX2（USART1_RM = 01）
  * =========================================================================== */
 
-/* 初始化 USART2 与引脚，并启动 RX 的 DMA。baudrate 传 0 用默认 115200。 */
+/* 初始化 COM2 的串口外设与引脚（含需要的重映射），并启动 RX 的 DMA。
+ * baudrate 传 0 用默认 115200。 */
 void drv_uart2_init(uint32_t baudrate);
 
-/* 停掉 USART2 并把 PA2/PA3 释放为浮空输入（随后由 drv_flow_pins_enable 接管） */
+/* 停掉 COM2 并把引脚交出去（有 DTR/RTS 的板子上随后由 drv_flow_pins_enable 接管） */
 void drv_uart2_deinit(void);
 
 /* 当前是否已初始化（双串口模式）。未初始化时写/读都是空操作。 */
@@ -109,10 +121,12 @@ uint32_t drv_uart2_tx_overflow_count(void);
 void drv_uart2_rx_resync(void);
 
 /* ===========================================================================
- * PA2 / PA3 的 DTR、RTS（**有效 = 低电平**，FT232 的 DTR#/RTS# 习惯）
+ * DTR / RTS（**有效 = 低电平**，FT232 的 DTR#/RTS# 习惯；板级可选）
  * ===========================================================================
- * 主机通过 CDC 的 SET_CONTROL_LINE_STATE 下发；只在「串口 1 + DTR/RTS」模式下
- * 有效 —— 双串口模式下这两脚已交给 USART2，set_* 自动变成空操作。 */
+ * 主机通过 CDC 的 SET_CONTROL_LINE_STATE 下发；只在「单串口 + DTR/RTS」模式下
+ * 有效 —— 双串口模式下这两脚已交给 COM2 的串口外设，set_* 自动变成空操作。
+ * 板级表 BOARD_AUX_FLOW_PINS = 0 的板子（uDap-CH32X033）没有这两个脚，
+ * 所有函数都是空操作、drv_flow_pins_dtr/rts() 恒为 false。 */
 
 void drv_flow_pins_release(void); /* 释放为浮空输入（交出引脚） */
 void drv_flow_pins_enable(void);  /* 推挽输出，并把已记录的状态重新打出去 */
@@ -124,28 +138,31 @@ bool drv_flow_pins_dtr(void);
 bool drv_flow_pins_rts(void);
 
 /* ===========================================================================
- * 串口工作模式（PA2/PA3 的用途）
+ * 串口工作模式（第二路串口 / 流控脚那一对引脚的用途）
  * ===========================================================================
- *   DRV_UART_MODE_FLOW  「串口 1 + DTR/RTS 流控」
- *       COM1 <-> USART4（PB0/PB1）；PA2 = DTR、PA3 = RTS。
- *       **USB 里只枚举 1 个 CDC**，USART2 与 COM2 完全不存在。
+ *   DRV_UART_MODE_FLOW  「单串口 [+ DTR/RTS 流控]」
+ *       COM1 <-> 板级表的 BOARD_UART1_*；有流控脚的板子上这些脚是 DTR/RTS。
+ *       **USB 里只枚举 1 个 CDC**，COM2 完全不存在。
  *   DRV_UART_MODE_DUAL  「双串口」
- *       COM1 <-> USART4；COM2 <-> USART2（PA2 = TX2 / PA3 = RX2）。
+ *       COM1 + COM2（板级表的 BOARD_AUX_UART_*）。
+ *
+ * 默认模式由板级表 BOARD_UART_DEFAULT_DUAL 决定（全新芯片/选项字无效时）：
+ *   有 DTR/RTS 脚的板子 -> FLOW；没有的 -> DUAL。
  *
  * 模式由按键**双击**或 vendor command 切换，并存进用户选择字 Data1（掉电保存）；
  * 注意双模式固件（CMSIS-DAP + WCH-Link）里串口**固定**为单串口 + DTR/RTS，
  * 双击手势让给调试器模式切换（见 src/main.c）。
  * 切换会重新枚举 USB（描述符里的接口数变了），主机侧看到一次插拔。
  * 指示：由 LED 模块决定（见 src/drv/drv_led.h 的 DRV_LED_MODE_STATUS 模式：
- * PB12 亮 = 双串口模式，灭 = DTR/RTS 模式，低电平点亮）。 */
+ * 串口灯亮 = 双串口模式，灭 = 单串口模式，低电平点亮）。 */
 
 typedef enum {
-    DRV_UART_MODE_FLOW = 0, /* 串口 1 + DTR/RTS（默认） */
+    DRV_UART_MODE_FLOW = 0, /* 单串口 [+ DTR/RTS] */
     DRV_UART_MODE_DUAL = 1, /* 双串口 */
     DRV_UART_MODE_COUNT,
 } drv_uart_mode_t;
 
-/* 上电初始化：从选项字恢复模式 + 按模式配置 PA2/PA3 */
+/* 上电初始化：从选项字恢复模式 + 按模式配置第二路串口/流控脚 */
 void drv_uart_mode_init(void);
 
 drv_uart_mode_t drv_uart_mode_get(void);

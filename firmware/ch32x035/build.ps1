@@ -14,9 +14,10 @@
 #
 # 用法:
 #   .\build.ps1               # release 构建（默认用芯片 ESIG UID 作序列号）
+#   .\build.ps1 -Board ch32x033   # 编 uDap-CH32X033（引脚表换一份，代码不分叉）
 #   .\build.ps1 -Wchlink y    # 把 WCH-Link（RVSWD）也编进去（双模式，无 UF2）
 #   .\build.ps1 -EsigSn n     # 退回固定串 DEADBEEF（所有板子相同）
-#   .\build.ps1 -SwdPins pa5_pa6   # 换 SWD 引脚方案（A/B 对照用）
+#   .\build.ps1 -SwdPins pa5_pa6   # 换 SWD 引脚方案（默认 board = 板级表的默认值）
 #   .\build.ps1 -Bootloader n # 不要 bootloader（应用从 0x0 起，只走 SWD）
 #   .\build.ps1 -Clean        # 先清理再构建
 #   .\build.ps1 -Mode debug   # debug 构建
@@ -55,9 +56,16 @@ param(
     [string]$Wchlink = 'n',
 
     # SWD 引脚方案，对应 xmake.lua 的 option("swd_pins")。
-    # pa5_pa6 = 默认（SWDIO 在 PA6，PA7 留给 nRESET）；pa5_pa7 / pa2_pa3 用于 A/B 对照。
-    [ValidateSet('pa5_pa7', 'pa5_pa6', 'pa2_pa3')]
-    [string]$SwdPins = 'pa5_pa6',
+    # board = 用板级表的默认值（application/board/*.h），平时不用管；
+    # pa5_pa6 / pa5_pa7 / pa2_pa3 / pa0_pa1 只用于 A/B 对照。
+    [ValidateSet('board', 'pa5_pa7', 'pa5_pa6', 'pa2_pa3', 'pa0_pa1')]
+    [string]$SwdPins = 'board',
+
+    # 板卡引脚表，对应 xmake.lua 的 option("board")。
+    #   ch32x035 = uDap-CH32X035F8U6（初版板，默认）
+    #   ch32x033 = uDap-CH32X033（芯片/SDK 相同，只换了引脚）
+    [ValidateSet('ch32x035', 'ch32x033')]
+    [string]$Board = 'ch32x035',
 
     # 是否按「UF2 bootloader 布局」构建应用（应用从 0x4000 起），对应
     # xmake.lua 的 option("bootloader")。它同时决定是否构建 bootloader target。
@@ -112,6 +120,7 @@ try {
     }
 
     Write-Host "工具链   : $(if ($toolchainRoot) { $toolchainRoot } else { '交给 xmake 自动探测' })" -ForegroundColor DarkGray
+    Write-Host "板卡     : $Board" -ForegroundColor Yellow
     Write-Host "调试器   : $dbgLabel" -ForegroundColor Yellow
     Write-Host "布局     : $layoutLabel" -ForegroundColor Yellow
     Write-Host "SWD 引脚 : $SwdPins" -ForegroundColor DarkGray
@@ -142,7 +151,7 @@ try {
     # 应用与 bootloader 现在**同一个工程**（本目录的 xmake.lua 里两个 target），
     # 所以这里只配置/构建一次，xmake 会把 bootloader 排在前、firmware 排在后。
     $configArgs = @('f', '-P', $PSScriptRoot, '-m', $Mode, "--esig_sn=$EsigSn",
-                    "--wchlink=$Wchlink", "--swd_pins=$SwdPins",
+                    "--wchlink=$Wchlink", "--swd_pins=$SwdPins", "--board=$Board",
                     "--bootloader=$Bootloader", '-y')
     if ($Reconfigure) { $configArgs += '-c' }
     Write-Host "==> xmake $($configArgs -join ' ')" -ForegroundColor Cyan
@@ -200,7 +209,7 @@ try {
 
     if ($useBootloader) {
         Write-Host ''
-        Write-Host '升级：上电时按住 PB3 约 1.2 s 进入 UF2，把 firmware.uf2 拖进 U 盘即可。' -ForegroundColor Green
+        Write-Host '升级：上电时按住板上按键约 1.2 s 进入 UF2，把 firmware.uf2 拖进 U 盘即可。' -ForegroundColor Green
         Write-Host '首次烧录（有 WCH-Link / SDI）: .\flash.ps1' -ForegroundColor Green
         Write-Host '首次烧录（没有调试器，走芯片自带 USB ISP）: .\flash_isp.ps1' -ForegroundColor Green
     }

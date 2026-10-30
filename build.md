@@ -19,6 +19,7 @@ cd firmware\ch32x035
 
 # 一键构建（默认）：bootloader + 应用 + firmware.uf2 + firmware_full.bin
 .\build.ps1
+.\build.ps1 -Board ch32x033        # uDap-CH32X033 的引脚表（同一份代码）
 .\build.ps1 -EsigSn n              # 固定序列号 DEADBEEF（所有板子相同）
 .\build.ps1 -Wchlink y             # 双模式（+ WCH-Link）；这个构建不支持 UF2
 .\build.ps1 -Bootloader n          # 不要 bootloader，应用从 0x0 起
@@ -27,15 +28,23 @@ cd firmware\ch32x035
 # 也可以走 cmd 包装（参数原样透传，优先 pwsh，只有 5.1 时也能跑）
 build.bat
 build.bat -Wchlink y
+build.bat -Board ch32x033
 
 # 或直接用 xmake（记得显式传选项，xmake 会记住上次的值）
 # 工具链优先 GCC15，其次是 GCC12；也可以自己指定任意版本/安装路径
 $env:WCH_TOOLCHAIN_ROOT = "C:\MounRiver\MounRiver_Studio2\resources\app\resources\win32\components\WCH\Toolchain\RISC-V Embedded GCC15"
-xmake f -m release --esig_sn=y --wchlink=n --swd_pins=pa5_pa6 --bootloader=y -y
+xmake f -m release --board=ch32x035 --esig_sn=y --wchlink=n --swd_pins=board --bootloader=y -y
 xmake -P . -r              # 两个 target 都编：bootloader → firmware
 xmake -P . -r firmware     # 只编应用
 xmake -P . -r bootloader   # 只编 bootloader（默认布局下才存在）
 ```
+
+> `--board` 选板卡引脚表（`application/board/board_<名字>.h`）：`ch32x035`（默认，
+> uDap-CH32X035F8U6）或 `ch32x033`（uDap-CH32X033）。它只决定 `BOARD_VARIANT` 宏，
+> 不改变编译/链接选项，所以两种板的产物大小几乎一样。
+>
+> `--swd_pins=board` 表示用板级表的默认 SWD 方案（x035 = `pa5_pa6`，x033 = `pa0_pa1`）；
+> 只有 A/B 对照（换脚飞线）时才显式给 `pa5_pa6` / `pa5_pa7` / `pa2_pa3` / `pa0_pa1`。
 
 > `-P .` 不能省：仓库根目录也有一个只含 task 的 `xmake.lua`，不给 `-P` 时 xmake
 > 会认成那个工程，报 `not a valid target name`。
@@ -79,7 +88,7 @@ cd firmware\ch32x035
 `CH375DLL64.dll`，或用 Zadig 换 WinUSB 驱动）；没有它时脚本会打印 WCHISPTool 的
 手动步骤。
 
-之后升级应用就不用接线了：上电长按 PB3 → 出现 U 盘 → 拖 `firmware.uf2`。
+之后升级应用就不用接线了：上电长按板上按键 → 出现 U 盘 → 拖 `firmware.uf2`。
 也可以由上位机发 vendor command `ENTER_UF2` 直接进 bootloader。
 
 > ⚠️ xmake 会把 option 值持久化到本地配置，构建脚本每次都显式传全部选项；

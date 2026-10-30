@@ -4,18 +4,19 @@
 #include <stdint.h>
 
 /*
- * 板载两颗 LED（PB11 / PB12，**低电平点亮**）的功能切换。
+ * 板载两颗 LED（引脚见 application/board_pin_map.h 的 BOARD_LED_*，**低电平点亮**）
+ * 的功能切换。
  *
  * 以前两颗灯是写死的：
- *   PB11 = DAP 连接指示（CMSIS-DAP 的 Connect LED，由调试器软件置位）
- *   PB12 = 串口模式指示（亮 = 双串口）
+ *   DAP 灯    = DAP 连接指示（CMSIS-DAP 的 Connect LED，由调试器软件置位）
+ *   串口灯    = 串口模式指示（亮 = 双串口）
  * 但不同人用这块板子的方式不同：有人只当调试器（灯最好别闪），有人主要当
  * 串口桥（灯用来提示收发），有人把板子塞进壳里根本看不见。所以改成 4 种
  * 模式，由 vendor command 或选项字持久化切换（见 src/dap/udap_vendor.h）。
  *
- *   DRV_LED_MODE_STATUS    PB11 = DAP 连接，PB12 = 双串口（历史默认行为）
- *   DRV_LED_MODE_ACTIVITY  PB11 = COM1 收发，PB12 = COM2 收发（串口桥模式）
- *   DRV_LED_MODE_MIXED     PB11 = DAP 连接，PB12 = COM1 收发
+ *   DRV_LED_MODE_STATUS    DAP 灯 = DAP 连接，串口灯 = 双串口（历史默认行为）
+ *   DRV_LED_MODE_ACTIVITY  DAP 灯 = COM1 收发，串口灯 = COM2 收发（串口桥模式）
+ *   DRV_LED_MODE_MIXED     DAP 灯 = DAP 连接，串口灯 = COM1 收发
  *   DRV_LED_MODE_OFF       两颗都灭（避免漏光干扰目标板 / 省电）
  *
  * 谁调用谁负责：
@@ -43,7 +44,7 @@ drv_led_mode_t drv_led_mode(void);
 /* DAP 主机是否已连接（CMSIS-DAP 的 HostStatus 命令） */
 void drv_led_set_dap_connected(bool connected);
 
-/* 当前是不是双串口模式（= PB12 在 STATUS 模式下的语义） */
+/* 当前是不是双串口模式（= 串口灯在 STATUS 模式下的语义） */
 void drv_led_set_uart_dual(bool dual);
 
 /* 串口有收发：uart_index 传 1（COM1）或 2（COM2）。

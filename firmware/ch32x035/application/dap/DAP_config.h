@@ -153,7 +153,8 @@ __STATIC_INLINE uint8_t DAP_GetProductFirmwareVersionString(char *str) {
     return 0U;
 }
 
-// SWCLK = PA5，SWDIO = PA6（引脚号见 src/swd_pin_map.h 的 SWD_PIN_VARIANT）
+// SWCLK / SWDIO 的引脚号见 application/swd_pin_map.h 的 SWD_PIN_VARIANT
+// （每块板的默认方案在 application/board/*.h 的 BOARD_SWD_DEFAULT_PIN_VARIANT）
 //
 // ⚠️ 这一层是**每比特**调用的边沿级原语，必须是编译期展开的 inline：
 // 快路径的一个 SWCLK 周期就等于两条 store 之间的指令数，中间插一次间接调用
@@ -181,34 +182,24 @@ __STATIC_FORCEINLINE uint32_t PIN_TDO_IN(void) { return 0U; }
 __STATIC_FORCEINLINE uint32_t PIN_nTRST_IN(void) { return 1U; }
 __STATIC_FORCEINLINE void PIN_nTRST_OUT(uint32_t bit) { (void)bit; }
 
-// nRESET（目标复位，低有效）是否启用由 src/swd_pin_map.h 决定：
-// 本板目标 nRESET 接到 PA7，默认启用；SWD_NRESET_ENABLE = 0 时，
-// 三个操作退化为空操作。SWDIO 必须使用 PA6，避免与 PA7 复位脚冲突。
+// nRESET（目标复位，低有效）是否启用、接在哪一脚由板级表决定
+// （application/board/*.h 的 BOARD_NRESET_ENABLE / BOARD_NRESET_BIT，
+//  见 application/swd_pin_map.h）；SWD_NRESET_ENABLE = 0 时三个操作退化为空操作。
 #if SWD_NRESET_ENABLE
-
-// nRESET 在 CFGLR 中占第 SWD_NRESET_CFGLR_SHIFT 起的 4 位（每脚 4 位）
-#define PIN_nRESET_PIN   SWD_NRESET_PIN
-#define PIN_nRESET_SHIFT SWD_NRESET_CFGLR_SHIFT
 
 // nRESET 采用「开漏模拟」，这是 CMSIS-DAP 推荐的接法：
 //   释放（bit=1）：切为输入 + 内部上拉（高阻）。电平交给目标板自己的上拉 /
 //                  复位电路决定，DAP 不会与目标侧的复位驱动对顶；此时读 INDR
 //                  得到的是真实线电平，主机才看得出目标是否正把复位拉住。
 //   复位（bit=0）：推挽输出拉低。
-// 两条路径都「先设好输出数据、再改 CFGLR」，避免切换瞬间输出旧电平产生毛刺。
+// 寄存器写法（CFGLR 裸写 / CFGHR 走 GPIO_Init）集中在 swd_pin_map.h 的
+// board_nreset_*，这里只转发 —— 这样 pin0..7 与 pin8..15 两种接法只在一处区分。
 __STATIC_FORCEINLINE uint32_t PIN_nRESET_IN(void) {
-    return (SWD_PORT->INDR & PIN_nRESET_PIN) != 0U;
+    return board_nreset_level();
 }
 
 __STATIC_FORCEINLINE void PIN_nRESET_OUT(uint32_t bit) {
-    if (bit != 0U) {
-        SWD_PORT->BSHR = PIN_nRESET_PIN;  // ODR 置 1；下面选输入模式时即取上拉
-        SWD_PORT->CFGLR = (SWD_PORT->CFGLR & ~(0xFU << PIN_nRESET_SHIFT)) | (0x8U << PIN_nRESET_SHIFT);
-    } else {
-        SWD_PORT->BCR = PIN_nRESET_PIN;   // 先让输出数据为低
-        SWD_PORT->CFGLR = (SWD_PORT->CFGLR & ~(0xFU << PIN_nRESET_SHIFT)) | (0x1U << PIN_nRESET_SHIFT);
-    }
-    board_swd_cfglr_resync(); /* 动过 CFGLR，SWD 的影子要重建 */
+    board_nreset_drive(bit == 0U); /* CMSIS-DAP 的 bit=1 = 释放 */
 }
 
 #else /* !SWD_NRESET_ENABLE */
@@ -239,12 +230,13 @@ __STATIC_INLINE void PORT_OFF(void) {
 //**************************************************************************************************
 // 状态指示灯
 //
-// 本板有两颗灯（PB11 / PB12，都是**低电平点亮**，引脚见 src/board_pin_map.h），
-// 它们的用途由 LED 模式决定（见 src/drv/drv_led.h）：
+// 本板有两颗灯（引脚见 application/board_pin_map.h 的 BOARD_LED_DAP_PIN /
+// BOARD_LED_UART_PIN，都是**低电平点亮**），它们的用途由 LED 模式决定
+// （见 src/drv/drv_led.h）：
 //
-//   PB11 = DAP 指示灯（默认模式）：CMSIS-DAP 的 Connect LED，主机（调试器软件）
-//          连接到 DAP 时点亮。也可能被配置成串口活动灯 / 熄灭。
-//   PB12 = 串口模式 / 串口活动灯：由 drv_uart / drv_led 驱动，不在这里碰。
+//   DAP 灯（默认模式）：CMSIS-DAP 的 Connect LED，主机（调试器软件）连接到
+//          DAP 时点亮。也可能被配置成串口活动灯 / 熄灭。
+//   串口灯：串口模式 / 串口活动灯，由 drv_uart / drv_led 驱动，不在这里碰。
 //
 // 本文件只把 DAP.c 的 HostStatus 事件转给 drv_led，灯到底怎么亮由 drv_led 决定：
 //   request[0] = DAP_DEBUGGER_CONNECTED(0) -> LED_CONNECTED_OUT(request[1])
@@ -267,9 +259,9 @@ __STATIC_INLINE uint32_t TIMESTAMP_GET(void) {
 }
 
 __STATIC_INLINE void DAP_SETUP(void) {
-    // GPIOA 给 SWD 用（SWCLK = PA5 / SWDIO = PA6）。
-    // 状态灯的 GPIOB 由 drv_led_init() 统一配置（两颗灯归 LED 模式管），
-    // 这里不再碰 —— 否则会与 drv_led 抢 CFGHR 的静态缓存（见 board_pin_map.h）。
+    // SWD 引脚所在的端口（GPIOA）时钟。具体哪两个脚见 application/swd_pin_map.h。
+    // 状态灯由 drv_led_init() 统一配置（两颗灯归 LED 模式管），这里不再碰 ——
+    // 否则会与 drv_led 抢 CFGHR 的静态缓存（见 board_pin_map.h）。
     RCC_APB2PeriphClockCmd(SWD_PORT_CLOCK, ENABLE);
 
     // 复位时先假定「未连接」
@@ -286,8 +278,8 @@ extern void Delayms(uint32_t delay);
 // 返回 1 表示已实现 —— 主机（OpenOCD / pyocd）执行 reset 时会优先走这里，
 // 而不是只靠 SWJ_Pins 逐次拉线。
 //
-// 默认通过 PA7 拉低 nRESET 20 ms 后释放；关闭 SWD_NRESET_ENABLE 时返回 0，
-// 主机退回 SWD SYSRESETREQ。
+// 拉低的是板级表里的 nRESET 脚（uDap-CH32X035F8U6 = PA7，uDap-CH32X033 = PA9）；
+// 关闭 SWD_NRESET_ENABLE 时返回 0，主机退回 SWD SYSRESETREQ。
 __STATIC_INLINE uint8_t RESET_TARGET(void) {
 #if SWD_NRESET_ENABLE
     PIN_nRESET_OUT(0U);
