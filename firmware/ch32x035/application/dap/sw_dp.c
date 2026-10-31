@@ -3,6 +3,19 @@
 #include "mode_overlay.h"
 #include "swd_gpio.h"
 
+/* --swd7=y：三段快路径位时序换成 7 clk/bit 的实现（application/dap/swd_gpio_x035_fast7.c）。
+ * 现役实现是 8 clk/bit（≈6 MHz），7 clk 版约 6.9 MHz（+14%）。默认关闭：
+ * 换实现后要重新用示波器核低/高电平时长，见该文件头的说明。 */
+#include "swd_gpio_fast7.h"
+#if SWD7_ENABLE
+#undef swd_gpio_packet_request
+#undef swd_gpio_read_data
+#undef swd_gpio_write_data
+#define swd_gpio_packet_request(req) swd7_gpio_packet_request(req)
+#define swd_gpio_read_data(v, p)     swd7_gpio_read_data((v), (p))
+#define swd_gpio_write_data(val)     swd7_gpio_write_data((val))
+#endif
+
 #include <DAP.h>
 
 // 把快路径的半时钟等待换成带余量的实现（见 DAP_config.h 的说明）。

@@ -6,7 +6,7 @@
 | 构建系统 | **xmake**（应用与 bootloader 是**同一个工程里的两个 target**） |
 | WCH 编译器 | WCH RISC-V Embedded GCC 15（MounRiver Studio 2 自带；没装时自动回退 GCC 12。GCC15 的 `-Os` 更省：bootloader 14.5 KiB vs 15.3 KiB，应用 25.8 KiB vs 26.7 KiB） |
 | 编译选项 | `-march=rv32imacxw -mabi=ilp32 -msmall-data-limit=8 -mno-save-restore`，`-Wall -std=gnu11` |
-| 优化 | LTO + `--gc-sections`；`.highcode` 段启动时从 Flash 搬到 RAM 执行。必须用 `-Os`：`-O3` 会让 `.highcode` 膨胀到 18.5 KiB（Flash/RAM 都装不下），`-Og`/`-O0` 又装不进 Flash —— debug 也是 `-Os` + LTO，只额外带调试符号 |
+| 优化 | LTO + `--gc-sections`；`.highcode` 段启动时从 Flash 搬到 RAM 执行。必须用 `-Os`：`-O3` 会让 `.highcode` 从 9.3 KiB 涨到 13.1 KiB（Flash 21.0 → 31.9 KiB，RAM 14.2 → 17.9 KiB），带串口/双模式构建直接装不下；`-Og`/`-O0` 同样不行，所以 debug 也是 `-Os` + LTO，只额外带调试符号。`--opt=speed` 可切 `-O3`，但**会破坏低速 SWD**（见下）、且实测没有吞吐收益，属实验选项 |
 | UF2 打包 | `third_party/uf2`（microsoft/uf2 子模块）里的 `utils/uf2conv.py` |
 | 辅助脚本 | `firmware/ch32x035/build.ps1`（包了工具链路径与所有 option）、`flash.ps1`（WCH-Link / SDI 烧录） |
 | 烧录 | `firmware/ch32x035/flash.ps1`（WCH 官方 OpenOCD）或 UF2 拖拽升级 |
@@ -21,7 +21,9 @@ cd firmware\ch32x035
 .\build.ps1
 .\build.ps1 -Board ch32x033        # uDap-CH32X033 的引脚表（同一份代码）
 .\build.ps1 -Uart n                # 只留 SWD：没有 CDC/USART/DMA，USB 里只剩 DAP 接口
-.\build.ps1 -EsigSn n              # 固定序列号 DEADBEEF（所有板子相同）
+.\build.ps1 -Uart n -Opt speed      # 实验性 -O3（体积更大；位翻转是汇编，不会更快）
+.\build.ps1 -Swd7 y                 # 快路径换成 7 clk/bit（≈6.9 MHz；需示波器核对时序）
+..\build.ps1 -EsigSn n              # 固定序列号 DEADBEEF（所有板子相同）
 .\build.ps1 -Wchlink y             # 双模式（+ WCH-Link）；这个构建不支持 UF2
 .\build.ps1 -Bootloader n          # 不要 bootloader，应用从 0x0 起
 .\build.ps1 -Clean                 # 先清理再构建（换编译器版本时会自动做一次）
@@ -67,6 +69,34 @@ xmake -P . -r bootloader   # 只编 bootloader（默认布局下才存在）
 >
 > `--swd_pins=board` 表示用板级表的默认 SWD 方案（x035 = `pa5_pa6`，x033 = `pa0_pa1`）；
 > 只有 A/B 对照（换脚飞线）时才显式给 `pa5_pa6` / `pa5_pa7` / `pa2_pa3` / `pa0_pa1`。
+
+> **关于「减少 USB 往返」（两次尝试都回退，记录结论）**
+>
+> 4 KiB 写入在 64 B 包下是 68 条命令 ×（1 写 + 1 读）= 136 次 USB 传输，
+> 每次约 90 µs 主机调度延迟，SWD 只占一半时间 —— 看起来「放大命令」很有吸引力，
+> 但两次实现都更慢：
+> 1. **放大上报的命令上限 + 固件跨包重组**：只放大了命令长度，OUT 仍按 64 B 挂，
+>    写入照样被拆成 32 次传输，还多等 ZLP；改用「按命令 ID 解析长度」又会截断
+>    某些命令（`Transfer` 的 match 项、`SWD_Sequence`、`ExecuteCommands` 批量）。
+> 2. **OUT 按 2 KiB 整块挂**（一次主机写入 = 一次 USB 传输）：往返次数确实从 136
+>    降到 4，但实测更慢 —— 单条命令长达 4 ms，主机在等响应期间完全空闲，
+>    OpenOCD 的 `ExecuteCommands` 批量也被单响应缓冲串行化。
+>
+> 结论：CMSIS-DAP v1 over FS bulk 的 278 KiB/s 已接近「每命令一次往返」模型的
+> 上限；要再快只能换协议/换 USB（HS），不值得在这条路上继续。
+
+> **关于 `--opt=speed`（-O3）：可以试，但预期不会更快。**
+>
+> - 位翻转本身是手写汇编（`swd_gpio_x035.c`），两版**逐字节相同**
+>   （`swd_fast_write_data` / `read_data` / `packet_request` 各 234 / 233 / 59 条指令），
+>   所以每比特的时钟周期数不会因为优化级别改变 —— 而吞吐就是被它决定的；
+> - 可能受影响的是快路径 ACK / turnaround 相位那段**内联 C**（`sw_dp.c` 的
+>   `swd_fast_ack_phase`；源码注释里已写明「连拆成两个函数都会让长块读偶发失败」），
+>   以及慢路径的 `while (--count) __NOP();`（-Os 每半拍 4 条指令，-O3 变 3 条）；
+> - 体积代价：x035 + `--uart=n` 下 Flash 21.20 → 30.27 KiB、RAM 14.23 → 18.08 KiB
+>   （带串口的构建直接链接失败，bootloader 也会溢出）。
+>
+> 产物体积对照（x035 / `-Uart n`）：`-Os` 21712 B、`-O3` 30996 B。默认保持 `-Os`。
 
 > `-P .` 不能省：仓库根目录也有一个只含 task 的 `xmake.lua`，不给 `-P` 时 xmake
 > 会认成那个工程，报 `not a valid target name`。

@@ -81,6 +81,16 @@ param(
     [ValidateSet('y', 'n')]
     [string]$Uart = 'y',
 
+    # 优化取向（配合 LTO），对应 xmake.lua 的 option("opt")。
+    #   size（默认）-Os；speed -O3（实验性：.highcode 变大，需 RAM 余量）
+    [ValidateSet('size', 'speed')]
+    [string]$Opt = 'size',
+
+    # 快路径位时序换成 7 clk/bit 的实现（对应 xmake.lua 的 option("swd7")）。
+    #   n（默认）8 clk/bit ≈ 6 MHz；y 7 clk/bit ≈ 6.9 MHz（+14%）
+    [ValidateSet('y', 'n')]
+    [string]$Swd7 = 'n',
+
     [switch]$Clean,
     [switch]$Reconfigure
 )
@@ -131,6 +141,8 @@ try {
     Write-Host "板卡     : $Board" -ForegroundColor Yellow
     Write-Host "调试器   : $dbgLabel" -ForegroundColor Yellow
     Write-Host "串口     : $(if ($Uart -eq 'y') { 'USB CDC + USART（单串口/双串口）' } else { '无（只有 CMSIS-DAP，SWD 最快）' })" -ForegroundColor Yellow
+    Write-Host "优化     : $(if ($Opt -eq 'speed') { '-O3 + LTO（实验性；.highcode 变大，需 RAM 余量）' } else { '-Os + LTO' })" -ForegroundColor $(if ($Opt -eq 'speed') { 'DarkYellow' } else { 'Yellow' })
+    Write-Host "SWD 时序 : $(if ($Swd7 -eq 'y') { '7 clk/bit ≈ 6.9 MHz（实验）' } else { '8 clk/bit ≈ 6 MHz' })" -ForegroundColor Yellow
     Write-Host "布局     : $layoutLabel" -ForegroundColor Yellow
     Write-Host "SWD 引脚 : $SwdPins" -ForegroundColor DarkGray
     Write-Host "序列号   : $snLabel (-EsigSn $EsigSn)" -ForegroundColor DarkGray
@@ -160,8 +172,9 @@ try {
     # 应用与 bootloader 现在**同一个工程**（本目录的 xmake.lua 里两个 target），
     # 所以这里只配置/构建一次，xmake 会把 bootloader 排在前、firmware 排在后。
     $configArgs = @('f', '-P', $PSScriptRoot, '-m', $Mode, "--esig_sn=$EsigSn",
-                    "--wchlink=$Wchlink", "--uart=$Uart", "--swd_pins=$SwdPins", "--board=$Board",
-                    "--bootloader=$Bootloader", '-y')
+                    "--wchlink=$Wchlink", "--uart=$Uart", "--opt=$Opt", "--swd7=$Swd7",
+                    "--swd_pins=$SwdPins",
+                    "--board=$Board", "--bootloader=$Bootloader", '-y')
     if ($Reconfigure) { $configArgs += '-c' }
     Write-Host "==> xmake $($configArgs -join ' ')" -ForegroundColor Cyan
     & xmake @configArgs

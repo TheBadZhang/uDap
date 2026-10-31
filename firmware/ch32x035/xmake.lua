@@ -107,8 +107,10 @@ local function print_memory_summary(size_info)
     print(string.format("RAM   used: %s", format_size(size_info.ram)))
 end
 
--- 两个 target 共用的编译/汇编选项
-local function add_shared_flags(extra_cxflags)
+-- 两个 target 共用的编译/汇编选项。
+-- optimize 传 xmake 的优化名；不传时按 option("opt") 取（-Os / -O3）。
+-- bootloader 显式传 "smallest"：它有 16 KiB 硬上限，-O3 直接装不下。
+local function add_shared_flags(extra_cxflags, optimize)
     local cxflags = {
         "-D__PACKED=__attribute__((packed))",
         "-fmessage-length=0",
@@ -129,15 +131,21 @@ local function add_shared_flags(extra_cxflags)
                    "-ffunction-sections",
                    "-fdata-sections"}), {force = true})
 
-    -- 空间都很紧：debug/release 都用 -Os + LTO
-    --   * release：-O3 会把整条 USB 调用链内联进 .highcode，Flash/RAM 都装不下；
+    -- 空间都很紧：debug/release 默认都用 -Os + LTO
+    --   * release：-O3 会把整条 USB 调用链内联进 .highcode，Flash/RAM 都变大很多；
     --   * debug：-Og/-O0 装不进 Flash，所以也只加调试符号。
+    --
+    -- ⚠️ -O3 **不会**让 SWD 变快：位翻转是手写汇编（swd_gpio_x035.c），与优化级别
+    -- 无关（实测两版逐字节相同）。它唯一可能影响的是快路径 ACK/turnaround 那段
+    -- 内联 C（sw_dp.c 的 swd_fast_ack_phase，源码注释里写明「拆成两个函数都会让
+    -- 长块读偶发失败」），所以 --opt=speed 属于需要实测的实验选项。
     if is_mode("debug") then
         set_symbols("debug")
     else
         set_symbols("hidden")
     end
-    set_optimize("smallest")
+    local opt = get_config("opt") or "size"
+    set_optimize(optimize or (opt == "speed" and "fastest" or "smallest"))
     add_cxflags("-flto", {force = true})
 end
 
@@ -167,8 +175,8 @@ option_end()
 -- SWD 引脚方案（对应 src/swd_pin_map.h 的 SWD_PIN_VARIANT）
 -- board = 用板级表的默认值（application/board/*.h 的 BOARD_SWD_DEFAULT_PIN_VARIANT），
 --         一般不用管；显式给值只用于 A/B 对照（例如同一块板换脚飞线）。
--- 注意不能用 "auto" 当值：xmake 会把 --opt=auto 当成保留值，直接报
--- "cannot set readonly config"。
+-- 注意不能用 "auto" 当值：xmake 会把 `--swd_pins=auto` 里的 auto 当成保留值，
+-- 直接报 "cannot set readonly config"。
 option("swd_pins")
     set_default("board")
     set_values({"board", "pa5_pa7", "pa5_pa6", "pa2_pa3", "pa0_pa1"})
@@ -203,6 +211,28 @@ option("uart")
     set_default(true)
     set_showmenu(true)
     set_description("Build the USB CDC + USART bridge (set n for an SWD-only firmware)")
+option_end()
+
+-- 优化取向（配合 LTO）：
+--   size  -Os（默认）
+--   speed -O3（实验性：不影响手写汇编的位翻转，但会改变快路径 ACK 相位那段内联 C
+--         的指令排布与寄存器分配 —— 见 sw_dp.c 里「拆成两个函数都会让长块读偶发
+--         失败」的注释。要不要用请实测；体积代价：Flash≈+11 KiB、.highcode≈+4 KiB）
+option("opt")
+    set_default("size")
+    set_values({"size", "speed"})
+    set_showmenu(true)
+    set_description("Optimization: size (-Os, default) or speed (-O3, experimental, larger .highcode)")
+option_end()
+
+-- 快路径位时序用 7 clk/bit 的实现（application/dap/swd_gpio_x035_fast7.c）
+--   默认 n：现役实现 8 clk/bit ≈ 6 MHz
+--   y     ：7 clk/bit ≈ 6.9 MHz（+14%），符号换成 swd7_*，8 clk 版被 gc 掉
+-- 换实现后请用示波器核低/高电平时长（推导见该文件头），再决定要不要留。
+option("swd7")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Use the 7-cycle-per-bit SWD phase implementation (~6.9 MHz instead of 6 MHz)")
 option_end()
 
 -- 是否按「UF2 bootloader 布局」构建（应用从 0x4000 起 + 同时构建 bootloader）
@@ -268,7 +298,7 @@ if use_bootloader then
                            third_party .. "/cherryusb/common",
                            third_party .. "/cherryusb/class/msc")
 
-        add_shared_flags({"-Wno-discarded-qualifiers"})
+        add_shared_flags({"-Wno-discarded-qualifiers"}, "smallest")
 
         -- bootloader 必须留在**机器模式**：它要跳进应用的 _start，而应用入口会
         -- 重跑 `csrw 0xbc0`（机器模式专用 CSR）。若 bootloader 的 startup 已按
@@ -358,6 +388,7 @@ target("firmware")
     add_defines("ESIG_SN=" .. (esig_sn_enabled and 1 or 0))
     add_defines("WCHLINK_ENABLE=" .. (wchlink_enabled and 1 or 0))
     add_defines("UART_ENABLE=" .. (uart_enabled and 1 or 0))
+    add_defines("SWD7_ENABLE=" .. (has_config("swd7") and 1 or 0))
     add_defines("UDAP_UF2_BOOTLOADER=" .. (use_bootloader and 1 or 0))
 
     -- 板卡引脚表 -> BOARD_VARIANT（application/board_pin_map.h 选 board_<name>.h）
@@ -497,6 +528,10 @@ target("firmware")
         cprint("${cyan}UART:${clear} %s", uart_enabled
             and "USB CDC + USART bridge (single/dual UART)"
             or "none (SWD only: no CDC interface, no USART/DMA)")
+        cprint("${cyan}Optimize:${clear} %s + LTO", (get_config("opt") or "size") == "speed"
+            and "-O3 (experimental)" or "-Os")
+        cprint("${cyan}SWD fast path:${clear} %s", has_config("swd7")
+            and "7 clk/bit (~6.9 MHz, swd7_*)" or "8 clk/bit (~6 MHz)")
         cprint("${cyan}Layout:${clear} %s", use_bootloader
             and "UF2 bootloader + app at 0x4000 (drag firmware.uf2 to upgrade)"
             or (wchlink_enabled
