@@ -20,7 +20,7 @@ param(
     [string]$Interface = 'cmsis-dap',
     [int]$Khz = 6000,
     [int]$Rounds = 1,
-    [string]$OpenOcdRoot = 'D:\repo\closeocd\dist'
+    [string]$OpenOcdRoot = '.\software\openocd\dist\'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -109,17 +109,17 @@ for ($r = 1; $r -le $Rounds; $r++) {
 }
 
 $kib = $size / 1KB
-Write-Host ('=' * 72)
-Write-Host ("  {0,-6} {1,-14} {2,-16} {3,-16} {4,-14}" -f '轮', 'erase', 'program', 'verify', '合计')
-Write-Host ('-' * 72)
+Write-Host ('=' * 90)
+Write-Host ("  {0,-12} {1,-17} {2,-24} {3,-26} {4,-14}" -f '轮', 'erase', 'program', 'verify', '合计')
+Write-Host ('-' * 90)
 foreach ($row in $rows) {
-    Write-Host ("  {0,-6} {1,-4} ms {2,7:N1} K/s  {3,-4} ms {4,7:N1} K/s  {5,-4} ms {6,7:N1} K/s  {7} ms" -f `
+    Write-Host ("  {0,-6} {1,-4} ms {2,7:N1} K/s | {3,-4} ms {4,7:N1} K/s | {5,-4} ms {6,7:N1} K/s |         {7} ms" -f `
             $row.Round,
         $row.Erase, $(if ($row.Erase -gt 0) { $kib / ($row.Erase / 1000.0) } else { 0 }),
         $row.Program, $(if ($row.Program -gt 0) { $kib / ($row.Program / 1000.0) } else { 0 }),
         $row.Verify, $(if ($row.Verify -gt 0) { $kib / ($row.Verify / 1000.0) } else { 0 }),
         $row.Total)
 }
-Write-Host ('=' * 72)
+Write-Host ('=' * 90)
 
 if ($generated) { Remove-Item $File -ErrorAction SilentlyContinue }

@@ -17,6 +17,8 @@ firmware/ch32x035/bootloader/test/build
 
 firmware/ch32x035/sdk/EXAM
 
+software/openocd
+
 production
 fp-lib-table
 *.copper_thief.json
