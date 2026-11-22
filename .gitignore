@@ -27,3 +27,5 @@ fabrication-toolkit-options.json
 
 *-backups
 fp-info-cache
+firmware/at32f405/build/
+firmware/ch32v305/third_party/

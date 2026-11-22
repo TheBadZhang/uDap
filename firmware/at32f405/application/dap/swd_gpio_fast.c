@@ -86,8 +86,8 @@ void swd_fast_dio_snapshot(void)
     swd_fast_hw.dio_out = s_swdio_cfgr_out;
 }
 
-#define SWD_DIO_DRIVE()     (BOARD_SWD_PORT->cfgr = s_swdio_cfgr_out)
-#define SWD_DIO_RELEASE()   (BOARD_SWD_PORT->cfgr = s_swdio_cfgr_in)
+#define SWD_DIO_DRIVE()     PIN_SWDIO_OUT_ENABLE()
+#define SWD_DIO_RELEASE()   PIN_SWDIO_OUT_DISABLE()
 
 /* 排查开关：1 = 在 .bss 里留档最近几次传输的 request/ACK，可用另一台探针
  * 直接读这几个字（地址用 nm 查 g_swd_fast_dbg）。默认 0，不留开销。 */
@@ -218,54 +218,24 @@ __attribute__((constructor(121))) static void swd_prof_micro(void)
     /* E：整字内核单独计时（无 USB 流量、无目标应答）——与实测中的相位
      * 周期一比较，就能判断「慢了 2 倍」是内核结构问题还是总线争用 */
     swd_fast_dio_snapshot();
+    /* [21][22][23] 对应的独立内核已删除，改用整字内核直接计时 */
     t0 = DWT->CYCCNT;
     for (uint32_t i = 0U; i < 100U; i++) {
-        swd_fast_tx_word(SWD_HW, 0x12345678U, 1U);
+        sink ^= swd_fast_wr(SWD_HW, 0x0BU, 0x12345678U, 1U);
     }
     t1 = DWT->CYCCNT;
     g_swd_prof[21] = (t1 - t0) / 100U;
 
     t0 = DWT->CYCCNT;
     for (uint32_t i = 0U; i < 100U; i++) {
-        sink ^= (uint32_t)swd_fast_rx_word(SWD_HW);
+        uint32_t dummy;
+        sink ^= swd_fast_rd(SWD_HW, 0x0FU, &dummy);
     }
     t1 = DWT->CYCCNT;
     g_swd_prof[22] = (t1 - t0) / 100U;
+    g_swd_prof[23] = 0U;
 
-    t0 = DWT->CYCCNT;
-    for (uint32_t i = 0U; i < 100U; i++) {
-        sink ^= swd_fast_req_ack(SWD_HW, 0x0BU);
-    }
-    t1 = DWT->CYCCNT;
-    g_swd_prof[23] = (t1 - t0) / 100U;
-
-    t0 = DWT->CYCCNT;
-    for (uint32_t i = 0U; i < 100U; i++) {
-        sink ^= swd_prof_txpat_flash(SWD_HW, 0x12345678U);
-    }
-    t1 = DWT->CYCCNT;
-    g_swd_prof[24] = (t1 - t0) / 100U;      /* FLASH + IO，每 bit = /32 */
-
-    t0 = DWT->CYCCNT;
-    for (uint32_t i = 0U; i < 100U; i++) {
-        sink ^= swd_prof_txpat_ram(SWD_HW, 0x12345678U);
-    }
-    t1 = DWT->CYCCNT;
-    g_swd_prof[25] = (t1 - t0) / 100U;      /* RAM + IO */
-
-    t0 = DWT->CYCCNT;
-    for (uint32_t i = 0U; i < 100U; i++) {
-        sink ^= swd_prof_txpat_aluflash(SWD_HW, 0x12345678U);
-    }
-    t1 = DWT->CYCCNT;
-    g_swd_prof[26] = (t1 - t0) / 100U;      /* FLASH + 纯 ALU（无 store） */
-
-    t0 = DWT->CYCCNT;
-    for (uint32_t i = 0U; i < 100U; i++) {
-        sink ^= swd_prof_txpat_aluram(SWD_HW, 0x12345678U);
-    }
-    t1 = DWT->CYCCNT;
-    g_swd_prof[27] = (t1 - t0) / 100U;      /* RAM + 纯 ALU */
+    /* [24..27] RAM/FLASH 对照内核已删除 */
 }
 #endif
 
@@ -440,6 +410,46 @@ static inline __attribute__((always_inline)) void swd_ack_log(uint32_t request, 
 }
 
 /* 请求 8 拍 + 松手 + 转向（turnaround 拍）+ 3 拍 ACK 采样 */
+/* ACK 采样前的等待拍数（27MHz 逐拍标定用） */
+#ifndef SWD_ACK_SAMPLE_NOP
+#define SWD_ACK_SAMPLE_NOP 2
+#endif
+#define SWD_ACK_SAMPLE_DLY() \
+    do { uint32_t _n = SWD_ACK_SAMPLE_NOP; while (_n--) { __NOP(); } } while (0)
+
+/* 定位实验：请求+ACK 完全用上游 DAP_config.h 的原语（PIN_DELAY 走 fast 档） */
+#ifndef SWD_FAST_REQ_REF
+#define SWD_FAST_REQ_REF 0
+#endif
+static inline __attribute__((always_inline)) uint32_t swd_request_ack_ref(uint32_t request)
+{
+    uint32_t ack = 0U, n;
+    uint32_t byte = swd_request_byte(request);
+
+    for (n = 0U; n < 8U; n++) {
+        PIN_SWDIO_OUT(byte >> n);
+        PIN_SWCLK_CLR();
+        PIN_DELAY();
+        PIN_SWCLK_SET();
+        PIN_DELAY();
+    }
+    PIN_SWDIO_OUT_DISABLE();
+    for (n = DAP_Data.swd_conf.turnaround; n; n--) {
+        PIN_SWCLK_CLR();
+        PIN_DELAY();
+        PIN_SWCLK_SET();
+        PIN_DELAY();
+    }
+    for (n = 0U; n < 3U; n++) {
+        PIN_SWCLK_CLR();
+        PIN_DELAY();
+        ack |= (uint32_t)PIN_SWDIO_IN() << n;
+        PIN_SWCLK_SET();
+        PIN_DELAY();
+    }
+    return ack;
+}
+
 static inline __attribute__((always_inline)) uint32_t swd_request_ack(const swd_fast_ctx_type ctx,
                                                                      uint32_t request)
 {
@@ -455,7 +465,7 @@ static inline __attribute__((always_inline)) uint32_t swd_request_ack(const swd_
     }
     for (uint32_t i = 0U; i < 3U; i++) {
         *(volatile uint32_t *)ctx.scr = ctx.sck_clr;
-        __NOP(); __NOP();
+        SWD_ACK_SAMPLE_DLY();
         ack |= (uint32_t)((BOARD_SWD_PORT->idt >> SWD_FAST_DIN_BIT) & 1U) << i;
         *(volatile uint32_t *)ctx.scr = ctx.sck_set;
         __NOP();
@@ -471,7 +481,7 @@ static inline __attribute__((always_inline)) void swd_fast_idle_tail(uint32_t re
     if (request & DAP_TRANSFER_TIMESTAMP) {
         DAP_Data.timestamp = TIMESTAMP_GET();
     }
-    n = DAP_Data.transfer.idle_cycles;
+    n = 0U;   /* 快路径忽略主机要的 idle 拍（pyocd 要 2 拍/字），与 SPI 通道同样的取舍 */
     if (n) {
         PIN_SWDIO_OUT(0U);
         k_clock(n);
@@ -551,7 +561,7 @@ static inline __attribute__((always_inline)) uint8_t swd_fast_read_fast(uint32_t
         *data = val;
     }
     if (DAP_Data.swd_conf.turnaround) {
-        k_clock(DAP_Data.swd_conf.turnaround + 1U);
+        k_clock(DAP_Data.swd_conf.turnaround);
     }
     SWD_DIO_DRIVE();
     swd_fast_idle_tail(request);
@@ -568,10 +578,16 @@ static inline __attribute__((always_inline)) uint8_t swd_fast_write_hot(uint32_t
         ((uint32_t)(1UL << SWD_FAST_DIO_BIT) << 16) | ((uint32_t)(1UL << SWD_FAST_SCK_BIT) << 16),
         ((uint32_t)(1UL << SWD_FAST_DIO_BIT)) | ((uint32_t)(1UL << SWD_FAST_SCK_BIT) << 16),
     };
-    uint32_t ack = swd_request_ack(ctx, request);
+#if SWD_PROFILE
+    uint32_t pt = DWT->CYCCNT;
+#endif
+    uint32_t ack = SWD_FAST_REQ_REF ? swd_request_ack_ref(request) : swd_request_ack(ctx, request);
+    /* ack log 关闭：省掉每字一次函数调用 */
     uint32_t val;
+#if SWD_PROFILE
+    g_swd_prof[1] += DWT->CYCCNT - pt; pt = DWT->CYCCNT;
+#endif
 
-    swd_ack_log(request, ack);
     if (ack != (uint32_t)DAP_TRANSFER_OK) {
         return swd_fast_finish(request, ack);
     }
@@ -585,8 +601,14 @@ static inline __attribute__((always_inline)) uint8_t swd_fast_write_hot(uint32_t
     swd_fast_tx32_hot(val, ctx.scr, ctx.w_clr, ctx.w_set);
     *(volatile uint32_t *)ctx.scr = swd_parity32(val) ? ctx.w_set : ctx.w_clr;
     *(volatile uint32_t *)ctx.scr = ctx.sck_set;
+#if SWD_PROFILE
+    g_swd_prof[2] += DWT->CYCCNT - pt; pt = DWT->CYCCNT;
+#endif
 
     swd_fast_idle_tail(request);
+#if SWD_PROFILE
+    g_swd_prof[3] += DWT->CYCCNT - pt; g_swd_prof[4]++;
+#endif
     return (uint8_t)ack;
 }
 
@@ -600,48 +622,117 @@ static inline __attribute__((always_inline)) uint8_t swd_fast_read_hot(uint32_t 
         ((uint32_t)(1UL << SWD_FAST_DIO_BIT) << 16) | ((uint32_t)(1UL << SWD_FAST_SCK_BIT) << 16),
         ((uint32_t)(1UL << SWD_FAST_DIO_BIT)) | ((uint32_t)(1UL << SWD_FAST_SCK_BIT) << 16),
     };
-    uint32_t ack = swd_request_ack(ctx, request);
+#if SWD_PROFILE
+    uint32_t pt = DWT->CYCCNT;
+#endif
+    uint32_t ack = SWD_FAST_REQ_REF ? swd_request_ack_ref(request) : swd_request_ack(ctx, request);
+    /* ack log 关闭：省掉每字一次函数调用 */
     uint32_t val;
     uint32_t parity;
+#if SWD_PROFILE
+    g_swd_prof[5] += DWT->CYCCNT - pt; pt = DWT->CYCCNT;
+#endif
 
-    swd_ack_log(request, ack);
     if (ack != (uint32_t)DAP_TRANSFER_OK) {
         return swd_fast_finish(request, ack);
     }
-    val = swd_fast_rx_bits(32U);
-    /* 校验位由目标较晚驱动：采样点比数据位再晚 4 个周期，否则偶发校验错 */
-    *(volatile uint32_t *)ctx.scr = ctx.sck_clr;
-    __NOP(); __NOP(); __NOP(); __NOP();
-    parity = (uint32_t)((BOARD_SWD_PORT->idt >> SWD_FAST_DIN_BIT) & 1U);
-    *(volatile uint32_t *)ctx.scr = ctx.sck_set;
-    __NOP();
+    {
+        uint64_t rx = swd_fast_rx_tail(SWD_HW);
+        val = (uint32_t)rx;
+        parity = (uint32_t)(rx >> 32) & 1U;
+    }
+#if SWD_PROFILE
+    g_swd_prof[6] += DWT->CYCCNT - pt; pt = DWT->CYCCNT;
+#endif
+    /* 校验位与转向、方向切换都已在汇编内核里完成 */
     if (swd_parity32(val) != (parity & 1U)) {
         ack = (uint32_t)DAP_TRANSFER_ERROR;
     }
     if (data) {
         *data = val;
     }
+    SWD_DIO_DRIVE();
+    swd_fast_idle_tail(request);
+    return (uint8_t)ack;
+}
+
+/* 整字合并核开关：1 = 一次汇编调用完成 请求+转向+ACK+数据相位 */
+#ifndef SWD_FAST_MERGED
+#define SWD_FAST_MERGED 0
+#endif
+
+/* 整字合并：请求 8 拍 + 松开 + 转向 + 3 拍 ACK + 32 拍数据 + 校验位 */
+static inline __attribute__((always_inline)) uint8_t swd_fast_write_word(uint32_t request, uint32_t *data)
+{
+    uint32_t val = data ? *data : 0U;
+    uint32_t ack = swd_fast_wr(SWD_HW, swd_request_byte(request), val, swd_parity32(val));
+
+    if (ack != (uint32_t)DAP_TRANSFER_OK) {
+        return swd_fast_finish(request, ack);
+    }
+    swd_fast_idle_tail(request);
+    return (uint8_t)ack;
+}
+
+static inline __attribute__((always_inline)) uint8_t swd_fast_read_word(uint32_t request, uint32_t *data)
+{
+    uint32_t val = 0U;
+    uint32_t r = swd_fast_rd(SWD_HW, swd_request_byte(request), &val);
+    uint32_t ack = r & 0x0FU;
+
+    if (ack != (uint32_t)DAP_TRANSFER_OK) {
+        return swd_fast_finish(request, ack);
+    }
+    if (swd_parity32(val) != ((r >> 4) & 1U)) {
+        ack = (uint32_t)DAP_TRANSFER_ERROR;
+    }
+    if (data) {
+        *data = val;
+    }
     if (DAP_Data.swd_conf.turnaround) {
-        k_clock(DAP_Data.swd_conf.turnaround + 1U);
+        k_clock(DAP_Data.swd_conf.turnaround);
     }
     SWD_DIO_DRIVE();
     swd_fast_idle_tail(request);
     return (uint8_t)ack;
 }
 
+#ifndef SWD_FAST_WRITE_REF
+#define SWD_FAST_WRITE_REF 0
+#endif
+#ifndef SWD_FAST_READ_REF
+#define SWD_FAST_READ_REF 1
+#endif
+
 #ifndef SWD_FAST_PHY_ENABLE
-#define SWD_FAST_PHY_ENABLE 0
+#define SWD_FAST_PHY_ENABLE 1
 #endif
 
 /* 档位分派：fast_clock=1（>=27 MHz）走展开汇编；其余交给上游 C 实现 */
 static inline __attribute__((always_inline)) uint8_t swd_fast_write(uint32_t request, uint32_t *data)
 {
+#if SWD_FAST_WRITE_REF
+    return SWD_TransferRef(request, data);
+#else
+#if SWD_FAST_MERGED
+    return swd_fast_write_word(request, data);
+#else
     return swd_fast_write_hot(request, data);
+#endif
+#endif
 }
 
 static inline __attribute__((always_inline)) uint8_t swd_fast_read(uint32_t request, uint32_t *data)
 {
+#if SWD_FAST_READ_REF
+    return SWD_TransferRef(request, data);
+#else
+#if SWD_FAST_MERGED
+    return swd_fast_read_word(request, data);
+#else
     return swd_fast_read_hot(request, data);
+#endif
+#endif
 }
 
 SWD_RAMF uint8_t SWD_Transfer(uint32_t request, uint32_t *data)
@@ -663,7 +754,6 @@ SWD_RAMF uint8_t SWD_Transfer(uint32_t request, uint32_t *data)
 
 
 #endif /* (DAP_SWD != 0) && SWD_PHY_GPIO_FAST */
-
 
 
 

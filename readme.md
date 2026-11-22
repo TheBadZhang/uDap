@@ -94,6 +94,74 @@ flowchart LR
 | USB | PC16 = DPDM / PC17 = DP | 固定复用 |
 | DTR / RTS | 无 | 本板没有这两个脚，默认串口模式为双串口 |
 
+### uDap-AT32F405KBU7
+
+AT32F405 版本，走**片上 OTGHS 高速 USB**（480 Mbit/s，UTMI PHY，需 12 MHz HEXT），
+调试器 + 串口 + 双通道 bootloader 全在 `firmware/at32f405/`：
+
+```powershell
+cd firmware/at32f405
+xmake f -P . -y                              # 默认：GPIO 位翻转 SWD 物理层，-Os + LTO
+xmake f -P . -y --swd_phy=gpio                 # 默认；27 MHz 档自动切 RAM 常驻汇编内核
+xmake f -P . -y --swd_phy=spi --opt=speed    # SPI1 硬件移位版（绝对速度最快，配 -O2）
+xmake -P . -j 8
+```
+
+固件特性：
+
+- CMSIS-DAP（`0d28:0204`，WinUSB）：SWD 快路径，**默认 JTAG**，关 JTAG 时 PB1/PB0 自动
+  作为串口 DTR/RTS
+- USB CDC ↔ USART2 串口桥（默认 115200，`SET_LINE_CODING` 可改到 **12 Mbaud**：RX 走 DMA 环形缓冲，实测 1047 KiB/s、60 s 零误码）
+- **bootloader**（`0d28:0205`）：标准 **DFU 1.1** + **WinUSB 私有批量协议**双通道，
+  应用在 `0x08004000`，可由上位机命令复位进入
+- vendor command 配置 LED 模式 / 串口模式 / 调试器模式 / 进 bootloader / 读 UID
+- 上位机 `software/udap-studio/`（C++/CLI + WinForms，.NET 4.8，兼容 Win7）
+
+| 信号 | 引脚 | 说明 |
+| --- | --- | --- |
+| USB | OTGHS1_D-/D+ | 专用引脚，无需 GPIO 复用 |
+| SWCLK / TCK | PA5 | SPI1_SCK |
+| SWDIO / TMS | PA6 + PA7 | PA6=MISO（读）、PA7=MOSI（写），两脚并线 |
+| nRESET | PA4 | 目标复位，低有效（开漏模拟） |
+| TDI / TDO | PB1 / PB0 | 关 JTAG 时复用为 DTR / RTS |
+| UART2_TX / RX | PA2 / PA3 | 桥接串口 |
+| LED1 / LED2 | PB2 / PB4 | 低电平点亮 |
+
+实测（STM32F411 目标，16 KiB 块，KiB/s 写/读）：
+
+| SWCLK | GPIO（旧版纯 C） | GPIO（三档，RAM 汇编） | SPI1 硬件移位 |
+| --- | --- | --- | --- |
+| 1 MHz | 81.0 / 48.2 | 56.8 / 41.4 | 87.2 / 51.5 |
+| 6 MHz | 327.2 / 189.8 | 228.8 / 158.9 | 331.5 / 185.7 |
+| 12 MHz | 445.5 / 255.4 | 305.9 / 210.3 | 573.9 / 307.9 |
+| 18 MHz | 445.7 / 255.4 | — | — |
+| **27 MHz** | **737.6 / 422.0** | **1223.9 / 597.1** | **1280.0 / 619.8** |
+
+上表全部为 `-Os` + LTO 构建（SPI 列用 `--opt=speed`，即 `-O2` + LTO）：LTO 让 firmware Flash
+从 31,612 B 降到 **27,324 B**、bootloader 从 15,748 B 降到 **14,064 B**。`-O2` 只对 SPI 版有利，
+两条 GPIO 路线开 `-O2` 会因位翻转余量不足而变慢（gpio 27 MHz 738→559 KiB/s）甚至失联（gpio_fast）。
+
+GPIO 路线把位翻转内核（`application/dap/swd_fast_gpio.S`）放进 `.ramcode`，由链接脚本塞进
+`.data` 随启动拷贝进 RAM，每 bit 只用两次 `GPIOA->scr` 写（数据+下降沿、上升沿）；
+27 MHz 下比纯 C 版快 +17% 写 / +3.5% 读（纯 C 版在 27 MHz 主动退回库函数写，换时序余量）。SPI 版仍然最快，因为 32 位数据由硬件移位、
+CPU 每 bit 零成本 —— 这是位翻转路线的物理下限。
+
+SPI1 挂在 APB2=216 MHz，分频只能是 2 的幂，实际 SWCLK 只有 27 / 13.5 / 6.75 MHz 这几档：
+所以 12~18 MHz 的请求都落在 ÷32（6.75 MHz），只有请求 27 MHz 才吃到 ÷8 那一档 ——
+这也是本板要跑 27 MHz 才「吃满」的原因。27 MHz 下数据相位只占每字成本约 39%（写）/ 19%（读），
+再往上不会更快（36/54 MHz 请求实测与 27 MHz 相同）。
+
+串口桥速测（PA2→PA3 回环，16 KiB 块）：4 Mbaud 374.6 KiB/s（96% 线速）、
+6 Mbaud 552.0（94%）、8 Mbaud 694.7（89%）、**12 Mbaud 1047.3（89~90%）**，全部零误码；
+12 Mbaud 下 `USARTDIV = 9/16 = 0.5625`，正好 12.000 Mbaud。
+上面是「写一块、读一块」的半双工口径（读的那段时间 UART 空着，所以只有 89%）。
+加 `--full-duplex`（边写边读）后：12 Mbaud 1141 KiB/s（97%）、13.5 Mbaud 1283（97%）、
+**15.43 Mbaud 1461 KiB/s（100% 线速）**，全部零误码 —— **USB HS 完全不是瓶颈**
+（1.4 MB/s 只占 HS 带宽的 2%），真正的上限是 USART 自己的采样裕量：`div=6`（18 Mbaud）
+起任何块大小都会错。压力测试：`python tools\uart_stress.py -p COM39 -b 12000000 -t 60 -c 4096`。
+
+细节见 [firmware/at32f405/README.md](firmware/at32f405/README.md)。
+
 ### uDap-CH32V203F8U6
 
 ### uDap-CH572

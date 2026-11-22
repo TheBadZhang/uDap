@@ -4,7 +4,7 @@
 USB 一线同时提供 **CMSIS-DAP 调试器** + **一路 USB 转串口**，外加一个 **DFU + WinUSB 双通道 bootloader**。
 
 - USB 高速：片上 OTGHS（UTMI PHY，480 Mbit/s），CherryUSB `port/dwc2` 驱动
-- 调试器：CherryDAP 的 `DAP.c` + 自写的 AT32 `DAP_config.h`；SWD 物理层有两套实现（GPIO 位翻转 / SPI1 硬件移位），编译期用 `--swd_phy=` 切换；GPIO 版在 12–24 MHz 与 ≥27 MHz 两档都跑 RAM 常驻汇编内核（只是节拍不同）
+- 调试器：CherryDAP 的 `DAP.c` + 自写的 AT32 `DAP_config.h`；SWD 物理层有两套实现（GPIO 位翻转 / SPI1 硬件移位），编译期用 `--swd_phy=` 切换；GPIO 版 ≥27 MHz 走 Flash 常驻的展开汇编快路径（写 1.75 MB/s，见 5 节），读方向默认交给上游实现
 - 串口：USART2（PA2/PA3）↔ CDC ACM，波特率随上位机 `SET_LINE_CODING` 实时改
 - bootloader：16 KiB，占 `0x08000000`，应用在 `0x08004000`；支持标准 DFU 1.1 与私有 WinUSB 批量协议
 - 上位机：`software/udap-studio/`（C++/CLI + WinForms，.NET 4.8）
@@ -28,7 +28,7 @@ USB 一线同时提供 **CMSIS-DAP 调试器** + **一路 USB 转串口**，外�
 ```powershell
 cd firmware/at32f405
 
-# 默认：GPIO 位翻转，27 MHz 档自动切到 RAM 常驻汇编快路径（见 6.3 节），-Os + LTO
+# 默认：GPIO 位翻转，≥27 MHz 走 Flash 常驻展开汇编快路径（见 6.3 节），-Os + LTO
 xmake f -P . -y
 xmake -P . -j 8
 
@@ -58,7 +58,7 @@ xmake -P . -j 8
 | 文件 | 地址 | 大小 |
 | --- | --- | --- |
 | `build/bin/bootloader/bootloader.{bin,hex}` | `0x08000000` | 14,064 / 16,384 B（85.8%） |
-| `build/bin/firmware/firmware.{bin,hex,elf,map,lst}` | `0x08004000` | 27,324 B（`-Os`）/ 38,112 B（`-O2`）+ 67 KB RAM |
+| `build/bin/firmware/firmware.{bin,hex,elf,map,lst}` | `0x08004000` | 36,692 B（`-Os`）/ 38,112 B（`-O2`）+ 26.5 KB RAM |
 
 > `xmake -P .` 不能省：仓库根目录也有一个 `xmake.lua`，父工程的配置会盖掉子工程。
 
@@ -139,29 +139,42 @@ SPI 版（`--opt=speed`，27 MHz 已开满，见下表说明）：
   固定 126 字/包时只有 868 KiB/s，这也是它只用来比较「固件每字成本」的原因。
 
 
-GPIO 位翻转版（`--swd_phy=gpio`，默认；按请求频率自动在三套实现之间切换）：
+GPIO 位翻转版（`--swd_phy=gpio`，默认；按 `clock_delay` 在两套实现之间分派）：
 
-| SWCLK 请求 | 1 MHz | 3 MHz | 6 MHz | 12 MHz | 18 MHz | 24 MHz | 27 MHz | 30 MHz |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 写 KiB/s | 57.8 | 143.4 | 283.9 | 1006.6 | 1003.0 | 1002.9 | **1223.9** | 1221.4 |
-| 读 KiB/s | 35.7 | 87.4 | 169.1 | 555.0 | 553.2 | 552.4 | **597.1** | 597.5 |
+| SWCLK 请求 | 1 MHz | 3 MHz | 6 MHz | 9 MHz | 12 MHz | 15 MHz | 18 MHz | 21 MHz | 24 MHz | 27 MHz | 30 MHz |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 写 KiB/s | 85.5 | 212.0 | 418.4 | 418.6 | 1697.8 | 1708.9 | 1701.0 | 1711.9 | 1708.0 | **1747.9** | 1736.3 |
+| 读 KiB/s | 48.3 | 119.5 | 235.5 | 235.1 | 391.2 | 391.8 | 392.3 | 389.9 | 390.7 | **750.5** | 745.2 |
+| 每字（写/读） | 45.7/81.0 µs | 18.4/32.7 | 9.34/16.6 | 9.33/16.6 | 2.30/9.98 | 2.29/9.97 | 2.30/9.96 | 2.28/10.0 | 2.29/10.0 | **2.23/5.20** | 2.25/5.24 |
 
-> **三套实现、按请求频率分派**（`application/dap/swd_gpio_fast.c` 的 `SWD_Transfer`）：
+> 上表为 2026-11-23 实测（`pyocd_speed.py`，16 KiB 块，2–3 轮全部数据校验通过）。
+> 同一台机器上 64 KiB 块：pyocd 写 1453.9 / 读 825.6 KiB/s（2.69 / 4.73 µs），
+> OpenOCD 写 1329.6 / 读 986.1 KiB/s。原始固件（改动前）16 KiB 为 1224 / 597，
+> 即写 +43%（1.75 MB/s）、读 +26%；64 KiB 读 +38%。
+
+> **两套实现、按 `clock_delay` 分派**（`application/dap/swd_gpio_fast.c` 的 `SWD_Transfer`）：
 >
-> | 请求 | `DAP_Data` 状态 | 走哪套 | 说明 |
+> | 请求 | `DAP_Data` 状态 | 写方向 | 读方向 |
 > | --- | --- | --- | --- |
-> | ≥ 27 MHz | `fast_clock=1` | `swd_fast_gpio.S` 的 `*_hot` | 每 bit 4 条指令 / 2 次 AHB 写，33 拍 10.4 周期/bit |
-> | 12–24 MHz | `fast_clock=0`、`clock_delay<=1` | 同文件的 `*_mid` | 同结构，但每个半周期插 `SWD_MID_PAD=3` 个 NOP（≈13.5 MHz） |
-> | ≤ 6 MHz | 更慢的档位 | cherrydap 原版 `SW_DP.c` | 链接时 `-D` 改名成 `SWD_TransferRef`，与上游逐字一致 |
+> | ≥ 27 MHz | `fast_clock=1` | `swd_fast_write_hot`（8 槽/bit，33 拍 ≈8.5 周期/bit） | 上游 `SW_TransferFast`（`SWD_FAST_READ_REF 1`） |
+> | 12–24 MHz | `fast_clock=0`、`clock_delay=1` | 同一套 `*_hot`（不随请求降速，实测 ≈27 MHz） | 上游 `SW_TransferSlow`（1 单位延时 ≈10 MHz） |
+> | ≤ 9 MHz | `clock_delay ≥ 2` | 上游 `SWD_TransferRef` | 上游 `SWD_TransferRef` |
 >
 > - 分派条件就是一行：`if (!DAP_Data.fast_clock && DAP_Data.clock_delay > 1U) return SWD_TransferRef(request, data);`
-> - **12–24 MHz 这一档原来直接落到 Flash 里的 C 实现（442/258 KiB/s），加中间档后是 941/529（+113% 写 / +105% 读）**；
->   三档都是「RAM 常驻 + 完全展开」，只有节拍不同。
-> - `SWD_MID_PAD` 实测：3 → 12 MHz 942 KiB/s（≈13.5 MHz，与请求相当）；2 → 1012 KiB/s，但实际时钟约 20 MHz、超出请求 50%，所以不取；4 → 886 KiB/s。
-> - ≥27 MHz 那一档是换内核而不是「快一点」：写 441 → 1125 KiB/s。热入口（`swd_fast_tx32_hot`）
->   省掉常量加载与 push/pop，配合 `DAP_config.h` 的 `PIN_SET/PIN_CLR` 走 `scr` 直写，
->   才把 14.6 周期/bit 压到 10.4（216 MHz → ≈20.8 MHz，这是软件位翻转的下限）。
+> - **为什么 12–24 MHz 的写也是 1700 KiB/s 而不是 1000**：`Set_Clock_Delay()` 把
+>   `clock_delay` 量化成 `(((CPU/2)/clock) - 2 + 7) / 8`，12–24 MHz 全算成 **1**（不是 >1），
+>   于是落不进 `Ref` 分支；而 `*_hot` 内核对请求频率不敏感（固定 8 槽/bit，≈27 MHz），
+>   所以写方向实际跑在 27 MHz。这是当前实现的已知偏差：上位机要 12 MHz 也会拿到 27 MHz
+>   的写时序（读方向不受影响，它走上游、按 1 单位延时 ≈10 MHz 跑）。若要严格守约，
+>   应在 `clock_delay == 1` 时改走 `swd_fast_write_mid`（`SWD_MID_PAD=3`，≈13.5 MHz）。
+> - 6 MHz 与 9 MHz 持平同样是量化台阶：两者 `clock_delay` 都落在 2（≈8 MHz 实际速率）。
+> - ≥27 MHz 那一档：写用展开汇编 + `scr` 直写（每 bit 4 条指令 / 2 次 AHB 写，
+>   33 拍约 8.5 周期/bit，216 MHz → 27 MHz）；读走上游实现，因为自写的 32 拍采样内核
+>   受「每位 1 次写时钟 + 1 次读 IDT」两次 APB 访问限制，实测 22 周期/bit（约 692 KiB/s），
+>   比上游慢，所以 `SWD_FAST_READ_REF` 保持 1（内核仍在，改 0 即可启用）。
 > - 低速段的台阶感来自上游 C 实现的量化延时：`(CPU/2)/clock - 2` 再整除 `DELAY_SLOW_CYCLES`(8)。
+>
+> 以下是 2026-11-22 那次构建的历史排查记录（数字与上表不同）：
 > - **合并掉速的排查（2026-11-22）**：`gpio_fast` 单独编（只有一套实现）时 27 MHz 是
 >   1316/575 KiB/s，合并成「一套实现 + 三档分派」后掉到 1125/558。逐项二分的结果：
 >   ① `__builtin_parity` 在 Cortex-M4 上是 libgcc 的 `__paritysi2` 调用（Flash 里跑，
@@ -181,11 +194,14 @@ GPIO 位翻转版（`--swd_phy=gpio`，默认；按请求频率自动在三套�
 
 `-flto` 让编译器跨文件内联，收益主要在体积；`--opt` 只对 SPI 版有帮助：
 
-| 构建 | firmware Flash | bootloader Flash | 27 MHz SWD 写 / 读（按物理层） |
+| 构建 | firmware Flash | bootloader Flash | 27 MHz SWD 写 / 读（16 KiB，按物理层） |
 | --- | --- | --- | --- |
 | `-Os`，无 LTO（旧） | 31,612 B | 15,748 B | gpio 610/346 · spi 1224/618 |
-| `-Os` + LTO（默认） | **32,772 B** | **14,064 B** | gpio **1224/597**（27 MHz 汇编档）· spi **1230/600** |
-| `-O2` + LTO（`--opt=speed`） | 38,112 B | 14,064 B（固定 -Os） | gpio 559/368（不稳定）· spi **1280/620** |
+| `-Os` + LTO（默认） | 36,692 B | 14,064 B | gpio **1748/750**（27 MHz 汇编档）· spi 1230/600 |
+| `-O2` + LTO（`--opt=speed`） | 38,112 B | 14,064 B（固定 -Os） | gpio 未复测（旧内核 559/368，已废弃）· spi **1280/620** |
+
+> gpio 版仍按 `-Os` 构建：新内核的节拍是「指令槽数 = 周期数」，`-O2` 会打乱槽位对齐，
+> 只对 SPI 版有意义（+11%）。
 
 LTO 顺带暴露出两个必须处理的点（都在代码注释里写清了原因）：
 
@@ -297,47 +313,69 @@ ACK/请求码留在 `.bss` 的 `g_swd_spi_dbg`，可以用另一台探针在运�
 
 ### 6.3 GPIO 的快路径：把位翻转内核搬进 RAM 并用汇编写
 
-AT32F405 的 Flash 在 216 MHz 下有 6 个等待周期，位翻转这种「每拍都要取指」的循环跑在
-Flash 里明显吃亏。`--swd_phy=gpio`（旧名 `gpio_fast`）在**请求到 27 MHz 档时**自动切到这条路线的做法：
+AT32F405 在 216 MHz 下访问 Flash 有等待周期，但**实测结论和直觉相反**：同一段展开的位翻转
+循环，放 SRAM 跑 15.5 周期/bit、放 Flash 跑 7.3 周期/bit（ART 加速器把顺序取指的开销吃掉，
+而 SRAM 侧反而被总线仲裁拖慢）。所以现在的分工是：
 
-- `application/dap/swd_fast_gpio.S`：三个内核 `swd_fast_tx_bits` / `swd_fast_rx_bits` /
-  `swd_fast_clock_n`，整段 `.section .ramcode`。
-- 链接脚本把 `*(.ramcode) *(.ramcode*)` 放进 `.data` 输出段（`>RAM AT>FLASH`），
-  于是启动文件现有的 `_sidata → _sdata.._edata` 拷贝**自动**把内核装进 RAM，
-  不用改 startup、也不用第二份加载镜像。`nm` 可以看到它们落在 `0x2000_00xx`。
+- **热内核放 Flash**（`.section .text.swdfast`）：`swd_fast_tx32_hot` / `swd_fast_tx8_hot` /
+  `swd_fast_rx_bits`（32 拍展开）/ `swd_fast_rx_tail`（读收尾）→ `0x0800_xxxx`。
+- **只能放 RAM 的**（`.section .ramcode`，链接脚本放进 `.data`，启动时 `_sidata → _sdata` 拷贝）：
+  `swd_fast_tx_bits`（`SWJ_Sequence` 用的通用 32/8 bit 版）以及 `.Ltx32`/`.Ltx_loop`，
+  因为**51 拍线复位**用的就是它——它在 Flash 里会跑到 ≈43 MHz，目标根本解不出复位序列
+  （表现是一上来就 `Unexpected ACK '0'`），在 RAM 里 ≈21 MHz 才安全。
+- 分派入口 `SWD_Transfer()` 本身也在 RAM（`SWD_RAMF`），`nm` 可以看到它落在 `0x2000_xxxx`。
 
-**32 位数据相位是完全展开的流水线，实测 10.4 个 CPU 周期/bit（216 MHz → 20.8 MHz）**，
-思路与 `firmware/ch32x035/application/dap/swd_gpio_x035.c` 一致，但把「取位 → 0/16 →
-选半字 → 拼字」这四条 ALU 整个省掉了：
+**写相位：每 bit 8 个槽（8 个 CPU 周期，216 MHz → 27 MHz）**，思路与
+`firmware/ch32x035/application/dap/swd_gpio_x035.c` 一致：把「取位 → 0/16 → 选半字 → 拼字」
+四条 ALU 换成「两个候选字 + 进位标志二选一」，并且**一个 SCR 写同时完成「SWCLK 下降沿 + 改 SWDIO」**：
 
 ```c
-/* 两个候选字预先放在 r4 / r7 里，用进位标志二选一，不再逐拍拼字 */
-lsrs    r0, r0, #1      /* C = 当前数据位（LSB 先发） */
-ite     cc
-strcc   r4, [r2]        /* bit=0：SWDIO 清零 + SWCLK 下降沿，一次 SCR 写完成 */
-strcs   r7, [r2]        /* bit=1：SWDIO 置位 + SWCLK 下降沿，一次 SCR 写完成 */
-str     r3, [r2]        /* SWCLK 上升沿 */
+/* r6 = value<<4，r8 = DIO_CLR，r9 = SCK_CLR，r12 = SCK_SET */
+ands    r7, r6, #16     /* 当前位的图样 */
+lsrs    r6, r6, #1      /* 下一拍预备 */
+lsr     r7, r8, r7      /* 0 → DIO_CLR|SCK_CLR，16 → DIO_SET|SCK_CLR */
+orrs    r7, r7, r9
+str     r7, [r4]        /* 下降沿 + 数据，一次 SCR 写完成 */
+nop                     /* SWD_TX_PAD_A */
+str     r12, [r4]       /* 上升沿 */
+nop                     /* SWD_TX_PAD_B */
 ```
 
-- **为什么那 4 条 ALU 可以省**：`ubfx`（取第 k 位）、`lsls`（0/1 → 0/16 当移位量）、
-  `lsr`（在 `DIO_CLR` / `DIO_SET` 两个半字间做无分支选择，因为 `DIO_CLR >> 16 == DIO_SET`）、
-  `orr`（或上 `SCK_CLR` 合成"数据 + 下降沿"的整字）——它们本质上都是在**算下一次要写的那个字**。
-  既然候选值只有两个，就把两个候选字预先放进寄存器，用 `lsrs` 把数据位移进进位标志，
-  再用 IT 块里的两条条件存储二选一：**每 bit 4 条指令、2 次 AHB 写**。
-- 两次 AHB 写是协议本身决定的（数据 + 下降沿一次、上升沿一次）。DWT 实测单次
-  `GPIOA->scr` 写约 4 个周期，两次写就是 8 个周期，加上 `lsrs` + IT 块刚好 10.4 个周期。
-  **这基本就是 216 MHz 软件位翻转的下限**：`swd_fast_tx_bits(…, 32)` 实测 333 周期
-  （10.41 周期/bit = 20.76 MHz），整条数据相位 12.8 周期/bit（含 1 bit 奇偶位的调用开销）。
-  要真的 27 MHz 只能让 SPI 硬件移位（见 6.2 节）。
-- 读相位每 bit 是「2 次写 + 1 次读」（`ldr [IDT]` 采样），实测 21 周期/bit ≈ 10.3 MHz；
-  采样点放在**下降沿后 1 个周期**（`.equ SWD_NOP_RX`，等目标 `tDVOD`），采样结果按常量
-  直接 or 进第 k 位；3 bit 的 ACK 放在 bit29..31（调用方 `>>29`），1 bit 奇偶位左对齐到 bit31。
+- **槽数就是时序**：Flash 里一条指令 ≈1 个周期，`SWD_TX_PAD_A/B` 每个 NOP 精确加 1 个周期，
+  所以调这些常量等于调占空比；8 个槽 = 8 周期/bit = 27 MHz（216 MHz / 8）。
+- 32 位数据相位 DWT 实测 **≈324 周期（8.5 周期/bit）**，加请求 8 拍 + 3 拍 ACK + 校验位后
+  整笔 **572 周期 ≈2.65 µs**；16 KiB 块实测 2.23 µs/字（1.75 MB/s）。
+- 剩下的 ~130 周期/字在 DAP.c 的块循环 + USB 处理里，不在位翻转内核。
 - 完全展开（`.rept 32` + `.set k`），没有循环、没有分支：**每拍指令条数一致，指令条数就是时序**。
   改任何一拍都要保证整段拍数一致，否则那一位的占空比就偏了。
 
-比「4 条 ALU 拼字」那一版（14.6 周期/bit）再省 29%：27 MHz 下写 **900 → 1224 KiB/s**、读 **481 → 597 KiB/s**，
-与 SPI 版的写侧（1241 KiB/s）相比已经反超，读侧仍受「每位多一次 AHB 读」限制（575 vs 616）。
-（读相位此前一直是坏的，新内核一次就通了：根因是旧内核把 3 bit ACK 放到 bit0..2，调用方却按 `>>29` 取，永远读到 ACK=0。）
+**读相位：采样点必须在 SWCLK 上升沿**（ARM IHI0031：主机在下降沿写 SWDIO、在**上升沿**读
+SWDIO；目标驱动的数据在下降沿后 tDVOD 才有效，主机的输入建立时间 T_is ≥4 ns）：
+
+```c
+str     r5, [r4]        /* 下降沿 */
+.rept SWD_RX_LOW nop    /* 等目标把数据摆上来（≈6~7 个周期） */
+ldr     r4, [idt]       /* 采样 */
+ands    r4, r4, #0x80   /* PA7（板上 PA6/PA7 短接，等价于读 PA6） */
+lsls    r4, r4, #24     /* 对齐到 bit31 */
+lsrs    r0, r0, #1
+orrs    r0, r0, r4      /* 旋转累加，32 拍后自然是 LSB 对齐 */
+str     r12, [r4]       /* 上升沿 */
+.rept SWD_RX_HI nop
+```
+
+- 这套内核能跑通（`SWD_FAST_READ_REF 0`），把 32 拍数据 + 校验位 + 转向 + 方向切换收进一次调用，
+  但实测只有 ≈692 KiB/s：每位要 1 次写（打时钟）+ 1 次读（采样），两次 APB 往返让循环跑到
+  **22 周期/bit**，这是 CPU 打 GPIO 的物理下限（≈4.7 µs/字）。
+- 所以默认 `SWD_FAST_READ_REF 1`，读方向交给上游 `SW_TransferFast`（825 KiB/s / 4.73 µs）；
+  要试自研读内核把它改成 0。
+
+**两个曾经卡很久的坑**（都已修掉）：
+
+1. 读数据相位曾**多补 1 个转向时钟**（`k_clock(turnaround + 1)`），DP 把它当成下一个包的
+   start 位，表现为「读一直正常、之后每一笔都 ack=7」；改回 `turnaround` 立即恢复。
+2. ACK 三拍必须**在低电平后段采样**（这三拍是目标与主机反向驱动），而数据/校验位要在上升沿
+   采样，两者不能混用同一个采样点。
 
 踩过的坑（都写在 `swd_fast_gpio.c` / `.S` 的注释里）：
 
@@ -354,6 +392,19 @@ str     r3, [r2]        /* SWCLK 上升沿 */
    无限递归，连不上目标，查了很久。
 
 ### 6.4 一笔传输的时间都花在哪（27 MHz，DWT 实测）
+
+当前构建（2026-11-23，写方向走自研快路径、读方向走上游）实测：
+
+| 段 | 周期 | 说明 |
+| --- | --- | --- |
+| 请求 8 拍 + 转向 + ACK 3 拍 | 238 | 汇编请求内核 + C 层 ACK 采样（理论下限 ≈110） |
+| 写数据 32 拍 + 奇偶位 | 324（8.5/bit） | 汇编热入口，8 槽/bit（27 MHz） |
+| idle 收尾 | 9 | `n = 0`，不再补上位机要求的 2 拍 idle |
+| 位翻转小计（写） | **572 = 2.65 µs** | 46 个 SWCLK 的协议下限是 368 周期 = 1.70 µs |
+| DAP 块循环 + USB | ≈130/字 | 16 KiB 块实测 2.23 µs/字（1.75 MB/s） |
+| 读数据 32 拍（上游 `SW_TransferFast`） | ≈700（22/bit） | 每位 1 次写时钟 + 1 次读 IDT，两次 APB 访问 |
+
+> 下表是 2026-11-22 旧内核的分解（合计 ≈740 周期 = 1224 KiB/s），保留用于对比：
 
 | 段 | 周期 | 说明 |
 | --- | --- | --- |
@@ -478,17 +529,19 @@ firmware/at32f405/
   上位机把双串口选项置灰（能力位 `0x0C` = LED 模式 + UF2 bootloader）。
 - WCH-Link 模式未实现（`WCHLINK_ENABLE = 0`）。
 - **串口推荐 12 Mbaud**（实际 12.000 Mbaud；半双工 1047 KiB/s、全双工 1141 KiB/s，均零误码）。全双工上限实测 15.43 Mbaud / 1461 KiB/s（100% 线速）；18 Mbaud 起 USART 采样裕量不足必错。USARTDIV=0.5625 低于 16 倍过采样推荐下限，接真实对端时留意对方时钟精度。USB HS 远未饱和（1.4 MB/s ≈ 带宽的 2%）。
-- 全功能构建 RAM 占用 67 KB / 70 KB（93.6%），再加缓冲要先腾 RAM。
-- **不要给 GPIO 物理层开 `-O2`**：`--opt=speed` 只适合 `--swd_phy=spi`。`gpio` 版在 27 MHz
-  会从 738/422 掉到 559/368 且 8 次里 2 次失败；汇编快路径开 `-O2` 后连不上目标。原因是 `-O2`
-  会把位翻转循环压到没有余量（LTO 下尤其明显，所以纯 C 物理层的 `PIN_SET/PIN_CLR` 特意包了
-  `application/dap/swd_pin_slow.c` 的 `noinline` 包装）。默认 `-Os` 是唯一三套 PHY 全绿的配置。
+- 全功能构建 RAM 占用约 26.5 KB / 70 KB（.data 5.2 KB 含 RAM 常驻内核 + .bss 19.8 KB +
+  heap/stack 1.5 KB），Flash 36.7 KB / 128 KB；再加缓冲还有很大余量。
+- **不要给 GPIO 物理层开 `-O2`**：`--opt=speed` 只适合 `--swd_phy=spi`。GPIO 版的快路径是
+  「指令槽数 = 周期数」的汇编，`-O2`/LTO 会改动槽位对齐；实测旧内核在 27 MHz 从 738/422
+  掉到 559/368 且 8 次里 2 次失败，所以 GPIO 版固定用 `-Os`（默认）。
 - 双串口 / SWO / 时间戳未启用（`DAP_UART`、`SWO_*`、`TIMESTAMP_CLOCK` 都是 0），
   RAM 只有 70 KiB，8×512 B 的 DAP 缓冲之外的预算要留给 CDC 环形缓冲。
-- GPIO 快路径的汇编读写内核都已可用（`SWD_FAST_TX_ASM` / `SWD_FAST_RX_ASM` 默认 1），
-  但**只在 `DAP_Data.fast_clock`（上位机请求 ≥27 MHz）时启用**；低速档回落 C 内核，
-  保证请求 12–24 MHz 走中间档、≤6 MHz 转给上游实现、真的跑慢。27 MHz 下为 1224/597 KiB/s，
-  写侧已与 SPI 版（1230/600）接近、读侧略低——位翻转占用 CPU 是路线性差异。
+- GPIO 快路径的汇编内核默认启用（`SWD_FAST_PHY_ENABLE 1`、`SWD_FAST_WRITE_REF 0`），
+  **写方向在 `clock_delay ≤ 1`（即 ≥10.8 MHz）时就接管**、读方向默认交给上游
+  （`SWD_FAST_READ_REF 1`，自研读内核 692 KiB/s 略慢于上游 825 KiB/s）。27 MHz 下为
+  **1748/750 KiB/s（16 KiB 块）/ 1454/826（64 KiB 块）**，写侧已超过 SPI 版（1230/600），
+  读侧仍受「每位多一次 APB 读」限制。注意 12–24 MHz 请求时写方向实际跑在 27 MHz
+  （见 5 节的档位说明），若需严格守约把 `clock_delay == 1` 改走 `swd_fast_write_mid`。
 
 ## 9. 自查命令
 
@@ -510,9 +563,13 @@ python ..\tools\udap_config.py --serial <SN> info      # 应看到 fw 1.0.0 / ca
 
 # 3) SWD 吞吐（目标 STM32F411）
 python ..\tools\pyocd_speed.py --probe <本板 SN> --target stm32f411re --frequency 27000000 --bytes 16384 --rounds 3
-#    spi+`--opt=speed`：27 MHz 应到 ~1.28 MB/s 写 / 620 KiB/s 读；gpio 版约 1224/597
+#    spi+`--opt=speed`：27 MHz 应到 ~1.28 MB/s 写 / 620 KiB/s 读；gpio 版约 1748/750（16 KiB）/ 1454/826（64 KiB）
+#    注意 --frequency 的单位是 Hz（27000000 = 27 MHz），写成 27000 就成了 27 kHz，会慢到像卡死
+pwsh -NoProfile -File tools\speed.ps1 -Rounds 1 -OpenOcdRoot D:\repo\closeocd\dist -Khz 27000
+#    OpenOCD 实测 27 MHz：gpio 写 1329.6 / 读 986.1 KiB/s（OpenOCD 每字一条小 USB 命令，属主机侧瓶颈）
 python tools\dap_raw_speed.py --serial <SN> --clock 27000000 --words 126 --packets 64
-#    这里能把「固件每字成本」和 USB 按包摊销的固定开销分开看
+#    ⚠ 这个脚本只用来比较「固件每字成本」：协议字段有历史 bug，且固定 126 字/包，
+#    绝对值 868 KiB/s 不代表真实吞吐，请以 pyocd_speed.py / speed.ps1 为准
 
 # 4) 串口压力测试（PA2→PA3 回环）：12 Mbaud 应到 ~1.05 MB/s（--full-duplex 时 ~1.14 MB/s）、零误码
 python tools\uart_stress.py -p COM39 -b 12000000 -t 60 -c 4096

@@ -43,7 +43,15 @@
     .equ SWD_NOP_FALL, 2
     .equ SWD_NOP_RISE, 0
 /* 下降沿到采样的间隔（目标 tDVOD 余量；27 MHz 下半周期只有 4 个周期） */
-    .equ SWD_NOP_RX,   2
+    .equ SWD_NOP_RX, 2
+
+/* 读数据相位采样时机（ARM ADIv5 / DSTREAM 规范）：
+ *   host 在 SWCLK 下降沿更新 SWDIO（写），在 SWCLK 上升沿读取 SWDIO（读）。
+ *   => 目标在下降沿之后驱动数据，host 必须在上升沿（及其之后）采样，
+ *      才能保证 T_is(>=4 ns) 的建立时间。 */
+    .equ SWD_RX_ON_RISE, 1
+    .equ SWD_RX_LOW, 4
+    .equ SWD_RX_HI, 0
 
 /* 把 r4 里的采样位（在 SWD_DIO_BIT 位上）挪到目标位 target */
     .macro SWD_SHIFT_TO target
@@ -57,7 +65,7 @@
     .endm
 
 
-    .section .text.swdfast, "ax", %progbits
+    .section .ramcode, "ax", %progbits
     .align 2
 
 /* ---------------------------------------------------------------------------
@@ -152,6 +160,7 @@ swd_fast_tx_bits:
     .globl  swd_fast_tx32_hot
     .thumb_func
     .type   swd_fast_tx32_hot, %function
+.section .text.swdfast, "ax", %progbits
 swd_fast_tx32_hot:
     movs    r12, #SCK_SET
     .rept   32
@@ -192,6 +201,7 @@ swd_fast_tx8_hot:
     .size   swd_fast_tx8_hot, . - swd_fast_tx8_hot
 
 /* --- 通用循环（1~3 位、33 位等很少走到的长度） --- */
+    .section .ramcode, "ax", %progbits
 .Ltx_loop:
     push    {r4, r5, r6, r7}
     movs    r4, r0                     /* 待发数据 */
@@ -236,6 +246,7 @@ swd_fast_tx8_hot:
     .globl  swd_fast_rx_bits
     .thumb_func
     .type   swd_fast_rx_bits, %function
+    .section .text.swdfast, "ax", %progbits
 swd_fast_rx_bits:
     cmp     r0, #32
     beq     .Lrx32
@@ -254,19 +265,29 @@ swd_fast_rx_bits:
     movt    r5, #(SCK_CLR >> 16)       /* r5 = 下降沿 */
     movs    r7, #SCK_SET               /* r7 = 上升沿 */
     movs    r0, #0                     /* 累加器 */
-    .set    k, 0
-    .rept   32
-    str     r5, [r2]                   /* 下降沿：目标开始驱动数据 */
-    .rept SWD_NOP_RX
-    nop                                /* 等目标把 SWDIO 摆稳（tDVOD 余量） */
+    /* 流水线：ldr 提前一拍发出，用上一拍的 4 条 ALU 掩盖 APB 读延迟 */
+    str     r5, [r2]                   /* 第 0 位下降沿 */
+    .rept SWD_RX_LOW
+    nop
     .endr
-    ldr     r4, [r6]                   /* 低电平窗口内采样 */
-    and     r4, r4, #DIO_SET           /* 只留 SWDIO 那一位 */
-    str     r7, [r2]                   /* 上升沿 */
-    SWD_SHIFT_TO k                     /* 挪到第 k 位（常量移位，无循环开销） */
+    ldr     r4, [r6]                   /* 采样第 0 位 */
+    .rept   31
+    str     r7, [r2]                   /* 第 k 位上升沿 */
+    and     r4, r4, #DIO_SET
+    lsls    r4, r4, #(31 - SWD_DIO_BIT)
+    lsrs    r0, r0, #1
     orrs    r0, r0, r4
-    .set    k, k + 1
+    str     r5, [r2]                   /* 第 k+1 位下降沿 */
+    .rept SWD_RX_LOW
+    nop
     .endr
+    ldr     r4, [r6]                   /* 采样第 k+1 位 */
+    .endr
+    str     r7, [r2]                   /* 第 31 位上升沿 */
+    and     r4, r4, #DIO_SET
+    lsls    r4, r4, #(31 - SWD_DIO_BIT)
+    lsrs    r0, r0, #1
+    orrs    r0, r0, r4
     pop     {r4, r5, r6, r7}
     bx      lr
 
@@ -311,16 +332,19 @@ swd_fast_rx_bits:
     movs    r6, #SCK_CLR
 2:
     str     r6, [r5]                   /* 下降沿：目标更新数据 */
-    .rept SWD_NOP_RX
+    .rept SWD_RX_LOW
     nop
     .endr
-    ldr     r4, [r2]                   /* 低电平窗口内采样 */
+    str     r3, [r5]                   /* 上升沿：host 在此刻读取 SWDIO */
+    ldr     r4, [r2]                   /* 上升沿之后采样 */
     and     r4, r4, #DIO_SET           /* bit7 → 0/0x80 */
     lsrs    r4, r4, #7                 /* 0/1 */
     lsrs    r0, r0, #1                 /* 右移，最高位空出来 */
     lsls    r4, r4, #31                /* 放到 bit31（左对齐） */
     orrs    r0, r0, r4
-    str     r3, [r5]                   /* 上升沿 */
+    .rept SWD_RX_HI
+    nop
+    .endr
     subs    r1, r1, #1
     bne     2b
     pop     {r4, r5, r6, r7}
@@ -335,6 +359,7 @@ swd_fast_rx_bits:
     .globl  swd_fast_clock_n
     .thumb_func
     .type   swd_fast_clock_n, %function
+    .section .ramcode, "ax", %progbits
 swd_fast_clock_n:
     push    {r4, r5}
     movs    r1, r0
@@ -579,16 +604,17 @@ swd_fast_tx8_mid:
     .equ HW_DIO_IN,  28
     .equ HW_DIO_OUT, 32
 
-    .equ SWD_REQ_PAD_A,  3
-    .equ SWD_REQ_PAD_B,  2
-    .equ SWD_TURN_PAD,   3
-    .equ SWD_ACK_PAD,    7
-    .equ SWD_ACK_TAIL,   2
-    .equ SWD_DATA_PAD_A, 3
-    .equ SWD_DATA_PAD_B, 2
-    .equ SWD_RX_PAD,     4
-    .equ SWD_PAR_PAD,    10
-    .equ SWD_WR_TURN,    1
+    .equ SWD_REQ_PAD_A, 3
+    .equ SWD_REQ_PAD_B, 2
+    .equ SWD_TURN_PAD, 4
+    .equ SWD_ACK_PAD, 2
+    .equ SWD_ACK_TAIL, 2
+    .equ SWD_DATA_PAD_A, 2
+    .equ SWD_DATA_PAD_B, 0
+    .equ SWD_RX_PAD, 6
+    .equ SWD_PAR_PAD, 6
+.equ SWD_PAR_LOW, 10
+    .equ SWD_WR_TURN, 0
 
 /* 一拍发送：DIO+SCK 拉低（条件 store 二选一）→ 选通建立 → SCK 拉高 → 保持 */
     .macro SWD_BEAT pa, pb
@@ -637,7 +663,7 @@ swd_fast_tx8_mid:
  *                      uint32_t value, uint32_t parity)
  *   返回 ACK（bit0..2，与 DAP_TRANSFER_OK/WAIT/FAULT 同序）
  * ------------------------------------------------------------------------- */
-    .section .ramcode,"ax",%progbits
+    .section .text.swdfast, "ax", %progbits
     .syntax unified
     .cpu    cortex-m4
     .thumb
@@ -760,9 +786,19 @@ swd_fast_rd:
     movs    r2, #0
     .set    k, 0
     .rept   32
-    str     r9, [r4]
-    .rept   SWD_RX_PAD
+    str     r5, [r2]                   /* 下降沿：目标开始驱动下一位 */
+    .rept SWD_RX_LOW
+    nop                                /* 等边沿落下 + tDVOD 建立 */
+    .endr
+    ldr     r4, [r6]                   /* 低电平中后段采样 */
+    and     r4, r4, #DIO_SET           /* 只留 PA7/PA6（板上级联）这一位 */
+    lsls    r4, r4, #(31 - SWD_DIO_BIT)/* -> bit31 */
+    lsrs    r0, r0, #1
+    orrs    r0, r0, r4
+    str     r7, [r2]                   /* 上升沿（采样之后再发，保证建立时间） */
+    .rept SWD_RX_HI
     nop
+    .endr
     .endr
     ldr     r7, [r10]
     str     r12,[r4]
@@ -789,4 +825,135 @@ swd_fast_rd:
     pop     {r4-r11}
     bx      lr
     .size   swd_fast_rd, . - swd_fast_rd
+/* ===================== 快速请求 + ACK 内核（FLASH） ===================== */
+    .section .text.swdfast, "ax", %progbits
+    .align  2
 
+/* uint32_t swd_fast_req(const swd_fast_hw_type *hw, uint32_t reqbyte)
+ *   8 拍请求（与 tx32_hot 同款，8 槽/bit）→ cfgr 释放 SWDIO
+ *   → 1 拍 turnaround → 3 拍 ACK（低电平中后段采样，与 C 版同位置）
+ *   返回 ack[0..2]；调用方须保证主机 turnaround == 1
+ */
+    .globl  swd_fast_req
+    .thumb_func
+    .type   swd_fast_req, %function
+swd_fast_req:
+    push    {r4-r7, lr}
+    mov     r4, r0
+    mov     r6, r1
+    ldr     r1, [r4, #HW_SCR]
+    ldr     r2, [r4, #HW_W_CLR]
+    ldr     r3, [r4, #HW_W_SET]
+    movs    r12, #SCK_SET
+    .rept   8
+    lsrs    r6, r6, #1
+    ite     cc
+    strcc   r2, [r1]
+    strcs   r3, [r1]
+    .rept   SWD_NOP_FALL
+    nop
+    .endr
+    str     r12, [r1]
+    .rept   SWD_NOP_RISE
+    nop
+    .endr
+    .endr
+
+    /* 释放 SWDIO：cfgr 写回输入配置（含上拉） */
+    ldr     r5, [r4, #HW_CFGR]
+    ldr     r0, [r4, #HW_DIO_IN]
+    str     r0, [r5]
+
+    /* 1 个 turnaround 时钟 */
+    ldr     r5, [r4, #HW_SCK_CLR]
+    str     r5, [r1]
+    nop
+    nop
+    str     r12, [r1]
+    nop
+
+    /* 3 拍 ACK */
+    ldr     r6, [r4, #HW_IDT]
+    movs    r0, #0
+    .set    ka, 0
+    .rept   3
+    str     r5, [r1]
+    nop
+    nop
+    ldr     r7, [r6]
+    and     r7, r7, #(1 << SWD_DIN_BIT)
+    lsrs    r7, r7, #(SWD_DIN_BIT - ka)
+    orrs    r0, r0, r7
+    str     r12, [r1]
+    nop
+    .set    ka, ka + 1
+    .endr
+    pop     {r4-r7, pc}
+    .size   swd_fast_req, . - swd_fast_req
+/* ===================== 读整字内核（数据 + 校验位 + 转向 + 切回输出） ===== */
+    .section .text.swdfast, "ax", %progbits
+    .align  2
+
+/* uint64_t swd_fast_rx_tail(const swd_fast_hw_type *hw)
+ *   32 拍流水线采样 → 校验位（低电平后段采样）→ 1 拍转向 → SWDIO 切回输出
+ *   返回 r0 = 数据（右对齐）、r1 = 校验位
+ */
+    .globl  swd_fast_rx_tail
+    .thumb_func
+    .type   swd_fast_rx_tail, %function
+swd_fast_rx_tail:
+    push    {r4, r5, r6, r7}
+    mov     r4, r0
+    ldr     r2, [r4, #HW_SCR]
+    ldr     r6, [r4, #HW_IDT]
+    ldr     r5, [r4, #HW_SCK_CLR]
+    ldr     r7, [r4, #HW_SCK_SET]
+    movs    r0, #0
+
+    str     r5, [r2]
+    .rept SWD_RX_LOW
+    nop
+    .endr
+    ldr     r3, [r6]
+    .rept   31
+    str     r7, [r2]                   /* 第 k 位上升沿 */
+    and     r3, r3, #DIO_SET
+    lsls    r3, r3, #(31 - SWD_DIO_BIT)
+    lsrs    r0, r0, #1
+    orrs    r0, r0, r3
+    str     r5, [r2]                   /* 第 k+1 位下降沿 */
+    .rept SWD_RX_LOW
+    nop
+    .endr
+    ldr     r3, [r6]
+    .endr
+    str     r7, [r2]                   /* 第 31 位上升沿 */
+    and     r3, r3, #DIO_SET
+    lsls    r3, r3, #(31 - SWD_DIO_BIT)
+    lsrs    r0, r0, #1
+    orrs    r0, r0, r3
+
+    /* 校验位：目标驱动更晚，低电平多等几拍 */
+    str     r5, [r2]
+    .rept SWD_PAR_LOW
+    nop
+    .endr
+    ldr     r1, [r6]
+    and     r1, r1, #DIO_SET
+    lsrs    r1, r1, #SWD_DIO_BIT       /* 校验位 -> bit0 */
+    str     r7, [r2]
+
+    /* 1 拍转向 */
+    str     r5, [r2]
+    nop
+    nop
+    str     r7, [r2]
+    nop
+
+    /* SWDIO 切回输出 */
+    ldr     r3, [r4, #HW_CFGR]
+    ldr     r12, [r4, #HW_DIO_OUT]
+    str     r12, [r3]
+    pop     {r4, r5, r6, r7}
+    bx      lr
+    .size   swd_fast_rx_tail, . - swd_fast_rx_tail

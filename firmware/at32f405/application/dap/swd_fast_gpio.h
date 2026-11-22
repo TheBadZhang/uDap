@@ -58,5 +58,8 @@ void swd_fast_tx8_mid(uint32_t value, uint32_t scr, uint32_t word_clr, uint32_t 
  */
 uint32_t swd_fast_wr(const uint32_t *hw, uint32_t reqbyte, uint32_t value, uint32_t parity);
 uint32_t swd_fast_rd(const uint32_t *hw, uint32_t reqbyte, uint32_t *out);
+uint64_t swd_fast_rx_word32(const uint32_t *hw);
+uint32_t swd_fast_req(const uint32_t *hw, uint32_t reqbyte);
 
+uint64_t swd_fast_rx_tail(const uint32_t *hw);
 #endif /* SWD_FAST_GPIO_H */
