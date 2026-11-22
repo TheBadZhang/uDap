@@ -139,40 +139,48 @@ SPI 版（`--opt=speed`，27 MHz 已开满，见下表说明）：
   固定 126 字/包时只有 868 KiB/s，这也是它只用来比较「固件每字成本」的原因。
 
 
-GPIO 位翻转版（`--swd_phy=gpio`，默认；按 `clock_delay` 在两套实现之间分派）：
+GPIO 位翻转版（`--swd_phy=gpio`，默认；按**主机请求频率**分四档，见下方表解）：
 
 | SWCLK 请求 | 1 MHz | 3 MHz | 6 MHz | 9 MHz | 12 MHz | 15 MHz | 18 MHz | 21 MHz | 24 MHz | 27 MHz | 30 MHz |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 写 KiB/s | 85.5 | 212.0 | 418.4 | 418.6 | 1697.8 | 1708.9 | 1701.0 | 1711.9 | 1708.0 | **1747.9** | 1736.3 |
-| 读 KiB/s | 48.3 | 119.5 | 235.5 | 235.1 | 391.2 | 391.8 | 392.3 | 389.9 | 390.7 | **750.5** | 745.2 |
-| 每字（写/读） | 45.7/81.0 µs | 18.4/32.7 | 9.34/16.6 | 9.33/16.6 | 2.30/9.98 | 2.29/9.97 | 2.30/9.96 | 2.28/10.0 | 2.29/10.0 | **2.23/5.20** | 2.25/5.24 |
+| 写 KiB/s | 85.3 | 211.1 | 415.5 | 416.0 | 964.1 | 966.4 | 1294.0 | 1295.7 | 1638.1 | **1723.9** | 1743.0 |
+| 读 KiB/s | 48.2 | 118.9 | 233.1 | 233.3 | 493.6 | 494.0 | 649.3 | 663.7 | 798.3 | **749.1** | 746.9 |
+| 每字（写/读） | 45.8/81.0 µs | 18.5/32.9 | 9.40/16.8 | 9.39/16.8 | 4.05/7.91 | 4.04/7.91 | 3.02/6.02 | 3.01/5.89 | 2.38/4.89 | **2.27/5.21** | 2.24/5.23 |
 
-> 上表为 2026-11-23 实测（`pyocd_speed.py`，16 KiB 块，2–3 轮全部数据校验通过）。
+> 上表为 2026-11-23 实测（`pyocd_speed.py`，16 KiB 块，2 轮全部数据校验通过）。
+> 12/15、18/21 两两相同是「取不超过请求频率的最快一档」的结果（12 MHz 档 / 18 MHz 档），
+> 6/9 相同是上游 `clock_delay` 量化到同一档（≈8 MHz）。
 > 同一台机器上 64 KiB 块：pyocd 写 1453.9 / 读 825.6 KiB/s（2.69 / 4.73 µs），
 > OpenOCD 写 1329.6 / 读 986.1 KiB/s。原始固件（改动前）16 KiB 为 1224 / 597，
 > 即写 +43%（1.75 MB/s）、读 +26%；64 KiB 读 +38%。
 
-> **两套实现、按 `clock_delay` 分派**（`application/dap/swd_gpio_fast.c` 的 `SWD_Transfer`）：
+> **按请求频率分四档**（`application/dap/swd_gpio_fast.c` 的 `SWD_Transfer`）：
 >
-> | 请求 | `DAP_Data` 状态 | 写方向 | 读方向 |
+> | 请求 | 判据 | 写方向 | 读方向 |
 > | --- | --- | --- | --- |
 > | ≥ 27 MHz | `fast_clock=1` | `swd_fast_write_hot`（8 槽/bit，33 拍 ≈8.5 周期/bit） | 上游 `SW_TransferFast`（`SWD_FAST_READ_REF 1`） |
-> | 12–24 MHz | `fast_clock=0`、`clock_delay=1` | 同一套 `*_hot`（不随请求降速，实测 ≈27 MHz） | 上游 `SW_TransferSlow`（1 单位延时 ≈10 MHz） |
-> | ≤ 9 MHz | `clock_delay ≥ 2` | 上游 `SWD_TransferRef` | 上游 `SWD_TransferRef` |
+> | 24–26 MHz | `g_swd_clock_hz ≥ 24 M` | `swd_fast_tx32_r24`/`tx8_r24`（9 槽/bit = 24 MHz） | `swd_fast_rx32_r24`（9 槽/bit） |
+> | 18–23 MHz | `≥ 18 M` | `*_r18`（12 槽/bit = 18 MHz） | `*_r18` |
+> | 12–17 MHz | `≥ 12 M` | `*_r12`（18 槽/bit = 12 MHz） | `*_r12` |
+> | ≤ 11 MHz | 其余 | 上游 `SWD_TransferRef` | 上游 `SWD_TransferRef` |
 >
-> - 分派条件就是一行：`if (!DAP_Data.fast_clock && DAP_Data.clock_delay > 1U) return SWD_TransferRef(request, data);`
-> - **为什么 12–24 MHz 的写也是 1700 KiB/s 而不是 1000**：`Set_Clock_Delay()` 把
->   `clock_delay` 量化成 `(((CPU/2)/clock) - 2 + 7) / 8`，12–24 MHz 全算成 **1**（不是 >1），
->   于是落不进 `Ref` 分支；而 `*_hot` 内核对请求频率不敏感（固定 8 槽/bit，≈27 MHz），
->   所以写方向实际跑在 27 MHz。这是当前实现的已知偏差：上位机要 12 MHz 也会拿到 27 MHz
->   的写时序（读方向不受影响，它走上游、按 1 单位延时 ≈10 MHz 跑）。若要严格守约，
->   应在 `clock_delay == 1` 时改走 `swd_fast_write_mid`（`SWD_MID_PAD=3`，≈13.5 MHz）。
-> - 6 MHz 与 9 MHz 持平同样是量化台阶：两者 `clock_delay` 都落在 2（≈8 MHz 实际速率）。
+> - 12–24 MHz 之所以要单独一套内核：`Set_Clock_Delay()` 把 `clock_delay` 量化成
+>   `(((CPU/2)/clock) - 2 + 7) / 8`，这三档需要的半周期只有 9/6/4.5 个 CPU 周期，
+>   除完全是 **1** —— 用 `clock_delay` 根本分不开，所以本文件覆盖了上游的弱符号
+>   `Set_Clock_Delay()`，把主机请求频率记进 `g_swd_clock_hz`，再按它分档。
+> - 中速档内核在 `swd_fast_gpio.S` 里用宏 `SWD_TX_RATE` / `SWD_RX32_RATE` 生成，
+>   **1 个 `nop` = 1 个 CPU 周期**：写每 bit = `lsrs/ite/strcc/strcs + pa×nop + str + pb×nop`
+>   = `7 + pa + pb` 槽；读每 bit = `str/ldr/and/str/lsls/lsrs/orrs + low×nop + hi×nop`
+>   = `7 + low + hi` 槽。槽数 × (1/216 MHz) 就是位周期，所以改 pad 就是改频率。
+> - 取「不超过请求频率的最快一档」，绝不对目标超频：15 MHz → 12 MHz 档、
+>   21 MHz → 18 MHz 档，因此表里 12/15、18/21 两两相同。
+> - 6 MHz 与 9 MHz 持平是上游量化台阶：两者 `clock_delay` 都落在 2（≈8 MHz 实际速率）。
 > - ≥27 MHz 那一档：写用展开汇编 + `scr` 直写（每 bit 4 条指令 / 2 次 AHB 写，
 >   33 拍约 8.5 周期/bit，216 MHz → 27 MHz）；读走上游实现，因为自写的 32 拍采样内核
->   受「每位 1 次写时钟 + 1 次读 IDT」两次 APB 访问限制，实测 22 周期/bit（约 692 KiB/s），
->   比上游慢，所以 `SWD_FAST_READ_REF` 保持 1（内核仍在，改 0 即可启用）。
-> - 低速段的台阶感来自上游 C 实现的量化延时：`(CPU/2)/clock - 2` 再整除 `DELAY_SLOW_CYCLES`(8)。
+>   受「每位 1 次写时钟 + 1 次读 IDT」两次 APB 访问限制，实测 22 周期/bit。
+>   注意 24 MHz 档的读（798 KiB/s = 4.89 µs）反而比 27 MHz 的上游读（749 = 5.21 µs）快，
+>   因为中速档的读也用自研采样内核。
+> - ≤ 11 MHz 的台阶感来自上游 C 实现的量化延时（`(CPU/2)/clock - 2` 再整除 `DELAY_SLOW_CYCLES`(8)）。
 >
 > 以下是 2026-11-22 那次构建的历史排查记录（数字与上表不同）：
 > - **合并掉速的排查（2026-11-22）**：`gpio_fast` 单独编（只有一套实现）时 27 MHz 是
@@ -324,6 +332,13 @@ AT32F405 在 216 MHz 下访问 Flash 有等待周期，但**实测结论和直�
   因为**51 拍线复位**用的就是它——它在 Flash 里会跑到 ≈43 MHz，目标根本解不出复位序列
   （表现是一上来就 `Unexpected ACK '0'`），在 RAM 里 ≈21 MHz 才安全。
 - 分派入口 `SWD_Transfer()` 本身也在 RAM（`SWD_RAMF`），`nm` 可以看到它落在 `0x2000_xxxx`。
+- **12/18/24 MHz 三档中速内核**（同在 `.text.swdfast`：`swd_fast_tx32_r24/r18/r12`、
+  `swd_fast_tx8_r*`、`swd_fast_rx32_r*`）：上游 `Set_Clock_Delay()` 把 `clock_delay`
+  量化成 `(((CPU/2)/clock) - 2 + 7) / 8`，这三档需要的半周期只有 9/6/4.5 个 CPU 周期，
+  除完全是 1 —— 既分不开、也降不到请求频率。所以本仓库**覆盖了弱符号 `Set_Clock_Delay()`**，
+  把主机请求频率记进 `g_swd_clock_hz`，再用 `SWD_TX_RATE` / `SWD_RX32_RATE` 宏按
+  「1 个 `nop` = 1 个 CPU 周期」生成三套补 NOP 的展开内核（写 9/12/18 槽、读 9/12/18 槽）。
+  实测 12/18/24 MHz 请求下写 964/1294/1638 KiB/s、读 494/649/798 KiB/s。
 
 **写相位：每 bit 8 个槽（8 个 CPU 周期，216 MHz → 27 MHz）**，思路与
 `firmware/ch32x035/application/dap/swd_gpio_x035.c` 一致：把「取位 → 0/16 → 选半字 → 拼字」
@@ -537,11 +552,12 @@ firmware/at32f405/
 - 双串口 / SWO / 时间戳未启用（`DAP_UART`、`SWO_*`、`TIMESTAMP_CLOCK` 都是 0），
   RAM 只有 70 KiB，8×512 B 的 DAP 缓冲之外的预算要留给 CDC 环形缓冲。
 - GPIO 快路径的汇编内核默认启用（`SWD_FAST_PHY_ENABLE 1`、`SWD_FAST_WRITE_REF 0`），
-  **写方向在 `clock_delay ≤ 1`（即 ≥10.8 MHz）时就接管**、读方向默认交给上游
-  （`SWD_FAST_READ_REF 1`，自研读内核 692 KiB/s 略慢于上游 825 KiB/s）。27 MHz 下为
-  **1748/750 KiB/s（16 KiB 块）/ 1454/826（64 KiB 块）**，写侧已超过 SPI 版（1230/600），
-  读侧仍受「每位多一次 APB 读」限制。注意 12–24 MHz 请求时写方向实际跑在 27 MHz
-  （见 5 节的档位说明），若需严格守约把 `clock_delay == 1` 改走 `swd_fast_write_mid`。
+  ≥27 MHz 走 8 槽/bit 热内核、12–24 MHz 按请求频率分成 12/18/24 三档中速内核、
+  ≤11 MHz 交回上游 `SWD_TransferRef`；读方向在 ≥27 MHz 默认交给上游
+  （`SWD_FAST_READ_REF 1`，自研 27 MHz 读内核 692 KiB/s 略慢于上游 825 KiB/s，
+  但 12–24 MHz 档用的是自研读内核，比上游快）。27 MHz 下为
+  **1724/749 KiB/s（16 KiB 块）/ 1454/826（64 KiB 块）**，写侧已超过 SPI 版（1230/600），
+  读侧仍受「每位多一次 APB 读」限制。
 
 ## 9. 自查命令
 

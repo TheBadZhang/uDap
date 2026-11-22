@@ -957,3 +957,87 @@ swd_fast_rx_tail:
     pop     {r4, r5, r6, r7}
     bx      lr
     .size   swd_fast_rx_tail, . - swd_fast_rx_tail
+
+
+/* ---------------------------------------------------------------------------
+ * 中速档整字内核（12 / 18 / 24 MHz，216 MHz 主频下）
+ *
+ *   上游 Set_Clock_Delay() 的 clock_delay 以 DELAY_SLOW_CYCLES(=8) 为步长，
+ *   12/18/24 MHz 需要的半周期只有 9/6/4.5 个周期，量化后全是 1，无法分辨。
+ *   这里改用「1 个 pad = 1 个 CPU 周期」的编译期补 NOP 内核：
+ *     写：每 bit = lsrs/ite/strcc/strcs(+pa nop)/str r12(+pb nop) = 7+pa+pb 槽
+ *     读：每 bit = str/ldr/and/str/lsls/lsrs/orrs(+low+hi nop) = 7+low+hi 槽
+ *   槽数 = 216 MHz / 目标 SWCLK：
+ *     24 MHz → 9 槽：(1,1) / low 1
+ *     18 MHz → 12 槽：(3,2) / low 4
+ *     12 MHz → 18 槽：(6,5) / low 10
+ * ------------------------------------------------------------------------- */
+.macro SWD_TX_RATE name, count, pa, pb
+    .section .text.swdfast, "ax", %progbits
+    .globl  \name
+    .thumb_func
+    .type   \name, %function
+\name:
+    movs    r12, #SCK_SET
+    .rept   \count
+    lsrs    r0, r0, #1
+    ite     cc
+    strcc   r2, [r1]
+    strcs   r3, [r1]
+    .rept   \pa
+    nop
+    .endr
+    str     r12, [r1]
+    .rept   \pb
+    nop
+    .endr
+    .endr
+    bx      lr
+    .size   \name, . - \name
+.endm
+
+.macro SWD_RX32_RATE name, low, hi
+    .section .text.swdfast, "ax", %progbits
+    .globl  \name
+    .thumb_func
+    .type   \name, %function
+\name:
+    push    {r4, r5, r6, r7}
+    movw    r2, #(GPIOA_SCR & 0xFFFF)
+    movt    r2, #(GPIOA_SCR >> 16)
+    movw    r6, #(GPIOA_IDT & 0xFFFF)
+    movt    r6, #(GPIOA_IDT >> 16)
+    movw    r5, #(SCK_CLR & 0xFFFF)
+    movt    r5, #(SCK_CLR >> 16)
+    movs    r7, #SCK_SET
+    movs    r0, #0
+    .rept   32
+    str     r5, [r2]
+    .rept   \low
+    nop
+    .endr
+    ldr     r4, [r6]
+    and     r4, r4, #DIO_SET
+    str     r7, [r2]
+    lsls    r4, r4, #(31 - SWD_DIO_BIT)
+    lsrs    r0, r0, #1
+    orrs    r0, r0, r4
+    .rept   \hi
+    nop
+    .endr
+    .endr
+    pop     {r4, r5, r6, r7}
+    bx      lr
+    .size   \name, . - \name
+.endm
+
+    SWD_TX_RATE swd_fast_tx32_r24, 32, 1, 1
+    SWD_TX_RATE swd_fast_tx32_r18, 32, 3, 2
+    SWD_TX_RATE swd_fast_tx32_r12, 32, 6, 5
+    SWD_TX_RATE swd_fast_tx8_r24,   8, 1, 1
+    SWD_TX_RATE swd_fast_tx8_r18,   8, 3, 2
+    SWD_TX_RATE swd_fast_tx8_r12,   8, 6, 5
+
+    SWD_RX32_RATE swd_fast_rx32_r24,  1, 0
+    SWD_RX32_RATE swd_fast_rx32_r18,  4, 0
+    SWD_RX32_RATE swd_fast_rx32_r12, 10, 0

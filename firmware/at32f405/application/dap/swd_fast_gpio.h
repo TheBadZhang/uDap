@@ -48,6 +48,22 @@ void swd_fast_tx8_hot(uint32_t value, uint32_t scr, uint32_t word_clr, uint32_t 
 void swd_fast_tx32_mid(uint32_t value, uint32_t scr, uint32_t word_clr, uint32_t word_set);
 void swd_fast_tx8_mid(uint32_t value, uint32_t scr, uint32_t word_clr, uint32_t word_set);
 
+/* 12 / 18 / 24 MHz 中速档（1 个 pad = 1 个 CPU 周期，216 MHz 主频）
+ *   24 MHz：写 9 槽/bit、读 9 槽/bit
+ *   18 MHz：写 12 槽/bit、读 12 槽/bit
+ *   12 MHz：写 18 槽/bit、读 18 槽/bit
+ */
+void swd_fast_tx32_r24(uint32_t value, uint32_t scr, uint32_t word_clr, uint32_t word_set);
+void swd_fast_tx32_r18(uint32_t value, uint32_t scr, uint32_t word_clr, uint32_t word_set);
+void swd_fast_tx32_r12(uint32_t value, uint32_t scr, uint32_t word_clr, uint32_t word_set);
+void swd_fast_tx8_r24(uint32_t value, uint32_t scr, uint32_t word_clr, uint32_t word_set);
+void swd_fast_tx8_r18(uint32_t value, uint32_t scr, uint32_t word_clr, uint32_t word_set);
+void swd_fast_tx8_r12(uint32_t value, uint32_t scr, uint32_t word_clr, uint32_t word_set);
+
+uint32_t swd_fast_rx32_r24(void);
+uint32_t swd_fast_rx32_r18(void);
+uint32_t swd_fast_rx32_r12(void);
+
 /* 27 MHz 档整字内核（hw = C 侧 swd_fast_hw[] 参数块，偏移见 swd_fast_gpio.S）
  *
  * 每个函数一次做完一整个传输相位，全部展开、无循环、无中间 C 胶水：

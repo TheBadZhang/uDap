@@ -708,7 +708,207 @@ static inline __attribute__((always_inline)) uint8_t swd_fast_read_word(uint32_t
 #define SWD_FAST_PHY_ENABLE 1
 #endif
 
-/* 档位分派：fast_clock=1（>=27 MHz）走展开汇编；其余交给上游 C 实现 */
+/* ===================== 12 / 18 / 24 MHz 中速档 ========================== */
+
+/* 上游 Set_Clock_Delay() 是弱符号，这里覆盖一份：照原样算 clock_delay，
+ * 同时把主机请求的频率记下来 —— 12~24 MHz 的半周期只有 9/6/4.5 个 CPU 周期，
+ * 量化后 clock_delay 全是 1，只有拿到原始频率才能分辨这三档。 */
+volatile uint32_t g_swd_clock_hz = 27000000U;
+
+#define SWD_MAX_SWJ_CLOCK(d) ((CPU_CLOCK / 2U) / (IO_PORT_WRITE_CYCLES + (d)))
+
+void Set_Clock_Delay(uint32_t clock)
+{
+    uint32_t delay;
+
+    g_swd_clock_hz = clock;
+    if (clock >= SWD_MAX_SWJ_CLOCK(DELAY_FAST_CYCLES)) {
+        DAP_Data.fast_clock  = 1U;
+        DAP_Data.clock_delay = 1U;
+    } else {
+        DAP_Data.fast_clock = 0U;
+        delay = ((CPU_CLOCK / 2U) + (clock - 1U)) / clock;
+        if (delay > IO_PORT_WRITE_CYCLES) {
+            delay -= IO_PORT_WRITE_CYCLES;
+            delay  = (delay + (DELAY_SLOW_CYCLES - 1U)) / DELAY_SLOW_CYCLES;
+        } else {
+            delay = 1U;
+        }
+        DAP_Data.clock_delay = delay;
+    }
+}
+
+/* 档位：0 = 24 MHz，1 = 18 MHz，2 = 12 MHz，3 = 其它（走上游慢速通道）
+ * 取「不超过主机请求频率」的最快一档，避免对目标超频。 */
+static inline __attribute__((always_inline)) uint32_t swd_rate_code(void)
+{
+    uint32_t clk = g_swd_clock_hz;
+
+    if (clk >= 24000000U) {
+        return 0U;
+    }
+    if (clk >= 18000000U) {
+        return 1U;
+    }
+    if (clk >= 12000000U) {
+        return 2U;
+    }
+    return 3U;
+}
+
+static inline __attribute__((always_inline)) void swd_rate_tx8(uint32_t code, uint32_t byte,
+                                                               swd_fast_ctx_type ctx)
+{
+    if (code == 0U) {
+        swd_fast_tx8_r24(byte, ctx.scr, ctx.w_clr, ctx.w_set);
+    } else if (code == 1U) {
+        swd_fast_tx8_r18(byte, ctx.scr, ctx.w_clr, ctx.w_set);
+    } else {
+        swd_fast_tx8_r12(byte, ctx.scr, ctx.w_clr, ctx.w_set);
+    }
+}
+
+static inline __attribute__((always_inline)) void swd_rate_tx32(uint32_t code, uint32_t val,
+                                                                swd_fast_ctx_type ctx)
+{
+    if (code == 0U) {
+        swd_fast_tx32_r24(val, ctx.scr, ctx.w_clr, ctx.w_set);
+    } else if (code == 1U) {
+        swd_fast_tx32_r18(val, ctx.scr, ctx.w_clr, ctx.w_set);
+    } else {
+        swd_fast_tx32_r12(val, ctx.scr, ctx.w_clr, ctx.w_set);
+    }
+}
+
+static inline __attribute__((always_inline)) uint32_t swd_rate_rx32(uint32_t code)
+{
+    if (code == 0U) {
+        return swd_fast_rx32_r24();
+    }
+    if (code == 1U) {
+        return swd_fast_rx32_r18();
+    }
+    return swd_fast_rx32_r12();
+}
+
+/* 每个半周期额外补的 NOP 数（校验位那两拍用） */
+static inline __attribute__((always_inline)) uint32_t swd_rate_pad(uint32_t code)
+{
+    return (code == 0U) ? 1U : ((code == 1U) ? 2U : 5U);
+}
+
+static inline __attribute__((always_inline)) void swd_rate_nops(uint32_t n)
+{
+    while (n--) {
+        __NOP();
+    }
+}
+
+/* 请求 8 拍（按档位速率）+ 松手 + 转向 + 3 拍 ACK */
+static inline __attribute__((always_inline)) uint32_t swd_request_ack_rate(swd_fast_ctx_type ctx,
+                                                                           uint32_t request,
+                                                                           uint32_t code)
+{
+    uint32_t ack = 0U;
+    uint32_t n;
+
+    swd_rate_tx8(code, swd_request_byte(request), ctx);
+    SWD_DIO_RELEASE();
+
+    for (n = DAP_Data.swd_conf.turnaround; n; n--) {
+        *(volatile uint32_t *)ctx.scr = ctx.sck_clr;
+        *(volatile uint32_t *)ctx.scr = ctx.sck_set;
+    }
+    for (uint32_t i = 0U; i < 3U; i++) {
+        *(volatile uint32_t *)ctx.scr = ctx.sck_clr;
+        SWD_ACK_SAMPLE_DLY();
+        ack |= (uint32_t)((BOARD_SWD_PORT->idt >> SWD_FAST_DIN_BIT) & 1U) << i;
+        *(volatile uint32_t *)ctx.scr = ctx.sck_set;
+        __NOP();
+    }
+    return ack;
+}
+
+static inline __attribute__((always_inline)) uint8_t swd_fast_write_rate(uint32_t request,
+                                                                         uint32_t *data,
+                                                                         uint32_t code)
+{
+    const swd_fast_ctx_type ctx = {
+        (uint32_t)&BOARD_SWD_PORT->scr,
+        (uint32_t)(1UL << SWD_FAST_SCK_BIT) << 16,
+        (uint32_t)(1UL << SWD_FAST_SCK_BIT),
+        ((uint32_t)(1UL << SWD_FAST_DIO_BIT) << 16) | ((uint32_t)(1UL << SWD_FAST_SCK_BIT) << 16),
+        ((uint32_t)(1UL << SWD_FAST_DIO_BIT)) | ((uint32_t)(1UL << SWD_FAST_SCK_BIT) << 16),
+    };
+    uint32_t ack = swd_request_ack_rate(ctx, request, code);
+    uint32_t val;
+    uint32_t p = swd_rate_pad(code);
+
+    if (ack != (uint32_t)DAP_TRANSFER_OK) {
+        return swd_fast_finish(request, ack);
+    }
+    for (uint32_t tn = DAP_Data.swd_conf.turnaround; tn; tn--) {
+        *(volatile uint32_t *)ctx.scr = ctx.sck_clr;
+        *(volatile uint32_t *)ctx.scr = ctx.sck_set;
+    }
+    SWD_DIO_DRIVE();
+    val = data ? *data : 0U;
+    swd_rate_tx32(code, val, ctx);
+    *(volatile uint32_t *)ctx.scr = swd_parity32(val) ? ctx.w_set : ctx.w_clr;
+    swd_rate_nops(p);
+    *(volatile uint32_t *)ctx.scr = ctx.sck_set;
+    swd_rate_nops(p);
+    swd_fast_idle_tail(request);
+    return (uint8_t)ack;
+}
+
+static inline __attribute__((always_inline)) uint8_t swd_fast_read_rate(uint32_t request,
+                                                                        uint32_t *data,
+                                                                        uint32_t code)
+{
+    const swd_fast_ctx_type ctx = {
+        (uint32_t)&BOARD_SWD_PORT->scr,
+        (uint32_t)(1UL << SWD_FAST_SCK_BIT) << 16,
+        (uint32_t)(1UL << SWD_FAST_SCK_BIT),
+        ((uint32_t)(1UL << SWD_FAST_DIO_BIT) << 16) | ((uint32_t)(1UL << SWD_FAST_SCK_BIT) << 16),
+        ((uint32_t)(1UL << SWD_FAST_DIO_BIT)) | ((uint32_t)(1UL << SWD_FAST_SCK_BIT) << 16),
+    };
+    uint32_t ack = swd_request_ack_rate(ctx, request, code);
+    uint32_t val;
+    uint32_t parity;
+    uint32_t p = swd_rate_pad(code);
+
+    if (ack != (uint32_t)DAP_TRANSFER_OK) {
+        return swd_fast_finish(request, ack);
+    }
+    val = swd_rate_rx32(code);
+
+    /* 校验位：目标驱动得更晚，下降沿之后按档位多等几拍再采样 */
+    *(volatile uint32_t *)ctx.scr = ctx.sck_clr;
+    swd_rate_nops(p);
+    parity = ((BOARD_SWD_PORT->idt >> SWD_FAST_DIN_BIT) & 1U);
+    *(volatile uint32_t *)ctx.scr = ctx.sck_set;
+    swd_rate_nops(p);
+
+    /* 1 拍转向后把 SWDIO 切回输出 */
+    *(volatile uint32_t *)ctx.scr = ctx.sck_clr;
+    swd_rate_nops(p);
+    *(volatile uint32_t *)ctx.scr = ctx.sck_set;
+    swd_rate_nops(p);
+    SWD_DIO_DRIVE();
+
+    if (swd_parity32(val) != parity) {
+        ack = (uint32_t)DAP_TRANSFER_ERROR;
+    }
+    if (data) {
+        *data = val;
+    }
+    swd_fast_idle_tail(request);
+    return (uint8_t)ack;
+}
+
+/* 档位分派：fast_clock=1（>=27 MHz）走展开汇编；12/18/24 MHz 走中速档；
+ * 其余交给上游 C 实现 */
 static inline __attribute__((always_inline)) uint8_t swd_fast_write(uint32_t request, uint32_t *data)
 {
 #if SWD_FAST_WRITE_REF
@@ -738,7 +938,16 @@ static inline __attribute__((always_inline)) uint8_t swd_fast_read(uint32_t requ
 SWD_RAMF uint8_t SWD_Transfer(uint32_t request, uint32_t *data)
 {
 #if SWD_FAST_PHY_ENABLE
-    if (!DAP_Data.fast_clock && (DAP_Data.clock_delay > 1U)) {
+    if (!DAP_Data.fast_clock) {
+        /* 12/18/24 MHz：用编译期补 NOP 的中速内核，按请求频率分档 */
+        uint32_t code = swd_rate_code();
+
+        if (code <= 2U) {
+            if (request & DAP_TRANSFER_RnW) {
+                return swd_fast_read_rate(request, data, code);
+            }
+            return swd_fast_write_rate(request, data, code);
+        }
         return SWD_TransferRef(request, data);
     }
     if (request & DAP_TRANSFER_RnW) {
